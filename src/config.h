@@ -88,7 +88,7 @@
 // 关门冷却：车走了及时关，不需要长
 #define AUTO_COOLDOWN_CLOSE_MS 30000  // 30 秒
 // 自动开后至少等这么久才能自动关（给车进库时间）
-#define AUTO_MIN_OPEN_HOLD_MS 15000   // 15 秒
+#define AUTO_MIN_OPEN_HOLD_MS 60000   // 1 分钟
 
 // 串口调试
 #define SerialBaud 115200
