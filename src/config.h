@@ -68,8 +68,9 @@
 #define BLE_MISS_FOR_LOST     3       // 连续 N 次未匹配算「丢」
 
 // ===== 经典蓝牙渐变规则（用于小蚂蚁等无 BLE 车型）=====
-#define RSSI_OPEN             -60     // 渐近开门阈值 dBm
-#define RSSI_FADE             -85     // 渐离弱信号阈值
+// 实测待补充：隔车库门经典蓝牙 RSSI 大约多少
+#define RSSI_OPEN             -80     // 渐近开门阈值 dBm（隔门信号弱，需实测调整）
+#define RSSI_FADE             -90     // 渐离弱信号阈值
 #define SLOPE_MIN             0.6f    // 渐变最小斜率 dBm/s
 #define T_CLEAR_MS            100000  // 门洞清空等待 100s
 #define T_SILENT_GAP_MS       10000   // 间隔多久算「突然出现」
