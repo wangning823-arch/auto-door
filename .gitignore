@@ -12,3 +12,8 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+
+# 测试数据（不纳入版本控制）
+../ble_logs/
+../drive_test*
+../firmware_backup/
