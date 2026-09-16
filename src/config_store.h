@@ -1,0 +1,22 @@
+#pragma once
+#include <Arduino.h>
+
+// NVS 持久化：车机 MAC、可选参数
+class ConfigStore {
+ public:
+  void begin();
+  String loadMac(const char* defaultMac);
+  bool saveMac(const String& mac);
+  bool clearMac();
+
+  // SoftAP 是否启用（默认开；网页可关，关掉后 BT Inquiry 独占射频）
+  bool loadWifiEnabled(bool defaultOn = true);
+  bool saveWifiEnabled(bool on);
+
+  // BLE 特征过滤：如 MiCarCDB8 或 MAC 前缀；空=未设置
+  String loadBleFilter();
+  bool saveBleFilter(const String& f);
+
+ private:
+  bool ready_ = false;
+};
