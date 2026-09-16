@@ -109,8 +109,8 @@ String WebPortal::pageHtml() const {
   html += F("</span></div><div class=\"row\"><span class=\"k\">BLE RSSI</span><span class=\"v\">");
   html += bleRssi;
   html += F("</span></div>"
-            "<button type=\"button\" onclick=\"startBle()\" id=\"bleBtn\">扫描小米车 BLE（约8秒）</button>"
-            "<div id=\"bleBox\" class=\"tip\">请开到只有你一辆小米车的地方再扫，点选自己的名称保存为特征。</div></div>");
+            "<button type=\"button\" onclick=\"startBle()\" id=\"bleBtn\">扫描 BLE 设备（约8秒）</button>"
+            "<div id=\"bleBox\" class=\"tip\">支持手机、汽车等任意 BLE 设备。点选要跟踪的设备名称保存为特征。</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
             "<span class=\"v\">WiFi 与蓝牙共用 2.4G</span></div>"
@@ -172,8 +172,8 @@ String WebPortal::pageHtml() const {
             "  var box=document.getElementById('bleBox');"
             "  var b=document.getElementById('bleBtn');"
             "  if(j.busy){box.innerHTML='扫描中… 已发现 '+j.n+' 个候选…';setTimeout(pollBle,1500);return;}"
-            "  b.disabled=false; b.textContent='扫描小米车 BLE（约8秒）';"
-            "  if(!j.devices||!j.devices.length){box.innerHTML='未扫到 MiCar/fcd1/58:C4:1E 设备';return;}"
+            "  b.disabled=false; b.textContent='扫描 BLE 设备（约8秒）';"
+            "  if(!j.devices||!j.devices.length){box.innerHTML='未扫到 BLE 设备，请确认周围有蓝牙设备在广播';return;}"
             "  var h='<div style=\"margin-top:8px\">';"
             "  j.devices.forEach(function(d){"
             "   var nm=d.name&&d.name.length?d.name:'(无名)';"
@@ -183,7 +183,7 @@ String WebPortal::pageHtml() const {
             "   <div style=\"font-weight:600\">'+nm+'</div>"
             "   <div style=\"color:#8b9aab;font-size:.85rem;margin-top:2px\">'+d.mac+' · RSSI '+d.rssi+'</div></div>';"
             "  });"
-            "  h+='</div><div class=\"tip\">点你自己的车名称，会写入 BLE 特征并开始跟踪</div>';"
+            "  h+='</div><div class=\"tip\">点要跟踪的设备名称，会写入 BLE 特征并开始跟踪</div>';"
             "  box.innerHTML=h;"
             " }).catch(function(){var b=document.getElementById('bleBtn');b.disabled=false;b.textContent='BLE 扫描失败';});"
             "}"

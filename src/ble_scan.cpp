@@ -63,6 +63,12 @@ static bool isXiaomiCarish(const BleAdvHit& h) {
   return false;
 }
 
+// 有名称的 BLE 设备都算候选（手机、车、手表等）
+static bool isInterestingBle(const BleAdvHit& h) {
+  if (h.name.length() > 0) return true;
+  return isXiaomiCarish(h);  // 无名但像小米车的也保留
+}
+
 bool BleScanTool::matchHits(const BleAdvHit& h) const {
   if (filter_.length() == 0) return false;
   String f = filter_;
@@ -80,7 +86,7 @@ bool BleScanTool::matchHits(const BleAdvHit& h) const {
 std::vector<BleAdvHit> BleScanTool::interestingHits() const {
   std::vector<BleAdvHit> out;
   for (const auto& h : hits_) {
-    if (isXiaomiCarish(h) || matchHits(h)) out.push_back(h);
+    if (isInterestingBle(h) || matchHits(h)) out.push_back(h);
   }
   for (size_t i = 0; i < out.size(); i++) {
     for (size_t j = i + 1; j < out.size(); j++) {

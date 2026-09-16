@@ -32,7 +32,7 @@ class BleScanTool {
   bool trackOn() const { return trackOn_; }
   void trackPoll(uint32_t intervalMs = 3000, uint32_t scanMs = 1000);
 
-  // 给 Web 用：仅 MiCar / fcd1 / 指定前缀 列表（按 RSSI 降序）
+  // 给 Web 用：有名称的 BLE 设备列表（按 RSSI 降序），支持任意设备
   std::vector<BleAdvHit> interestingHits() const;
   bool matchHits(const BleAdvHit& h) const;
 
