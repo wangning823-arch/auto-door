@@ -53,28 +53,35 @@
 #define AP_MAX_CONN 4
 #endif
 
-// ===== 信号与安全参数（对应商品方案 3.1）=====
+// ===== 信号与安全参数 =====
 #define RSSI_SAMPLE_MS        1000
 #define RSSI_WINDOW           10      // 滑动窗口点数
-#define RSSI_OPEN             -60     // 渐近开门阈值 dBm
-#define RSSI_FADE             -85     // 渐离弱信号阈值
-#define SLOPE_MIN             0.6f    // 渐变最小斜率 dBm/s
-#define T_CLEAR_MS            100000  // 门洞清空等待 100s
-#define T_MIN_OPEN_MS         30000   // 门刚开禁止关
-#define T_COOLDOWN_OPEN_MS    180000  // 自动开冷却 3min
-#define T_COOLDOWN_CLOSE_MS   60000
-#define RELAY_PULSE_MS        2000  // 遥控按压时长；1s 电机常不认，改 2s
-#define PRE_CLOSE_ABORT_SCAN  true
-#define T_SILENT_GAP_MS       10000   // 间隔多久算「突然出现」
-#define T_LOSS_BLIP_MS        4000    // 连续丢包多久算「突然消失」
+#define RELAY_PULSE_MS        2000    // 遥控按压时长；1s 电机常不认，改 2s
 
 // ===== 简化 BLE 状态机（无→有→强=开；强→弱→无=关）=====
+// 用于 SU7 等有 BLE 广播的车
 // 实测参考（ESP32 在库内靠门侧）：
 //   车在库外远处 ~-97；库外门口 ~-75~-81；库内强 ~-70 以上
 #define RSSI_APPEAR_MIN       -110    // 出现信号下限（≥此值算「有」）
 #define RSSI_STRONG           -80     // 强信号阈值（≥此值算「强」）
 #define BLE_SILENT_GAP_MS     15000   // BLE 多久没匹配算「无信号」
 #define BLE_MISS_FOR_LOST     3       // 连续 N 次未匹配算「丢」
+
+// ===== 经典蓝牙渐变规则（用于小蚂蚁等无 BLE 车型）=====
+#define RSSI_OPEN             -60     // 渐近开门阈值 dBm
+#define RSSI_FADE             -85     // 渐离弱信号阈值
+#define SLOPE_MIN             0.6f    // 渐变最小斜率 dBm/s
+#define T_CLEAR_MS            100000  // 门洞清空等待 100s
+#define T_SILENT_GAP_MS       10000   // 间隔多久算「突然出现」
+#define T_LOSS_BLIP_MS        4000    // 连续丢包多久算「突然消失」
+
+// ===== 跟踪模式（二选一）=====
+// BLE_MODE: SU7 等有 BLE 广播的车
+// CLASSIC_MODE: 小蚂蚁等仅经典蓝牙的车
+#define TRACK_MODE_BLE        0
+#define TRACK_MODE_CLASSIC    1
+#define TRACK_MODE_DEFAULT    TRACK_MODE_BLE
+
 // 开门冷却：防误开砸车（开了车没进去又触发开）。正常回家间隔远超此值
 #define AUTO_COOLDOWN_OPEN_MS 300000  // 5 分钟
 // 关门冷却：车走了及时关，不需要长

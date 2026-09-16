@@ -87,6 +87,23 @@ String WebPortal::pageHtml() const {
   html += trend;
   html += F("</span></div></div>");
 
+  // 跟踪模式选择
+  html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">跟踪模式</span><span class=\"v\">");
+  html += (trackMode_ == TRACK_MODE_BLE) ? "BLE" : "经典蓝牙";
+  html += F("</span></div>"
+            "<form method=\"GET\" action=\"/mode\" style=\"margin-top:8px\">"
+            "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
+            "<input type=\"radio\" name=\"m\" value=\"0\" ");
+  if (trackMode_ == TRACK_MODE_BLE) html += F("checked ");
+  html += F(">BLE（SU7 等有 BLE 广播的车）</label>"
+            "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
+            "<input type=\"radio\" name=\"m\" value=\"1\" ");
+  if (trackMode_ == TRACK_MODE_CLASSIC) html += F("checked ");
+  html += F(">经典蓝牙（小蚂蚁等无 BLE 的车）</label>"
+            "<button type=\"submit\">保存模式</button></form>"
+            "<div class=\"tip\">BLE：无→有→强开，强→弱→无关。"
+            "经典蓝牙：渐近开，渐离+清空关。</div></div>");
+
   html += F("<div class=\"card\"><form method=\"GET\" action=\"/save\" id=\"macform\">"
             "<label>车机 / 钥匙 蓝牙 MAC</label>"
             "<input type=\"text\" name=\"mac\" id=\"mac\" value=\"");
@@ -245,6 +262,20 @@ void WebPortal::setupRoutes() {
     server.send(302, "text/plain", "ok");
   });
 
+  server.on("/mode", HTTP_GET, []() {
+    if (!gPortal) {
+      server.send(500, "text/plain", "no portal");
+      return;
+    }
+    String m = server.arg("m");
+    int mode = m.toInt();
+    if (mode == TRACK_MODE_BLE || mode == TRACK_MODE_CLASSIC) {
+      gPortal->setTrackMode(mode);
+    }
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "ok");
+  });
+
   server.on("/status", HTTP_GET, []() {
     String j = "{";
     if (gPortal && gPortal->door_) {
@@ -397,6 +428,12 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
   bt_ = bt;
   door_ = door;
   ble_ = ble;
+
+  // 加载跟踪模式
+  if (store_) {
+    trackMode_ = store_->loadTrackMode(TRACK_MODE_DEFAULT);
+  }
+
   if (ble_ && store_) {
     String f = store_->loadBleFilter();
     if (f.length()) {
@@ -469,4 +506,11 @@ void WebPortal::loop() {
     }
     bt_->setInquiryPaused(clients > 0);
   }
+}
+
+void WebPortal::setTrackMode(int mode) {
+  if (mode != TRACK_MODE_BLE && mode != TRACK_MODE_CLASSIC) return;
+  trackMode_ = mode;
+  if (store_) store_->saveTrackMode(mode);
+  Serial.println("[WEB] track mode -> " + String(mode == TRACK_MODE_BLE ? "BLE" : "Classic"));
 }

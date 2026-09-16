@@ -17,6 +17,10 @@ class ConfigStore {
   String loadBleFilter();
   bool saveBleFilter(const String& f);
 
+  // 跟踪模式：0=BLE, 1=经典蓝牙（默认 BLE）
+  int loadTrackMode(int defaultMode = 0);
+  bool saveTrackMode(int mode);
+
  private:
   bool ready_ = false;
 };

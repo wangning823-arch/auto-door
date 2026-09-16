@@ -47,3 +47,13 @@ bool ConfigStore::saveBleFilter(const String& f) {
   if (f.length() == 0) return prefs.remove("ble_filter") || true;
   return prefs.putString("ble_filter", f) > 0;
 }
+
+int ConfigStore::loadTrackMode(int defaultMode) {
+  if (!ready_) return defaultMode;
+  return prefs.getInt("track_mode", defaultMode);
+}
+
+bool ConfigStore::saveTrackMode(int mode) {
+  if (!ready_) return false;
+  return prefs.putInt("track_mode", mode);
+}

@@ -4,6 +4,7 @@
 #include "door_fsm.h"
 #include "config_store.h"
 #include "ble_scan.h"
+#include "config.h"
 
 // SoftAP + 手机网页：设置车机蓝牙 MAC / BLE 特征 / 查看状态 / 手动开关
 class WebPortal {
@@ -17,6 +18,10 @@ class WebPortal {
   bool startAp();
   void stopAp();
 
+  // 跟踪模式：0=BLE, 1=Classic
+  int trackMode() const { return trackMode_; }
+  void setTrackMode(int mode);
+
  private:
   void setupRoutes();
   String pageHtml() const;
@@ -28,4 +33,5 @@ class WebPortal {
   String apSsid_;
   bool apActive_ = false;
   bool serverStarted_ = false;
+  int trackMode_ = TRACK_MODE_DEFAULT;
 };
