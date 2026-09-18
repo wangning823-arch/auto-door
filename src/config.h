@@ -54,8 +54,8 @@
 
 // RF 抓包参数
 #define RF_CAPTURE_MAX_PULSES  512     // 最大记录脉冲数
-#define RF_CAPTURE_GAP_US      10000   // 静默超过 10ms 视为一次传输结束
-#define RF_CAPTURE_TIMEOUT_MS  5000    // 抓包超时 5 秒
+#define RF_CAPTURE_GAP_US      8000    // 静默 >8ms 视为一帧间隔
+#define RF_CAPTURE_TIMEOUT_MS  8000    // 抓包超时 8 秒
 
 // ===== 目标车机蓝牙 MAC（默认值；运行时可由网页/NVS 覆盖）=====
 #ifndef CAR_BT_MAC

@@ -5,6 +5,7 @@ static volatile uint16_t rfPulseBuf[RF_CAPTURE_MAX_PULSES];
 static volatile uint32_t rfLastChangeUs = 0;
 static volatile uint16_t rfIdx = 0;
 static volatile bool rfCapturing = false;
+static volatile uint32_t rfFirstEdgeMs = 0;
 
 static void IRAM_ATTR rfIsr() {
   if (!rfCapturing) return;
@@ -12,12 +13,19 @@ static void IRAM_ATTR rfIsr() {
   uint32_t dur = now - rfLastChangeUs;
   rfLastChangeUs = now;
 
+  // 第一沿只是「从空闲到有信号」，不是脉冲宽，不记录
+  if (rfIdx == 0 && dur >= RF_CAPTURE_GAP_US) {
+    return;
+  }
+
   if (dur >= RF_CAPTURE_GAP_US) {
+    // 信号中间出现长静默：已有足够数据则结束
     if (rfIdx > 10) rfCapturing = false;
     return;
   }
   if (rfIdx < RF_CAPTURE_MAX_PULSES) {
     rfPulseBuf[rfIdx++] = (dur > 65535) ? 65535 : (uint16_t)dur;
+    if (rfIdx == 1) rfFirstEdgeMs = millis();
   }
 }
 
@@ -29,32 +37,52 @@ void RfCapture::begin(int pin) {
 bool RfCapture::capture(uint32_t timeoutMs) {
   if (pin_ < 0) return false;
 
-  // 保存上一次数据用于对比
   if (count_ > 0) {
     memcpy(lastPulses_, pulses_, count_ * sizeof(uint16_t));
     lastCount_ = count_;
     hasLast_ = true;
   }
 
-  // 重置状态
   rfIdx = 0;
   rfCapturing = true;
   rfLastChangeUs = micros();
+  rfFirstEdgeMs = 0;
   count_ = 0;
 
   Serial.printf("[RF] 等待信号... (DATA=GPIO%d, 超时 %ums)\n", pin_, timeoutMs);
-  Serial.println("[RF] 请按遥控器按钮...");
+  Serial.println("[RF] 请按遥控器（尽量靠近天线 5~10cm）...");
 
-  // attachInterrupt
   attachInterrupt(digitalPinToInterrupt(pin_), rfIsr, CHANGE);
 
   uint32_t start = millis();
-  while (rfCapturing && (millis() - start) < timeoutMs) {
+  uint16_t lastPrinted = 0;
+  while ((millis() - start) < timeoutMs) {
+    if (!rfCapturing) break;
+
+    uint16_t n = rfIdx;
+    if (n >= 10 && lastPrinted == 0) {
+      Serial.printf("[RF] 已收到 %u 脉冲...\n", n);
+      lastPrinted = n;
+    }
+
+    // 收到数据后：静默 25ms 即认为本帧结束（不必等 5s 超时）
+    if (n >= 10 && rfLastChangeUs > 0) {
+      uint32_t idleUs = micros() - rfLastChangeUs;
+      if (idleUs > 25000) {
+        rfCapturing = false;
+        break;
+      }
+    }
+
+    // 完全没信号时给一点提示
+    if (n == 0 && (millis() - start) > 2000 && (millis() - start) < 2200) {
+      Serial.println("[RF] 还没检测到边沿，检查天线/距离/频率...");
+    }
     delay(1);
   }
   rfCapturing = false;
   detachInterrupt(digitalPinToInterrupt(pin_));
-  delay(10);
+  delay(5);
 
   count_ = rfIdx;
   for (uint16_t i = 0; i < count_; i++) {
@@ -62,8 +90,13 @@ bool RfCapture::capture(uint32_t timeoutMs) {
   }
 
   if (count_ < 10) {
-    Serial.println("[RF] 抓包失败：未收到有效信号");
-    Serial.println("[RF] 检查：模块接线、供电、遥控器电量");
+    Serial.printf("[RF] 抓包失败：仅 %u 个脉冲\n", count_);
+    Serial.println("[RF] 检查清单：");
+    Serial.println("[RF]  1) ANT 接 17cm 导线天线（必须）");
+    Serial.println("[RF]  2) 遥控器贴到天线 5~10cm 再按");
+    Serial.println("[RF]  3) 确认遥控是 433MHz 不是 315");
+    Serial.println("[RF]  4) 接收板远离 ESP32/USB 线；可 wifi off");
+    Serial.println("[RF]  5) 遥控器换新电池");
     return false;
   }
 
