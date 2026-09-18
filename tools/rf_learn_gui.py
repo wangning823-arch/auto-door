@@ -53,7 +53,6 @@ class RfLearnApp:
 
         self._build(ports := pick_ports())
         self.port_var.set(ports[0])
-        self.root.after(300, self._tick)
 
     def _build(self, ports):
         top = tk.Frame(self.root, bg="#0f1419")
