@@ -258,6 +258,17 @@ uint16_t RfCapture::keyCount(int idx) const {
   return keyLen_[idx];
 }
 
+void RfCapture::exportKeyCsv(int idx) const {
+  if (idx < 0 || idx >= RF_KEY_COUNT || keyLen_[idx] == 0) return;
+  static const char* names[4] = {"open", "close", "stop", "lock"};
+  Serial.printf("RFDATA %d %s %u ", idx, names[idx], keyLen_[idx]);
+  for (uint16_t i = 0; i < keyLen_[idx]; i++) {
+    if (i) Serial.print(',');
+    Serial.print(keys_[idx][i]);
+  }
+  Serial.println();
+}
+
 bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
   if (txPin_ < 0 || !p || n < 5) return false;
   if (repeats == 0) repeats = 1;

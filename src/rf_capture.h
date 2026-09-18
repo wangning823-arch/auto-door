@@ -32,6 +32,8 @@ class RfCapture {
   bool playKey(int idx);
   bool keyValid(int idx) const;
   uint16_t keyCount(int idx) const;
+  // 打印 RFDATA <idx> <name> <n> <csv...>
+  void exportKeyCsv(int idx) const;
 
   int rxPin() const { return rxPin_; }
   int txPin() const { return txPin_; }

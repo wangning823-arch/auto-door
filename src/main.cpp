@@ -267,6 +267,9 @@ static void handleSerial() {
         rfPrintKeys();
       } else if (line == "rfkeys") {
         rfPrintKeys();
+      } else if (line == "rfexport") {
+        for (int i = 0; i < RF_KEY_COUNT; i++) gRf.exportKeyCsv(i);
+        Serial.println("[RF] export done");
       } else if (line == "nfcscan") {
         Serial.println("[CMD] 等待刷卡 5 秒...");
         String uid;
@@ -297,7 +300,7 @@ static void handleSerial() {
       } else if (line == "help") {
         Serial.println(
             "cmds: status | open | close | rfcap | rflearn 0-3 | rfplay 0-3 | rfkeys | "
-            "rfclear | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
+            "rfexport | rfclear | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
       } else {
         Serial.println("[CMD] unknown, try help");
       }
@@ -331,6 +334,9 @@ void setup() {
     }
     Serial.println("[BOOT] RF keys:");
     rfPrintKeys();
+    for (int i = 0; i < RF_KEY_COUNT; i++) {
+      if (gRf.keyValid(i)) gRf.exportKeyCsv(i);
+    }
     if (!any) Serial.println("[BOOT] 尚未学习，串口: rflearn 0 再短按遥控");
   }
 
