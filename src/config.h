@@ -33,6 +33,16 @@
 #define PIN_STATUS_LED 2
 #endif
 
+// 433MHz 接收模块 DATA（超再生/超外差模块）
+#ifndef PIN_RF_DATA
+#define PIN_RF_DATA 13
+#endif
+
+// RF 抓包参数
+#define RF_CAPTURE_MAX_PULSES  512     // 最大记录脉冲数
+#define RF_CAPTURE_GAP_US      10000   // 静默超过 10ms 视为一次传输结束
+#define RF_CAPTURE_TIMEOUT_MS  5000    // 抓包超时 5 秒
+
 // ===== 目标车机蓝牙 MAC（默认值；运行时可由网页/NVS 覆盖）=====
 #ifndef CAR_BT_MAC
 #define CAR_BT_MAC "58:C4:1E:84:59:8B"

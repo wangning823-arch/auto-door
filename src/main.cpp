@@ -6,6 +6,7 @@
 #include "config_store.h"
 #include "web_portal.h"
 #include "ble_scan.h"
+#include "rf_capture.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -16,6 +17,7 @@ static DoorFsm gDoor;
 static ConfigStore gCfg;
 static WebPortal gWeb;
 static BleScanTool gBleScan;
+static RfCapture gRf;
 static char gMac[24] = CAR_BT_MAC;
 
 // 运行中长按 BOOT(GPIO0) 3s：强制开 SoftAP
@@ -188,9 +190,14 @@ static void handleSerial() {
       } else if (line == "autotrack off") {
         gBt.setAutoTrack(false);
         Serial.println("[CMD] autotrack OFF");
+      } else if (line == "rfcap") {
+        // RF 抓包：按两次遥控器对比固定码/滚码
+        gRf.capture();
+      } else if (line == "rfdump") {
+        gRf.dump(100);
       } else if (line == "help") {
         Serial.println(
-            "cmds: status | open | close | pin N | blink | ble [sec] | relay high|low | wifi on|off | autotrack on|off");
+            "cmds: status | open | close | pin N | blink | ble [sec] | relay high|low | wifi on|off | autotrack on|off | rfcap");
       } else {
         Serial.println("[CMD] unknown, try help");
       }
@@ -212,6 +219,7 @@ void setup() {
 
   gDoor.begin();
   gCfg.begin();
+  gRf.begin(PIN_RF_DATA);
   String saved = gCfg.loadMac(CAR_BT_MAC);
   saved.toCharArray(gMac, sizeof(gMac));
   Serial.println("[BOOT] car MAC from NVS: " + saved);
