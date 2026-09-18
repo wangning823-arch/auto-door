@@ -117,9 +117,14 @@ String WebPortal::pageHtml() const {
             "手机需打开蓝牙并开启「可被搜索/开放检测」；车机需开着蓝牙。"
             "扫到后点列表即可填入 MAC。</div></div>");
 
-  html += F("<div class=\"card\"><form method=\"GET\" action=\"/door\">"
-            "<button class=\"sec\" name=\"a\" value=\"toggle\" type=\"submit\">开关门（手动）</button>"
-            "</form><div class=\"tip\">手动开关用于联调；自动开/关仍按渐变蓝牙规则执行。</div></div>");
+  html += F("<div class=\"card\">"
+            "<div class=\"row\"><span class=\"k\">手动控制</span><span class=\"v\">发 RF 键，不依赖门磁</span></div>"
+            "<form method=\"GET\" action=\"/door\" style=\"display:flex;gap:8px\">"
+            "<button name=\"a\" value=\"open\" type=\"submit\" style=\"flex:1\">开（上）</button>"
+            "<button name=\"a\" value=\"close\" type=\"submit\" class=\"sec\" style=\"flex:1\">关（下）</button>"
+            "</form>"
+            "<div class=\"tip\">无门磁时请用这两个按钮，不要靠状态猜开/关。"
+            "串口也可: open / close</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">BLE 特征</span><span class=\"v\">");
   html += bleFilt.length() ? bleFilt : String("(未选)");
@@ -257,7 +262,15 @@ void WebPortal::setupRoutes() {
       server.send(500, "text/plain", "no door");
       return;
     }
-    gPortal->door_->requestManualToggle(OpenSource::NFC);
+    String a = server.arg("a");
+    if (a == "open") {
+      gPortal->door_->requestManualOpen(OpenSource::NFC);
+    } else if (a == "close") {
+      gPortal->door_->requestManualClose(OpenSource::NFC);
+    } else {
+      // 兼容旧 toggle：无门磁时不可靠，默认当开
+      gPortal->door_->requestManualOpen(OpenSource::NFC);
+    }
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "ok");
   });

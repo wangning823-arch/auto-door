@@ -30,6 +30,8 @@ class DoorFsm {
 
   // 外部触发：NFC / TRIG(米家) / 串口
   void requestManualToggle(OpenSource src);
+  void requestManualOpen(OpenSource src);
+  void requestManualClose(OpenSource src);
   void notifyMagnet(bool closed);
   void setHoldOpen(bool hold) { holdOpen_ = hold; }
 

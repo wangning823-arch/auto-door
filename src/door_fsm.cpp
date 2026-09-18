@@ -117,21 +117,32 @@ bool DoorFsm::tryAutoClose(const char* why) {
 }
 
 void DoorFsm::requestManualToggle(OpenSource src) {
+  // 无门磁时状态不可靠：UNKNOWN 也走「开」——网页请用明确的开/关按钮
   if (doorState_ == DoorState::OPEN) {
-    Serial.println("[FSM] MANUAL CLOSE");
-    pending_ = DoorAction::PULSE_CLOSE;
-    emitClose();
-    doorState_ = DoorState::CLOSED;
-    openSource_ = OpenSource::NONE;
-    doorOpenTs_ = 0;
+    requestManualClose(src);
   } else {
-    Serial.println("[FSM] MANUAL OPEN");
-    pending_ = DoorAction::PULSE_OPEN;
-    emitOpen();
-    doorState_ = DoorState::OPEN;
-    openSource_ = src;
-    doorOpenTs_ = millis();
+    requestManualOpen(src);
   }
+}
+
+void DoorFsm::requestManualOpen(OpenSource src) {
+  Serial.println("[FSM] MANUAL OPEN");
+  pending_ = DoorAction::PULSE_OPEN;
+  emitOpen();
+  doorState_ = DoorState::OPEN;
+  openSource_ = src;
+  doorOpenTs_ = millis();
+  pending_ = DoorAction::NONE;
+  lastAnyActionTs_ = millis();
+}
+
+void DoorFsm::requestManualClose(OpenSource src) {
+  Serial.println("[FSM] MANUAL CLOSE");
+  pending_ = DoorAction::PULSE_CLOSE;
+  emitClose();
+  doorState_ = DoorState::CLOSED;
+  openSource_ = src == OpenSource::NONE ? OpenSource::NONE : src;
+  doorOpenTs_ = 0;
   pending_ = DoorAction::NONE;
   lastAnyActionTs_ = millis();
 }
