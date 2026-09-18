@@ -26,6 +26,11 @@ class ConfigStore {
   bool saveNfcUid(const String& uid);
   bool clearNfcUid();
 
+  // RF 固定码按键 0..3（CSV 脉冲）；空=未学习
+  String loadRfKey(int idx);
+  bool saveRfKey(int idx, const char* csv);
+  bool clearRfKey(int idx);
+
  private:
   bool ready_ = false;
 };

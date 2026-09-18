@@ -72,3 +72,24 @@ bool ConfigStore::clearNfcUid() {
   if (!ready_) return false;
   return prefs.remove("nfc_uid");
 }
+
+String ConfigStore::loadRfKey(int idx) {
+  if (!ready_ || idx < 0 || idx > 3) return String();
+  char k[8];
+  snprintf(k, sizeof(k), "rfk%d", idx);
+  return prefs.getString(k, "");
+}
+
+bool ConfigStore::saveRfKey(int idx, const char* csv) {
+  if (!ready_ || idx < 0 || idx > 3 || !csv) return false;
+  char k[8];
+  snprintf(k, sizeof(k), "rfk%d", idx);
+  return prefs.putString(k, csv) > 0;
+}
+
+bool ConfigStore::clearRfKey(int idx) {
+  if (!ready_ || idx < 0 || idx > 3) return false;
+  char k[8];
+  snprintf(k, sizeof(k), "rfk%d", idx);
+  return prefs.remove(k);
+}

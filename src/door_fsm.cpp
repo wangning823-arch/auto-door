@@ -42,17 +42,35 @@ void DoorFsm::setRelayPin(int pin) {
 }
 
 void DoorFsm::pulseRelay() {
-  Serial.printf("[FSM] RELAY PULSE 1s pin=%d\n", relayPin_);
+  Serial.printf("[FSM] RELAY PULSE %dms pin=%d\n", RELAY_PULSE_MS, relayPin_);
 #if RELAY_ACTIVE_LOW
-  digitalWrite(relayPin_, LOW);   // 拉地=吸合
+  digitalWrite(relayPin_, LOW);
   delay(RELAY_PULSE_MS);
-  digitalWrite(relayPin_, HIGH);  // 悬空=释放
+  digitalWrite(relayPin_, HIGH);
 #else
   digitalWrite(relayPin_, HIGH);
   delay(RELAY_PULSE_MS);
   digitalWrite(relayPin_, LOW);
 #endif
   lastAnyActionTs_ = millis();
+}
+
+void DoorFsm::emitOpen() {
+  if (rfEmit_ && rfEmit_(true)) {
+    Serial.println("[FSM] RF TX open/up");
+    lastAnyActionTs_ = millis();
+    return;
+  }
+  pulseRelay();
+}
+
+void DoorFsm::emitClose() {
+  if (rfEmit_ && rfEmit_(false)) {
+    Serial.println("[FSM] RF TX close/down");
+    lastAnyActionTs_ = millis();
+    return;
+  }
+  pulseRelay();
 }
 
 bool DoorFsm::canAutoOpenNow() const {
@@ -68,7 +86,6 @@ bool DoorFsm::canAutoCloseNow() const {
   if (doorState_ == DoorState::CLOSED) return false;
   uint32_t now = millis();
   if (lastAutoCloseTs_ && (now - lastAutoCloseTs_) < AUTO_COOLDOWN_CLOSE_MS) return false;
-  // 自动开后至少等 AUTO_MIN_OPEN_HOLD_MS 再关（给车进库时间）
   if (lastAutoOpenTs_ && (now - lastAutoOpenTs_) < AUTO_MIN_OPEN_HOLD_MS) return false;
   return true;
 }
@@ -81,7 +98,7 @@ bool DoorFsm::tryAutoOpen(const char* why) {
   doorState_ = DoorState::OPEN;
   doorOpenTs_ = millis();
   lastAutoOpenTs_ = millis();
-  pulseRelay();
+  emitOpen();
   pending_ = DoorAction::NONE;
   return true;
 }
@@ -90,7 +107,7 @@ bool DoorFsm::tryAutoClose(const char* why) {
   if (!canAutoCloseNow()) return false;
   Serial.printf("[FSM] AUTO CLOSE (%s)\n", why ? why : "");
   pending_ = DoorAction::PULSE_CLOSE;
-  pulseRelay();
+  emitClose();
   doorState_ = DoorState::CLOSED;
   openSource_ = OpenSource::NONE;
   doorOpenTs_ = 0;
@@ -101,17 +118,16 @@ bool DoorFsm::tryAutoClose(const char* why) {
 
 void DoorFsm::requestManualToggle(OpenSource src) {
   if (doorState_ == DoorState::OPEN) {
-    // 手动关：允许（NFC/米家/串口），但 TRANSIT 时提示
     Serial.println("[FSM] MANUAL CLOSE");
     pending_ = DoorAction::PULSE_CLOSE;
-    pulseRelay();
+    emitClose();
     doorState_ = DoorState::CLOSED;
     openSource_ = OpenSource::NONE;
     doorOpenTs_ = 0;
   } else {
     Serial.println("[FSM] MANUAL OPEN");
     pending_ = DoorAction::PULSE_OPEN;
-    pulseRelay();
+    emitOpen();
     doorState_ = DoorState::OPEN;
     openSource_ = src;
     doorOpenTs_ = millis();

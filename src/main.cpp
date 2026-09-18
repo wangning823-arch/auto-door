@@ -22,6 +22,36 @@ static RfCapture gRf;
 static NfcReader gNfc;
 static char gMac[24] = CAR_BT_MAC;
 
+static bool rfSaveKeyCb(int idx, const char* csv) {
+  return gCfg.saveRfKey(idx, csv);
+}
+
+static bool rfEmitDoor(bool open) {
+  int idx = open ? RF_KEY_OPEN : RF_KEY_CLOSE;
+  if (!gRf.keyValid(idx)) return false;
+  return gRf.playKey(idx);
+}
+
+static int rfKeyIndexFromArg(const String& s) {
+  String t = s;
+  t.trim();
+  t.toLowerCase();
+  if (t == "0" || t == "open" || t == "up" || t == "开" || t == "上") return RF_KEY_OPEN;
+  if (t == "1" || t == "close" || t == "down" || t == "关" || t == "下") return RF_KEY_CLOSE;
+  if (t == "2" || t == "stop" || t == "pause" || t == "暂停" || t == "停") return RF_KEY_STOP;
+  if (t == "3" || t == "lock" || t == "锁定" || t == "锁") return RF_KEY_LOCK;
+  if (t.length() == 1 && t[0] >= '0' && t[0] <= '3') return t[0] - '0';
+  return -1;
+}
+
+static void rfPrintKeys() {
+  static const char* names[4] = {"open/up", "close/down", "stop/pause", "lock"};
+  for (int i = 0; i < RF_KEY_COUNT; i++) {
+    Serial.printf("[RF] key %d (%s): %s, %u pulses\n", i, names[i],
+                  gRf.keyValid(i) ? "OK" : "empty", gRf.keyCount(i));
+  }
+}
+
 // 运行中长按 BOOT(GPIO0) 3s：强制开 SoftAP
 // 注意：不能在「上电时按住」——GPIO0 会进 ROM 下载模式，应用根本不会跑
 static bool gForceApArmed = false;
@@ -193,10 +223,50 @@ static void handleSerial() {
         gBt.setAutoTrack(false);
         Serial.println("[CMD] autotrack OFF");
       } else if (line == "rfcap") {
-        // RF 抓包：按两次遥控器对比固定码/滚码
         gRf.capture();
       } else if (line == "rfdump") {
         gRf.dump(100);
+      } else if (line.startsWith("rflearn ")) {
+        int idx = rfKeyIndexFromArg(line.substring(8));
+        if (idx < 0) {
+          Serial.println("[RF] 用法: rflearn 0|1|2|3  或 open/close/stop/lock");
+        } else if (gRf.learnKey(idx, rfSaveKeyCb)) {
+          Serial.printf("[RF] 按键 %d 学习成功，可用 rfplay %d 测试\n", idx, idx);
+          rfPrintKeys();
+        }
+      } else if (line.startsWith("rfplay ")) {
+        int idx = rfKeyIndexFromArg(line.substring(7));
+        if (idx < 0) {
+          Serial.println("[RF] 用法: rfplay 0|1|2|3  或 open/close/stop/lock");
+        } else {
+          gRf.playKey(idx);
+        }
+      } else if (line.startsWith("rfset ")) {
+        // rfset 0 123,456,... 手动灌码
+        String rest = line.substring(6);
+        int sp = rest.indexOf(' ');
+        if (sp > 0) {
+          int idx = rfKeyIndexFromArg(rest.substring(0, sp));
+          String csv = rest.substring(sp + 1);
+          csv.trim();
+          if (idx >= 0 && csv.length()) {
+            if (gRf.setKeyFromCsv(idx, csv.c_str())) {
+              gCfg.saveRfKey(idx, csv.c_str());
+              Serial.printf("[RF] key %d 已写入 (%u pulses)\n", idx, gRf.keyCount(idx));
+            } else {
+              Serial.println("[RF] CSV 解析失败");
+            }
+          }
+        }
+      } else if (line.startsWith("rfclear")) {
+        for (int i = 0; i < RF_KEY_COUNT; i++) {
+          gCfg.clearRfKey(i);
+          gRf.setKeyFromCsv(i, "");
+        }
+        Serial.println("[RF] 已清除全部按键");
+        rfPrintKeys();
+      } else if (line == "rfkeys") {
+        rfPrintKeys();
       } else if (line == "nfcscan") {
         Serial.println("[CMD] 等待刷卡 5 秒...");
         String uid;
@@ -226,7 +296,8 @@ static void handleSerial() {
         Serial.println("[NFC] 已清除授权卡");
       } else if (line == "help") {
         Serial.println(
-            "cmds: status | open | close | pin N | blink | ble [sec] | relay high|low | wifi on|off | autotrack on|off | rfcap | nfcscan | nfcsave <uid> | nfcclear");
+            "cmds: status | open | close | rfcap | rflearn 0-3 | rfplay 0-3 | rfkeys | "
+            "rfclear | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
       } else {
         Serial.println("[CMD] unknown, try help");
       }
@@ -248,7 +319,20 @@ void setup() {
 
   gDoor.begin();
   gCfg.begin();
-  gRf.begin(PIN_RF_DATA);
+  gRf.begin(PIN_RF_DATA, PIN_RF_TX);
+  gDoor.setRfEmit(rfEmitDoor);
+
+  // 加载已学习的 RF 按键
+  {
+    bool any = false;
+    for (int i = 0; i < RF_KEY_COUNT; i++) {
+      String csv = gCfg.loadRfKey(i);
+      if (csv.length() && gRf.setKeyFromCsv(i, csv.c_str())) any = true;
+    }
+    Serial.println("[BOOT] RF keys:");
+    rfPrintKeys();
+    if (!any) Serial.println("[BOOT] 尚未学习，串口: rflearn 0 再短按遥控");
+  }
 
   Serial.println("[BOOT] NFC init...");
   if (gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL)) {
