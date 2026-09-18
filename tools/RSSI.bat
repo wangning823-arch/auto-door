@@ -9,17 +9,32 @@ echo Working dir: %CD%
 echo.
 
 set "PY="
-if defined MIMO_PYTHON if exist "%MIMO_PYTHON%" set "PY=%MIMO_PYTHON%"
-if not defined PY (
-    where python >nul 2>nul && set "PY=python"
+
+if defined MIMO_PYTHON if exist "%MIMO_PYTHON%" (
+    set "PY=%MIMO_PYTHON%"
+    goto :found
 )
 
-if not defined PY (
-    echo [ERROR] Python not found!
-    pause
-    exit /b 1
+if exist "C:\Program Files\Xiaomi MiMo\resources\runtimes\win32-x64\python\python.exe" (
+    set "PY=C:\Program Files\Xiaomi MiMo\resources\runtimes\win32-x64\python\python.exe"
+    goto :found
 )
 
+if exist "D:\Python37\python.exe" (
+    set "PY=D:\Python37\python.exe"
+    goto :found
+)
+
+py -3 --version >nul 2>nul && (
+    set "PY=py -3"
+    goto :found
+)
+
+echo [ERROR] Python not found!
+pause
+exit /b 1
+
+:found
 echo Python: %PY%
 echo Starting GUI...
 echo.
