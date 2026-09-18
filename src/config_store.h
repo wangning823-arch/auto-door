@@ -21,6 +21,11 @@ class ConfigStore {
   int loadTrackMode(int defaultMode = 0);
   bool saveTrackMode(int mode);
 
+  // NFC 授权卡 UID（十六进制，如 "04A1B2C3"）；空=未注册
+  String loadNfcUid();
+  bool saveNfcUid(const String& uid);
+  bool clearNfcUid();
+
  private:
   bool ready_ = false;
 };

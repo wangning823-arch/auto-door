@@ -7,6 +7,7 @@
 #include "web_portal.h"
 #include "ble_scan.h"
 #include "rf_capture.h"
+#include "nfc_reader.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -18,6 +19,7 @@ static ConfigStore gCfg;
 static WebPortal gWeb;
 static BleScanTool gBleScan;
 static RfCapture gRf;
+static NfcReader gNfc;
 static char gMac[24] = CAR_BT_MAC;
 
 // 运行中长按 BOOT(GPIO0) 3s：强制开 SoftAP
@@ -195,9 +197,36 @@ static void handleSerial() {
         gRf.capture();
       } else if (line == "rfdump") {
         gRf.dump(100);
+      } else if (line == "nfcscan") {
+        Serial.println("[CMD] 等待刷卡 5 秒...");
+        String uid;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 5000) {
+          if (gNfc.poll(uid)) {
+            Serial.println("[NFC] 读到卡: " + uid);
+            break;
+          }
+          delay(50);
+        }
+        if (uid.length() == 0) Serial.println("[NFC] 超时未读到卡");
+      } else if (line.startsWith("nfcsave ")) {
+        String uid = line.substring(8);
+        uid.trim();
+        uid.toUpperCase();
+        if (uid.length() >= 8) {
+          gCfg.saveNfcUid(uid);
+          gNfc.setAuthUid(uid);
+          Serial.println("[NFC] 已保存授权卡: " + uid);
+        } else {
+          Serial.println("[NFC] UID 太短，先 nfcscan 读卡");
+        }
+      } else if (line == "nfcclear") {
+        gCfg.clearNfcUid();
+        gNfc.setAuthUid("");
+        Serial.println("[NFC] 已清除授权卡");
       } else if (line == "help") {
         Serial.println(
-            "cmds: status | open | close | pin N | blink | ble [sec] | relay high|low | wifi on|off | autotrack on|off | rfcap");
+            "cmds: status | open | close | pin N | blink | ble [sec] | relay high|low | wifi on|off | autotrack on|off | rfcap | nfcscan | nfcsave <uid> | nfcclear");
       } else {
         Serial.println("[CMD] unknown, try help");
       }
@@ -220,6 +249,14 @@ void setup() {
   gDoor.begin();
   gCfg.begin();
   gRf.begin(PIN_RF_DATA);
+
+  Serial.println("[BOOT] NFC init...");
+  if (gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL)) {
+    String auth = gCfg.loadNfcUid();
+    gNfc.setAuthUid(auth);
+    Serial.println("[BOOT] NFC auth: " + (auth.length() ? auth : String("(未注册)")));
+  }
+
   String saved = gCfg.loadMac(CAR_BT_MAC);
   saved.toCharArray(gMac, sizeof(gMac));
   Serial.println("[BOOT] car MAC from NVS: " + saved);
@@ -257,6 +294,23 @@ void loop() {
   serviceBootLongPress();
   handleSerial();
   gBt.loop();
+
+  // NFC 刷卡：授权卡 → 手动开关门
+  {
+    String uid;
+    if (gNfc.poll(uid)) {
+      Serial.println("[NFC] card: " + uid);
+      if (gNfc.isAuthorized(uid)) {
+        Serial.println("[NFC] authorized -> toggle");
+        gDoor.requestManualToggle(OpenSource::NFC);
+      } else if (gNfc.authUid().length() == 0) {
+        // 未注册任何卡：打印 UID 方便用户注册
+        Serial.println("[NFC] 未注册卡，串口执行: nfcsave " + uid);
+      } else {
+        Serial.println("[NFC] 未授权卡");
+      }
+    }
+  }
 
   // ===== 跟踪模式分发 =====
   int trackMode = gWeb.trackMode();  // 实时从 WebPortal 读取（网页可改）
@@ -379,6 +433,6 @@ void loop() {
     lastLog = millis();
     Serial.println("[LOG] " + gDoor.debugLine() + " | " + gBt.debugLine() +
                    " | ble_rssi=" + String(gBleScan.matchRssi()) +
-                   " f=" + gBleScan.filter());
+                   " f=" + gBleScan.filter() + " | " + gNfc.debugLine());
   }
 }

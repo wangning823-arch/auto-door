@@ -38,6 +38,20 @@
 #define PIN_RF_DATA 13
 #endif
 
+// 433MHz 发射模块 DATA（学习回放用）
+#ifndef PIN_RF_TX
+#define PIN_RF_TX 26
+#endif
+
+// PN532 NFC（I2C 模式，模块焊盘拨到 I2C）
+// GPIO21 已被继电器占用，I2C 改用 16/17
+#ifndef PIN_NFC_SDA
+#define PIN_NFC_SDA 16
+#endif
+#ifndef PIN_NFC_SCL
+#define PIN_NFC_SCL 17
+#endif
+
 // RF 抓包参数
 #define RF_CAPTURE_MAX_PULSES  512     // 最大记录脉冲数
 #define RF_CAPTURE_GAP_US      10000   // 静默超过 10ms 视为一次传输结束

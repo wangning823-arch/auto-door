@@ -57,3 +57,18 @@ bool ConfigStore::saveTrackMode(int mode) {
   if (!ready_) return false;
   return prefs.putInt("track_mode", mode);
 }
+
+String ConfigStore::loadNfcUid() {
+  if (!ready_) return String();
+  return prefs.getString("nfc_uid", "");
+}
+
+bool ConfigStore::saveNfcUid(const String& uid) {
+  if (!ready_) return false;
+  return prefs.putString("nfc_uid", uid) > 0;
+}
+
+bool ConfigStore::clearNfcUid() {
+  if (!ready_) return false;
+  return prefs.remove("nfc_uid");
+}
