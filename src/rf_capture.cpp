@@ -68,7 +68,14 @@ bool RfCapture::capture(uint32_t timeoutMs) {
   }
 
   Serial.printf("[RF] 抓包成功：%u 个脉冲\n", count_);
-  dump(40);
+  // 完整脉冲序列，供 PC 工具解析画波形
+  Serial.print("[RF] pulses:");
+  for (uint16_t i = 0; i < count_; i++) {
+    Serial.print(' ');
+    Serial.print(pulses_[i]);
+    if (i + 1 < count_) Serial.print(',');
+  }
+  Serial.println();
 
   // 有上次数据则自动对比
   if (hasLast_) {
@@ -81,6 +88,34 @@ bool RfCapture::capture(uint32_t timeoutMs) {
   return true;
 }
 
+// 检测重复帧长（固定码/重复帧遥控）：pulses[i] ≈ pulses[i+L]
+static uint16_t detectFrameLen(const uint16_t* p, uint16_t n) {
+  if (n < 32) return n;
+  uint16_t bestL = 0;
+  uint16_t bestScore = 0;
+  const uint16_t minL = 16;
+  const uint16_t maxL = (n / 2 > 400) ? 400 : (n / 2);
+  for (uint16_t L = minL; L <= maxL; L++) {
+    uint16_t score = 0, cmp = 0;
+    uint16_t check = n - L;
+    if (check > L * 2) check = L * 2;
+    for (uint16_t i = 0; i < check; i++) {
+      uint16_t a = p[i], b = p[i + L];
+      uint16_t mx = a > b ? a : b;
+      uint16_t d = a > b ? a - b : b - a;
+      if (d <= (mx / 4 > 80 ? mx / 4 : 80)) score++;
+      cmp++;
+    }
+    if (cmp >= 16 && score * 10 >= cmp * 8) {  // ≥80% 匹配
+      if (score > bestScore || (score == bestScore && L > bestL)) {
+        bestScore = score;
+        bestL = L;
+      }
+    }
+  }
+  return bestL ? bestL : n;
+}
+
 bool RfCapture::compareWithLast() {
   if (!hasLast_ || lastCount_ == 0 || count_ == 0) {
     Serial.println("[RF] 无对比数据");
@@ -89,34 +124,38 @@ bool RfCapture::compareWithLast() {
 
   Serial.printf("[RF] 上次 %u 脉冲, 本次 %u 脉冲\n", lastCount_, count_);
 
-  if (lastCount_ == count_) {
-    bool same = true;
-    uint16_t mismatches = 0;
-    for (uint16_t i = 0; i < count_; i++) {
-      uint16_t a = pulses_[i];
-      uint16_t b = lastPulses_[i];
-      uint16_t diff = (a > b) ? (a - b) : (b - a);
-      uint16_t mx = (a > b) ? a : b;
-      uint16_t tol = mx / 5;  // 20% 容差
-      if (diff > tol && diff > 50) {
-        mismatches++;
-        if (mismatches <= 5) {
-          Serial.printf("[RF] 差异 #%u: %u vs %u\n", i, a, b);
-        }
+  // 按重复帧对齐：按压时长不同会导致总长不同，先取单帧再比
+  uint16_t la = detectFrameLen(lastPulses_, lastCount_);
+  uint16_t lb = detectFrameLen(pulses_, count_);
+  uint16_t frameLen = (la < lb) ? la : lb;
+  if (frameLen > 240) frameLen = 240;  // 单帧不会太长
+
+  Serial.printf("[RF] 帧长估计: %u / %u（按压次数不同不影响单帧对比）\n", la, lb);
+
+  uint16_t mismatches = 0;
+  uint16_t cmpN = frameLen;
+  for (uint16_t i = 0; i < cmpN; i++) {
+    uint16_t a = pulses_[i];
+    uint16_t b = lastPulses_[i];
+    uint16_t diff = (a > b) ? (a - b) : (b - a);
+    uint16_t mx = (a > b) ? a : b;
+    uint16_t tol = mx / 4;
+    if (tol < 80) tol = 80;
+    if (diff > tol) {
+      mismatches++;
+      if (mismatches <= 5) {
+        Serial.printf("[RF] 差异 #%u: %u vs %u\n", i, a, b);
       }
     }
-
-    if (mismatches == 0) {
-      Serial.println("[RF] ========== 码相同 ==========");
-      Serial.println("[RF] 结论：固定码，可直接克隆回放");
-      return true;
-    } else {
-      Serial.printf("[RF] 共 %u 处脉冲不同\n", mismatches);
-    }
-  } else {
-    Serial.println("[RF] 脉冲总数不同");
   }
 
+  if (mismatches == 0) {
+    Serial.println("[RF] ========== 码相同 ==========");
+    Serial.println("[RF] 结论：固定码，可直接克隆回放");
+    return true;
+  }
+
+  Serial.printf("[RF] 单帧内 %u 处脉冲不同 (共比较 %u)\n", mismatches, cmpN);
   Serial.println("[RF] ========== 码不同 ==========");
   Serial.println("[RF] 结论：可能是滚码，需要解码算法");
   return false;

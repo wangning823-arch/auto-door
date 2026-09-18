@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 433MHz RF 抓包波形查看器（Windows）
-- 连接 ESP32 串口，触发 rfcap 抓包
-- 可视化脉冲波形，多次抓包叠加对比
-- 自动判断固定码/滚码
-用法：python rf_capture_viewer.py
+- 串口触发 rfcap，解析完整脉冲序列并画波形
+- 按重复帧对齐对比，区分「按压次数不同」与「码不同」
+用法：双击 RF.bat 或 python rf_capture_viewer.py
 """
 import datetime
 import json
@@ -24,24 +23,76 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-# [RF] pulses: 350,700,350,...
-RE_PULSES = re.compile(r"\[RF\]\s+pulses:\s+(.+)")
-RE_COUNT = re.compile(r"\[RF\]\s+抓包成功：(\d+)\s+个脉冲")
-RE_SAME = re.compile(r"\[RF\].*码相同")
-RE_DIFF = re.compile(r"\[RF\].*码不同")
+# 固件输出: [RF] pulses: 350,700,350,...
+RE_PULSES = re.compile(r"\[RF\]\s+pulses:\s*(.+)")
+# 兼容旧格式: [RF] 350,700,...
+RE_PULSES_OLD = re.compile(r"^\[RF\]\s+(\d+(?:\s*,\s*\d+)+)\s*$")
+RE_COUNT = re.compile(r"\[RF\]\s+抓包成功：(\d+)")
+RE_SAME = re.compile(r"码相同|固定码")
+RE_DIFF = re.compile(r"码不同|可能是滚码")
+
+
+def detect_frame_len(pulses: list[int], min_len: int = 16, max_len: int = 400) -> int:
+    """检测重复帧长度：pulses[i] ≈ pulses[i+L]"""
+    n = len(pulses)
+    if n < min_len * 2:
+        return n
+    best_l = n
+    best_score = -1
+    max_l = min(max_len, n // 2)
+    for length in range(min_len, max_l + 1):
+        score = 0
+        cmp = 0
+        check = min(n - length, length * 2)
+        for i in range(check):
+            a, b = pulses[i], pulses[i + length]
+            mx = max(a, b, 1)
+            d = abs(a - b)
+            if d <= max(mx // 4, 80):
+                score += 1
+            cmp += 1
+        if cmp >= 16 and score * 10 >= cmp * 8:
+            if score > best_score or (score == best_score and length > best_l):
+                best_score = score
+                best_l = length
+    return best_l
+
+
+def first_frame(pulses: list[int], max_frame: int = 240) -> list[int]:
+    fl = min(detect_frame_len(pulses), max_frame, len(pulses))
+    return pulses[:fl]
+
+
+def pulses_equal(a: list[int], b: list[int]) -> tuple[bool, int, int]:
+    """返回 (相同?, 差异数, 比较长度)"""
+    n = min(len(a), len(b), 240)
+    if n == 0:
+        return False, 999, 0
+    mismatches = 0
+    for i in range(n):
+        x, y = a[i], b[i]
+        mx = max(x, y, 1)
+        if abs(x - y) > max(mx // 4, 80):
+            mismatches += 1
+    return mismatches == 0, mismatches, n
 
 
 class CaptureData:
-    """一次抓包数据"""
-
     def __init__(self, pulses: list[int], timestamp: str = None):
         self.pulses = pulses
         self.timestamp = timestamp or datetime.datetime.now().strftime("%H:%M:%S")
-        self.label = f"#{timestamp or self.timestamp}"
 
     @property
     def count(self) -> int:
         return len(self.pulses)
+
+    @property
+    def duration_ms(self) -> float:
+        return sum(self.pulses) / 1000.0
+
+    @property
+    def frame_len(self) -> int:
+        return detect_frame_len(self.pulses)
 
     @property
     def hash(self) -> int:
@@ -52,14 +103,18 @@ class CaptureData:
         return h
 
     def to_dict(self):
-        return {"timestamp": self.timestamp, "pulses": self.pulses, "count": self.count}
+        return {
+            "timestamp": self.timestamp,
+            "pulses": self.pulses,
+            "count": self.count,
+        }
 
 
 class RfCaptureApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("433MHz RF 抓包查看器")
-        root.geometry("1000x680")
+        root.geometry("1040x760")
         root.configure(bg="#0f1419")
 
         self.ser = None
@@ -67,15 +122,14 @@ class RfCaptureApp:
         self.reader = None
         self.captures: list[CaptureData] = []
         self.capturing = False
-        self.pulse_buf = []
         self.waiting_pulses = False
 
         self.status = tk.StringVar(value="未连接")
         self.port_var = tk.StringVar()
         self.result_var = tk.StringVar(value="-")
         self.count_var = tk.StringVar(value="0 次抓包")
+        self.stats_var = tk.StringVar(value="-")
 
-        # 列出串口
         ports = [p.device for p in list_ports.comports()]
         if not ports:
             ports = ["COM3"]
@@ -84,7 +138,6 @@ class RfCaptureApp:
             ports.insert(0, "COM3")
 
         self._build_ui(ports)
-        self.root.after(200, self.poll_ui)
 
     def _build_ui(self, ports):
         style = ttk.Style()
@@ -93,9 +146,8 @@ class RfCaptureApp:
         except Exception:
             pass
 
-        # 顶部工具栏
         top = tk.Frame(self.root, bg="#0f1419")
-        top.pack(fill="x", padx=12, pady=10)
+        top.pack(fill="x", padx=12, pady=(10, 4))
 
         tk.Label(top, text="串口", bg="#0f1419", fg="#8b9aab").pack(side="left")
         self.port_cb = ttk.Combobox(
@@ -120,58 +172,42 @@ class RfCaptureApp:
         )
         self.cap_btn.pack(side="left", padx=4)
 
-        tk.Button(
-            top, text="清空", bg="#2a3548", fg="#c5d0dc", width=6, command=self.clear_all
-        ).pack(side="left", padx=4)
-
-        tk.Button(
-            top, text="保存", bg="#2a3548", fg="#c5d0dc", width=6, command=self.save_captures
-        ).pack(side="left", padx=4)
-
-        tk.Button(
-            top, text="加载", bg="#2a3548", fg="#c5d0dc", width=6, command=self.load_captures
-        ).pack(side="left", padx=4)
+        for text, cmd in (("清空", self.clear_all), ("保存", self.save_captures), ("加载", self.load_captures)):
+            tk.Button(
+                top, text=text, bg="#2a3548", fg="#c5d0dc", width=6, command=cmd
+            ).pack(side="left", padx=3)
 
         tk.Label(top, textvariable=self.status, bg="#0f1419", fg="#3dd68c").pack(
-            side="left", padx=16
+            side="left", padx=12
         )
         tk.Label(top, textvariable=self.count_var, bg="#0f1419", fg="#8b9aab").pack(
-            side="left", padx=8
+            side="left", padx=6
         )
         tk.Label(top, text="结果:", bg="#0f1419", fg="#8b9aab").pack(side="left")
         tk.Label(top, textvariable=self.result_var, bg="#0f1419", fg="#f2c94c").pack(
             side="left", padx=4
         )
 
-        # 显示模式切换
-        mode_frame = tk.Frame(self.root, bg="#0f1419")
-        mode_frame.pack(fill="x", padx=12, pady=(0, 4))
+        # 第二行：视图控制
+        row2 = tk.Frame(self.root, bg="#0f1419")
+        row2.pack(fill="x", padx=12, pady=(0, 4))
 
         self.view_mode = tk.StringVar(value="wave")
-        tk.Radiobutton(
-            mode_frame,
-            text="波形图",
-            variable=self.view_mode,
-            value="wave",
-            bg="#0f1419",
-            fg="#e7ecf1",
-            selectcolor="#1a2332",
-            command=self.redraw,
-        ).pack(side="left", padx=8)
-        tk.Radiobutton(
-            mode_frame,
-            text="脉冲时序",
-            variable=self.view_mode,
-            value="timing",
-            bg="#0f1419",
-            fg="#e7ecf1",
-            selectcolor="#1a2332",
-            command=self.redraw,
-        ).pack(side="left", padx=8)
+        for val, text in (("wave", "方波"), ("frame", "首帧方波"), ("timing", "脉宽柱状")):
+            tk.Radiobutton(
+                row2,
+                text=text,
+                variable=self.view_mode,
+                value=val,
+                bg="#0f1419",
+                fg="#e7ecf1",
+                selectcolor="#1a2332",
+                command=self.redraw,
+            ).pack(side="left", padx=6)
 
         self.overlay_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
-            mode_frame,
+            row2,
             text="叠加对比",
             variable=self.overlay_var,
             bg="#0f1419",
@@ -180,41 +216,70 @@ class RfCaptureApp:
             command=self.redraw,
         ).pack(side="left", padx=8)
 
+        self.zoom_var = tk.StringVar(value="frame")
+        tk.Label(row2, text="缩放:", bg="#0f1419", fg="#8b9aab").pack(side="left", padx=(16, 4))
+        for val, text in (("frame", "首帧"), ("80ms", "80ms"), ("full", "完整")):
+            tk.Radiobutton(
+                row2,
+                text=text,
+                variable=self.zoom_var,
+                value=val,
+                bg="#0f1419",
+                fg="#e7ecf1",
+                selectcolor="#1a2332",
+                command=self.redraw,
+            ).pack(side="left", padx=4)
+
+        tk.Label(row2, textvariable=self.stats_var, bg="#0f1419", fg="#6b7c8f").pack(
+            side="right", padx=8
+        )
+
         # 图表
-        self.fig = Figure(figsize=(9.5, 4.5), dpi=100, facecolor="#1a2332")
+        self.fig = Figure(figsize=(10, 4.2), dpi=100, facecolor="#1a2332")
         self.ax = self.fig.add_subplot(111)
+        self._style_ax()
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=12, pady=4)
+
+        # 底部：提示 + 日志
+        tip = tk.Label(
+            self.root,
+            text="建议：短促点按遥控（按一下松手），每次手法一致；模块天线对准遥控器 10~20cm",
+            bg="#0f1419",
+            fg="#f2c94c",
+            font=("Segoe UI", 9),
+        )
+        tip.pack(fill="x", padx=12)
+
+        bottom = tk.Frame(self.root, bg="#0f1419")
+        bottom.pack(fill="both", padx=12, pady=(4, 10))
+        tk.Label(bottom, text="串口日志:", bg="#0f1419", fg="#8b9aab").pack(anchor="w")
+        self.log_text = tk.Text(
+            bottom,
+            height=7,
+            bg="#1a2332",
+            fg="#8b9aab",
+            font=("Consolas", 9),
+            relief="flat",
+            wrap="none",
+        )
+        self.log_text.pack(fill="both", expand=True, pady=4)
+
+    def _style_ax(self):
         self.ax.set_facecolor("#0f1419")
         self.ax.tick_params(colors="#8b9aab")
         self.ax.grid(True, alpha=0.25, color="#8b9aab")
         for spine in self.ax.spines.values():
             spine.set_color("#2e3d52")
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=12, pady=4)
-
-        # 底部日志
-        bottom = tk.Frame(self.root, bg="#0f1419")
-        bottom.pack(fill="x", padx=12, pady=8)
-
-        tk.Label(bottom, text="日志:", bg="#0f1419", fg="#8b9aab").pack(side="left")
-        self.log_text = tk.Text(
-            bottom,
-            height=5,
-            bg="#1a2332",
-            fg="#8b9aab",
-            font=("Consolas", 9),
-            relief="flat",
-        )
-        self.log_text.pack(fill="x", pady=4)
-
     def log(self, msg: str):
         def _do():
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
-            # 只保留最近 200 行
             lines = int(self.log_text.index("end-1c").split(".")[0])
-            if lines > 200:
-                self.log_text.delete("1.0", "100.0")
+            if lines > 300:
+                self.log_text.delete("1.0", "80.0")
 
         self.root.after(0, _do)
 
@@ -262,19 +327,16 @@ class RfCaptureApp:
         if self.capturing:
             return
         self.capturing = True
-        self.pulse_buf = []
         self.waiting_pulses = False
         self.cap_btn.config(state="disabled", text="抓包中...", bg="#f2c94c")
-        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 发送 rfcap，请按遥控器...")
+        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 发送 rfcap，请短按遥控器...")
         try:
             self.ser.write(b"rfcap\n")
         except Exception as e:
             self.log(f"[ERROR] 发送失败: {e}")
-            self.capturing = False
-            self.cap_btn.config(state="normal", text="抓包 (rfcap)", bg="#3dd68c")
+            self.capture_done()
 
     def read_loop(self):
-        buf = ""
         while self.running and self.ser and self.ser.is_open:
             try:
                 raw = self.ser.readline()
@@ -287,57 +349,63 @@ class RfCaptureApp:
                 line = raw.decode("utf-8", errors="replace").strip()
             except Exception:
                 continue
-            if not line:
-                continue
-            self.handle_line(line)
+            if line:
+                self.handle_line(line)
 
     def handle_line(self, line: str):
-        # 日志所有 RF 相关行
-        if line.startswith("[RF]") or "rfcap" in line.lower():
+        if line.startswith("[RF]") or "rfcap" in line.lower() or line.startswith("[CMD]"):
             self.log(line)
 
-        # 抓包成功，开始收集脉冲
-        m_count = RE_COUNT.search(line)
-        if m_count:
+        if RE_COUNT.search(line):
             self.waiting_pulses = True
-            self.pulse_buf = []
             return
 
-        # 脉冲数据行
-        m_pulses = RE_PULSES.search(line)
-        if m_pulses and self.waiting_pulses:
-            data = m_pulses.group(1)
-            # 可能有 "...(+N)" 结尾
+        m = RE_PULSES.search(line)
+        if m:
+            data = m.group(1)
             data = re.sub(r"\s*\.\.\..*$", "", data)
-            try:
-                pulses = [int(x.strip()) for x in data.split(",") if x.strip().isdigit()]
-                self.pulse_buf = pulses
-                self.waiting_pulses = False
-                # 创建捕获记录
-                cap = CaptureData(self.pulse_buf)
-                self.captures.append(cap)
+            pulses = []
+            for x in re.split(r"[,\s]+", data.strip()):
+                if x.isdigit():
+                    pulses.append(int(x))
+            self.waiting_pulses = False
+            if len(pulses) >= 10:
+                cap = CaptureData(pulses)
                 self.root.after(0, lambda c=cap: self.on_capture(c))
-            except Exception as e:
-                self.log(f"[ERROR] 解析脉冲失败: {e}")
+            else:
+                self.log("[ERROR] 解析到的脉冲太少")
+                self.root.after(0, self.capture_done)
             return
 
-        # 对比结果
-        if RE_SAME.search(line):
+        m2 = RE_PULSES_OLD.match(line)
+        if m2 and self.waiting_pulses:
+            pulses = [int(x) for x in m2.group(1).split(",") if x.strip().isdigit()]
+            self.waiting_pulses = False
+            if len(pulses) >= 10:
+                cap = CaptureData(pulses)
+                self.root.after(0, lambda c=cap: self.on_capture(c))
+            return
+
+        if RE_SAME.search(line) and "结论" in line:
             self.root.after(0, lambda: self.result_var.set("固定码（可克隆）"))
             self.root.after(0, lambda: self.result_var.configure(fg="#3dd68c"))
-        elif RE_DIFF.search(line):
+        elif RE_DIFF.search(line) and ("结论" in line or "滚码" in line):
             self.root.after(0, lambda: self.result_var.set("滚码（需解码）"))
             self.root.after(0, lambda: self.result_var.configure(fg="#f2c94c"))
 
-        # 抓包失败/超时
         if "抓包失败" in line or "超时" in line:
             self.root.after(0, self.capture_done)
 
     def on_capture(self, cap: CaptureData):
         self.capture_done()
+        self.captures.append(cap)
+        if len(self.captures) > 6:
+            self.captures = self.captures[-6:]
         self.count_var.set(f"{len(self.captures)} 次抓包")
+        self.stats_var.set(
+            f"最近: {cap.count} 脉冲 / {cap.duration_ms:.1f}ms / 帧长≈{cap.frame_len} / hash=0x{cap.hash:08X}"
+        )
         self.redraw()
-        # 多次抓包时自动对比
         if len(self.captures) >= 2:
             self.compare_captures()
 
@@ -350,33 +418,33 @@ class RfCaptureApp:
             return
         a = self.captures[-2]
         b = self.captures[-1]
-        if a.count == b.count:
-            mismatches = sum(
-                1
-                for x, y in zip(a.pulses, b.pulses)
-                if abs(x - y) > max(x, y) // 5 and abs(x - y) > 50
-            )
-            if mismatches == 0:
-                self.result_var.set("固定码（码相同）")
-                self.result_var.configure(fg="#3dd68c")
-                self.log("[COMPARE] 码相同 → 固定码，可克隆")
-            else:
-                self.result_var.set(f"滚码? ({mismatches}处不同)")
-                self.result_var.configure(fg="#f2c94c")
-                self.log(f"[COMPARE] {mismatches} 处脉冲不同 → 可能是滚码")
-        else:
-            self.result_var.set("滚码? (脉冲数不同)")
-            self.result_var.configure(fg="#f2c94c")
-            self.log("[COMPARE] 脉冲数不同 → 可能是滚码")
+        fa = first_frame(a.pulses)
+        fb = first_frame(b.pulses)
+        same, mismatches, n = pulses_equal(fa, fb)
 
-    def to_square_wave(self, pulses: list[int]) -> tuple[list, list]:
-        """脉冲序列 → 方波坐标"""
+        if a.count != b.count:
+            self.log(
+                f"[COMPARE] 总脉冲 {a.count} vs {b.count}（按压时长不同，忽略）；"
+                f"单帧 {a.frame_len} vs {b.frame_len}"
+            )
+
+        if same:
+            self.result_var.set("固定码（单帧相同）")
+            self.result_var.configure(fg="#3dd68c")
+            self.log(f"[COMPARE] 单帧 {n} 脉冲一致 → 固定码，可克隆")
+        else:
+            self.result_var.set(f"滚码? 单帧{mismatches}处不同")
+            self.result_var.configure(fg="#f2c94c")
+            self.log(f"[COMPARE] 单帧 {n} 点中有 {mismatches} 处不同 → 可能是滚码")
+
+    @staticmethod
+    def to_square_wave(pulses: list[int]) -> tuple[list, list]:
         xs = [0.0]
-        ys = [1]
+        ys = [1.0]
         level = 1
-        t = 0
+        t = 0.0
         for p in pulses:
-            t += p / 1000.0  # ms
+            t += p / 1000.0
             xs.append(t)
             ys.append(level)
             level = 0 if level else 1
@@ -384,61 +452,88 @@ class RfCaptureApp:
             ys.append(level)
         return xs, ys
 
+    @staticmethod
+    def trim_to_duration(pulses: list[int], max_ms: float) -> list[int]:
+        out = []
+        total = 0.0
+        for p in pulses:
+            total += p / 1000.0
+            out.append(p)
+            if total >= max_ms:
+                break
+        return out
+
     def redraw(self):
         self.ax.clear()
-        self.ax.set_facecolor("#0f1419")
-        self.ax.tick_params(colors="#8b9aab")
-        self.ax.grid(True, alpha=0.25, color="#8b9aab")
-        for spine in self.ax.spines.values():
-            spine.set_color("#2e3d52")
+        self._style_ax()
 
         if not self.captures:
-            self.ax.set_title("无数据 — 连接串口后点「抓包」", color="#8b9aab")
+            self.ax.set_title("无数据 — 连接串口后点「抓包」，短按遥控器", color="#8b9aab")
             self.canvas.draw_idle()
             return
 
         colors = ["#2f80ed", "#3dd68c", "#f2c94c", "#e74c3c", "#9b59b6", "#1abc9c"]
-        overlay = self.overlay_var.get()
+        show = self.captures if self.overlay_var.get() else self.captures[-1:]
         mode = self.view_mode.get()
+        zoom = self.zoom_var.get()
 
-        show = self.captures if overlay else self.captures[-1:]
-
-        if mode == "wave":
-            self.ax.set_xlabel("时间 (ms)", color="#8b9aab")
-            self.ax.set_ylabel("信号", color="#8b9aab")
-            self.ax.set_ylim(-0.2, 1.2)
-            for i, cap in enumerate(show):
-                xs, ys = self.to_square_wave(cap.pulses)
-                c = colors[i % len(colors)]
-                label = f"#{len(self.captures) - len(show) + i + 1} ({cap.count})"
-                self.ax.plot(xs, ys, color=c, lw=1.2, label=label, drawstyle="steps-post")
-            self.ax.legend(
-                loc="upper right", facecolor="#1a2332", edgecolor="#2e3d52", fontsize=8
-            )
-            for t in self.ax.get_legend().get_texts():
-                t.set_color("#e7ecf1")
-        else:
-            # 脉冲时序：柱状图显示每个脉冲宽度
+        if mode == "timing":
             self.ax.set_xlabel("脉冲序号", color="#8b9aab")
             self.ax.set_ylabel("宽度 (us)", color="#8b9aab")
             for i, cap in enumerate(show):
+                pulses = cap.pulses[:240]
                 c = colors[i % len(colors)]
-                label = f"#{len(self.captures) - len(show) + i + 1}"
-                idx = range(len(cap.pulses))
-                self.ax.bar(idx, cap.pulses, color=c, alpha=0.7, label=label, width=1.0)
+                self.ax.bar(
+                    range(len(pulses)),
+                    pulses,
+                    color=c,
+                    alpha=0.65,
+                    width=1.0,
+                    label=f"#{len(self.captures) - len(show) + i + 1} ({cap.count})",
+                )
+            self.ax.legend(
+                loc="upper right", facecolor="#1a2332", edgecolor="#2e3d52", fontsize=8
+            )
+            for t in self.ax.get_legend().get_texts():
+                t.set_color("#e7ecf1")
+        else:
+            self.ax.set_xlabel("时间 (ms)", color="#8b9aab")
+            self.ax.set_ylabel("信号", color="#8b9aab")
+            self.ax.set_ylim(-0.15, 1.15)
+            for i, cap in enumerate(show):
+                pulses = cap.pulses
+                if mode == "frame":
+                    pulses = first_frame(pulses)
+                elif zoom == "80ms":
+                    pulses = self.trim_to_duration(pulses, 80)
+                elif zoom == "frame" and mode == "wave":
+                    pulses = first_frame(pulses)
+                xs, ys = self.to_square_wave(pulses)
+                c = colors[i % len(colors)]
+                n = len(self.captures) - len(show) + i + 1
+                self.ax.plot(
+                    xs,
+                    ys,
+                    color=c,
+                    lw=1.3,
+                    label=f"#{n} n={cap.count}",
+                    drawstyle="steps-post",
+                )
             self.ax.legend(
                 loc="upper right", facecolor="#1a2332", edgecolor="#2e3d52", fontsize=8
             )
             for t in self.ax.get_legend().get_texts():
                 t.set_color("#e7ecf1")
 
-        # 标题
         n = len(self.captures)
         if n >= 2:
-            self.ax.set_title(f"已抓 {n} 次 | 对比结果: {self.result_var.get()}", color="#e7ecf1")
+            self.ax.set_title(
+                f"已抓 {n} 次 | {self.result_var.get()}", color="#e7ecf1", fontsize=11
+            )
         else:
-            self.ax.set_title(f"已抓 {n} 次（再抓一次对比）", color="#e7ecf1")
-
+            self.ax.set_title(
+                f"已抓 {n} 次（再抓一次做单帧对比）", color="#e7ecf1", fontsize=11
+            )
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
@@ -447,6 +542,7 @@ class RfCaptureApp:
         self.result_var.set("-")
         self.result_var.configure(fg="#f2c94c")
         self.count_var.set("0 次抓包")
+        self.stats_var.set("-")
         self.redraw()
 
     def save_captures(self):
@@ -460,10 +556,9 @@ class RfCaptureApp:
         )
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            data = [c.to_dict() for c in self.captures]
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            self.log(f"[SAVE] 已保存到 {path}")
+                json.dump([c.to_dict() for c in self.captures], f, ensure_ascii=False, indent=2)
+            self.log(f"[SAVE] {path}")
             messagebox.showinfo("已保存", path)
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
@@ -483,14 +578,11 @@ class RfCaptureApp:
             self.captures = [CaptureData(d["pulses"], d.get("timestamp")) for d in data]
             self.count_var.set(f"{len(self.captures)} 次抓包")
             self.redraw()
-            self.log(f"[LOAD] 加载 {len(self.captures)} 次抓包")
+            self.log(f"[LOAD] {len(self.captures)} 次")
             if len(self.captures) >= 2:
                 self.compare_captures()
         except Exception as e:
             messagebox.showerror("加载失败", str(e))
-
-    def poll_ui(self):
-        self.root.after(300, self.poll_ui)
 
     def on_close(self):
         self.disconnect()
