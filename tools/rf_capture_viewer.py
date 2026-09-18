@@ -123,6 +123,8 @@ class RfCaptureApp:
         self.captures: list[CaptureData] = []
         self.capturing = False
         self.waiting_pulses = False
+        self.capture_started = False  # 已看到固件 [RF] 等待信号
+        self.capture_deadline = 0.0   # 抓包总超时（工具侧兜底）
 
         self.status = tk.StringVar(value="未连接")
         self.port_var = tk.StringVar()
@@ -138,6 +140,7 @@ class RfCaptureApp:
             ports.insert(0, "COM3")
 
         self._build_ui(ports)
+        self.root.after(300, self.tick_watchdog)
 
     def _build_ui(self, ports):
         style = ttk.Style()
@@ -295,17 +298,49 @@ class RfCaptureApp:
             messagebox.showerror("错误", "请选择串口")
             return
         try:
-            self.ser = serial.Serial(port, 115200, timeout=0.3)
+            # 不拉 DTR/RTS，避免打开串口时复位 ESP32，丢掉第一条命令
+            self.ser = serial.Serial()
+            self.ser.port = port
+            self.ser.baudrate = 115200
+            self.ser.timeout = 0.3
+            self.ser.dsrdtr = False
+            self.ser.rtscts = False
+            self.ser.open()
+            try:
+                self.ser.dtr = False
+                self.ser.rts = False
+            except Exception:
+                pass
+            self.ser.reset_input_buffer()
         except Exception as e:
             messagebox.showerror("打开串口失败", str(e))
             return
         self.running = True
+        self.capturing = False
+        self.capture_started = False
         self.connect_btn.config(text="断开", bg="#c0392b")
-        self.cap_btn.config(state="normal")
-        self.status.set(f"已连接 {port}")
+        # 启动期间禁用抓包，等板子跑完再允许
+        self.cap_btn.config(state="disabled", text="启动中...", bg="#2a3548")
+        self.status.set(f"已连接 {port}（等待启动…）")
         self.reader = threading.Thread(target=self.read_loop, daemon=True)
         self.reader.start()
         self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 已连接 {port}")
+        self.log("[*] 等待 ESP32 启动约 2.5s（若曾被复位）…")
+        self.root.after(2500, self._on_boot_ready)
+
+    def _on_boot_ready(self):
+        if not self.running:
+            return
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.reset_input_buffer()
+                # 探活：空行触发回显/忽略，主要为冲掉残留
+                self.ser.write(b"\n")
+            except Exception:
+                pass
+        self.cap_btn.config(state="normal", text="抓包 (rfcap)", bg="#3dd68c")
+        self.status.set(self.status.get().replace("（等待启动…）", "") + " 就绪")
+        self.log("[*] 就绪，可点「抓包」；固件出现「等待信号」后再按遥控")
 
     def disconnect(self):
         self.running = False
@@ -316,8 +351,10 @@ class RfCaptureApp:
             except Exception:
                 pass
         self.ser = None
+        self.capturing = False
+        self.capture_started = False
         self.connect_btn.config(text="连接", bg="#2f80ed")
-        self.cap_btn.config(state="disabled")
+        self.cap_btn.config(state="disabled", text="抓包 (rfcap)", bg="#3dd68c")
         self.status.set("未连接")
 
     def trigger_capture(self):
@@ -327,14 +364,46 @@ class RfCaptureApp:
         if self.capturing:
             return
         self.capturing = True
+        self.capture_started = False
         self.waiting_pulses = False
-        self.cap_btn.config(state="disabled", text="抓包中...", bg="#f2c94c")
-        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 发送 rfcap，请短按遥控器...")
+        self.capture_deadline = time.time() + 12.0  # 固件8s + 余量
+        self.cap_btn.config(state="disabled", text="等待固件...", bg="#f2c94c")
+        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 发送 rfcap…")
         try:
+            self.ser.reset_input_buffer()
             self.ser.write(b"rfcap\n")
+            self.ser.flush()
         except Exception as e:
             self.log(f"[ERROR] 发送失败: {e}")
             self.capture_done()
+            return
+        # 等 ACK（后台）：看到「等待信号」才算真正开始
+        self.root.after(800, self._check_ack, 1)
+
+    def _check_ack(self, attempt: int):
+        if not self.capturing or self.capture_started:
+            if self.capturing and self.capture_started:
+                self.cap_btn.config(state="disabled", text="抓包中...", bg="#f2c94c")
+            return
+        if attempt <= 3 and self.ser and self.ser.is_open:
+            self.log(f"[*] 未收到固件 ACK，重发 rfcap（{attempt}/3）…")
+            try:
+                self.ser.write(b"rfcap\n")
+                self.ser.flush()
+            except Exception as e:
+                self.log(f"[ERROR] 重发失败: {e}")
+                self.capture_done()
+                return
+            self.root.after(1200, self._check_ack, attempt + 1)
+            return
+        self.log("[ERROR] 固件未响应 rfcap（可能复位/占线），本次取消")
+        self.capture_done()
+
+    def tick_watchdog(self):
+        if self.capturing and self.capture_deadline and time.time() > self.capture_deadline:
+            self.log("[ERROR] 工具侧超时，复位抓包状态（可再点一次）")
+            self.capture_done()
+        self.root.after(400, self.tick_watchdog)
 
     def read_loop(self):
         while self.running and self.ser and self.ser.is_open:
@@ -355,6 +424,14 @@ class RfCaptureApp:
     def handle_line(self, line: str):
         if line.startswith("[RF]") or "rfcap" in line.lower() or line.startswith("[CMD]"):
             self.log(line)
+
+        # 固件已进入等待 → ACK
+        if "等待信号" in line or "请按遥控器" in line:
+            self.capture_started = True
+            if self.capturing:
+                self.root.after(0, lambda: self.cap_btn.config(
+                    state="disabled", text="抓包中...", bg="#f2c94c"))
+                self.log("[*] 固件就绪，请短按遥控器")
 
         if RE_COUNT.search(line):
             self.waiting_pulses = True
@@ -411,7 +488,11 @@ class RfCaptureApp:
 
     def capture_done(self):
         self.capturing = False
-        self.cap_btn.config(state="normal", text="抓包 (rfcap)", bg="#3dd68c")
+        self.capture_started = False
+        self.waiting_pulses = False
+        self.capture_deadline = 0.0
+        if self.running:
+            self.cap_btn.config(state="normal", text="抓包 (rfcap)", bg="#3dd68c")
 
     def compare_captures(self):
         if len(self.captures) < 2:
