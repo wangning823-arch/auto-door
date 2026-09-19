@@ -95,18 +95,23 @@
 #define RSSI_WINDOW           10      // 滑动窗口点数
 #define RELAY_PULSE_MS        2000    // 遥控按压时长；1s 电机常不认，改 2s
 
-// ===== 简化 BLE 状态机（无→有→强=开；强→弱→无=关）=====
+// ===== BLE 状态机 =====
+// 开：无→有 就开（门关着信号弱也要开，例如门口 -93）
+// 例外：无→一上来就极强（≥ RSSI_SUDDEN_STRONG）= 库内唤醒，不开
+// 关：有→强 后再 变弱→无 = 关（进库变强，离开变无）
 // 用于 SU7 等有 BLE 广播的车
 // 实测参考（ESP32 在库内靠门侧）：
-//   车在库外远处 ~-97；库外门口 ~-75~-81；库内强 ~-70 以上
+//   车在库外远处 ~-97；库外门口 ~-75~-93（关门）；库内强 ~-70 以上
 #define RSSI_APPEAR_MIN       -110    // 出现信号下限（≥此值算「有」）
-#define RSSI_STRONG           -80     // 强信号阈值（≥此值算「强」）
+#define RSSI_STRONG           -80     // 强信号阈值（≥此值算「强」，关门路径用）
+#define RSSI_SUDDEN_STRONG    -70     // 首见就 ≥ 此值：库内唤醒，不自动开
 #define BLE_SILENT_GAP_MS     15000   // BLE 多久没匹配算「无信号」
 #define BLE_MISS_FOR_LOST     3       // 连续 N 次未匹配算「丢」
 
-// ===== 经典蓝牙渐变规则（用于小蚂蚁等无 BLE 车型）=====
-// 实测待补充：隔车库门经典蓝牙 RSSI 大约多少
-#define RSSI_OPEN             -80     // 渐近开门阈值 dBm（隔门信号弱，需实测调整）
+// ===== 经典蓝牙（与 BLE 共用开/关状态机阈值）=====
+// 开/关逻辑与 BLE 相同：无→有开；首见≥RSSI_SUDDEN_STRONG 不开；强→弱→无关
+// 以下仅保留给趋势/分区调试，门控不再单靠渐变
+#define RSSI_OPEN             -80     // （旧渐近开阈值，门控已统一）
 #define RSSI_FADE             -90     // 渐离弱信号阈值
 #define SLOPE_MIN             0.6f    // 渐变最小斜率 dBm/s
 #define T_CLEAR_MS            100000  // 门洞清空等待 100s

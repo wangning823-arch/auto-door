@@ -23,6 +23,7 @@ class BleScanTool {
   int matchRssi() const { return matchRssi_; }
   String matchLabel() const { return matchLabel_; }
   uint32_t lastMatchMs() const { return lastMatchMs_; }
+  uint32_t lastScanEndMs() const { return lastScanEndMs_; }
   uint8_t missStreak() const { return missStreak_; }
   bool lostCar() const { return lostCar_; }
   void clearLostFlag() { lostCar_ = false; }

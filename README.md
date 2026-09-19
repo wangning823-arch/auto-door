@@ -16,11 +16,15 @@ garage_door_firmware/
 ## 核心功能
 
 - **跟踪模式二选一**：BLE / 经典蓝牙（网页切换，存 NVS）
-- **BLE 模式**：无→有→强开，强→弱→无关（SU7 等有 BLE 广播的车）
-- **经典蓝牙模式**：渐近开，渐离+清空关（小蚂蚁等无 BLE 的车）
-- **冷却保护**：开门 5min / 关门 30s / 开后保持 15s
+- **自动开/关（BLE 与经典同一套状态机）**：
+  - 无 → 有即开（弱信号也开，例如门口约 -93）
+  - 首见 ≥ -70 不开（库内蓝牙唤醒）
+  - 强(-80) → 弱 → 无 = 关
+  - 详见 `docs/联调记录_20260919_RF学习与BLE自动门.md`
+- **冷却保护**：开门 5min / 关门 30s / 开后保持 60s
+- **315/433 固定码学习回放**：学习模式预热+抗噪；多帧抓包提码
 - 手动开关（网页/串口/NFC/米家 TRIG）
-- 门磁检测（暂不参与自动开关判断）
+- 门磁：自动开不依赖门磁；自动关后 20s 内忽略误报「仍开着」
 
 ## 接线（默认，可在 `config.h` 改）
 
@@ -56,6 +60,12 @@ cd D:\mimo\车库门自动化\garage_door_firmware
 ```
 status          查看状态
 open / close    手动开关
+rfauto on|off   周期自动发开码（默认应 OFF）
+rflearn 0-3     学习按键（0开 1关 2暂停 3锁）
+rfplay 0-3      回放按键
+rfset 0 <csv>   手动灌码
+rfcap / rfstop  连续抓包
+rfkeys/rfexport 查看/导出按键
 ble [sec]       BLE 扫描
 bletrack on/off BLE 跟踪开关
 blefilter XXX   设置 BLE 特征
@@ -65,8 +75,12 @@ wifi on/off     WiFi 开关
 
 ## 调试工具
 
-- `tools/rssi_monitor.py` - 实时 RSSI 曲线监控
-- `tools/serial_logger.ps1` - 串口日志记录
+- `tools/学习按键.bat` / `rf_learn_gui.py` - 按键学习向导
+- `tools/RF.bat` / `rf_capture_viewer.py` - 连续抓包与波形
+- `tools/rf_cmd.py` - 串口发命令
+- `tools/open_key_candidates.json` - 开键多帧聚类候选
+- `tools/rf_keys_backup.json` - 按键备份（key0开/key1关已实车验证）
+- `docs/联调记录_20260919_RF学习与BLE自动门.md` - 本轮联调说明
 
 ## 待实现（商品化版本）
 

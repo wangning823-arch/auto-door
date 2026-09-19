@@ -101,8 +101,7 @@ String WebPortal::pageHtml() const {
   if (trackMode_ == TRACK_MODE_CLASSIC) html += F("checked ");
   html += F(">经典蓝牙（小蚂蚁等无 BLE 的车）</label>"
             "<button type=\"submit\">保存模式</button></form>"
-            "<div class=\"tip\">BLE：无→有→强开，强→弱→无关。"
-            "经典蓝牙：渐近开，渐离+清空关。</div></div>");
+            "<div class=\"tip\">BLE 与经典同一套：无→有即开（弱也开）；首见≥-70 不开；强→弱→无关。</div></div>");
 
   html += F("<div class=\"card\"><form method=\"GET\" action=\"/save\" id=\"macform\">"
             "<label>车机 / 钥匙 蓝牙 MAC</label>"

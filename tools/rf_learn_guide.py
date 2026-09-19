@@ -73,11 +73,16 @@ def main():
         ser.reset_input_buffer()
         ser.write(f"rflearn {idx}\n".encode())
         ser.flush()
+        t0 = time.time()
         result = read_until(
             ser,
-            ["学习成功", "抓包失败", "提不出", "保存 NVS 失败"],
+            ["学习成功", "抓包失败", "提不出", "波形不像固定码", "保存 NVS 失败"],
             timeout=35.0,
         )
+        # 固件最短监听约 2s+预热；过早回显视为噪音
+        if "学习成功" in result and (time.time() - t0) < 1.2:
+            print(">>> 忽略过早的学习成功（疑似噪音），请重试")
+            result = ""
         if "学习成功" in result:
             print(f">>> 按键 {idx} 成功")
         else:

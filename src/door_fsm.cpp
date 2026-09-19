@@ -75,7 +75,8 @@ void DoorFsm::emitClose() {
 
 bool DoorFsm::canAutoOpenNow() const {
   if (holdOpen_) return false;
-  if (doorState_ == DoorState::OPEN) return false;
+  // 自动开不依赖门磁：关门后门磁常仍报 OPEN（无门磁/极性/关门行程中），
+  // 若用 doorState_==OPEN 拦会把「无→有→强」全部挡掉（本次不自动开的根因）
   uint32_t now = millis();
   if (lastAutoOpenTs_ && (now - lastAutoOpenTs_) < AUTO_COOLDOWN_OPEN_MS) return false;
   return true;
@@ -91,7 +92,14 @@ bool DoorFsm::canAutoCloseNow() const {
 }
 
 bool DoorFsm::tryAutoOpen(const char* why) {
-  if (!canAutoOpenNow()) return false;
+  if (!canAutoOpenNow()) {
+    Serial.printf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d door=%d cool_open=%lu cool_close=%lu hold_ms=%lu\n",
+                  why ? why : "?", holdOpen_ ? 1 : 0, (int)doorState_,
+                  (unsigned long)(lastAutoOpenTs_ ? (millis() - lastAutoOpenTs_) : 0),
+                  (unsigned long)(lastAutoCloseTs_ ? (millis() - lastAutoCloseTs_) : 0),
+                  (unsigned long)(lastAutoOpenTs_ ? (millis() - lastAutoOpenTs_) : 0));
+    return false;
+  }
   Serial.printf("[FSM] AUTO OPEN (%s)\n", why ? why : "");
   pending_ = DoorAction::PULSE_OPEN;
   openSource_ = OpenSource::AUTO;
@@ -104,7 +112,13 @@ bool DoorFsm::tryAutoOpen(const char* why) {
 }
 
 bool DoorFsm::tryAutoClose(const char* why) {
-  if (!canAutoCloseNow()) return false;
+  if (!canAutoCloseNow()) {
+    Serial.printf("[FSM] AUTO CLOSE 拒绝 (%s) hold=%d door=%d cool=%lu since_open=%lu\n",
+                  why ? why : "?", holdOpen_ ? 1 : 0, (int)doorState_,
+                  (unsigned long)(lastAutoCloseTs_ ? (millis() - lastAutoCloseTs_) : 0),
+                  (unsigned long)(lastAutoOpenTs_ ? (millis() - lastAutoOpenTs_) : 0));
+    return false;
+  }
   Serial.printf("[FSM] AUTO CLOSE (%s)\n", why ? why : "");
   pending_ = DoorAction::PULSE_CLOSE;
   emitClose();
@@ -149,6 +163,11 @@ void DoorFsm::requestManualClose(OpenSource src) {
 
 void DoorFsm::notifyMagnet(bool closed) {
   magnetOk_ = true;
+  // 刚自动关门后的行程时间里，门磁常仍报“开着”，先别改状态
+  if (!closed && lastAutoCloseTs_ &&
+      (millis() - lastAutoCloseTs_) < 20000) {
+    return;
+  }
   DoorState s = closed ? DoorState::CLOSED : DoorState::OPEN;
   if (s != doorState_) {
     // 若原遥控开关，标记 UNKNOWN 来源（仅当与系统状态不一致）

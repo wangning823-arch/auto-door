@@ -46,10 +46,12 @@ def main():
 
     ser.write(cmd.encode())
     ser.flush()
+    t0 = time.time()
     print("已发送，请按遥控对应键...", flush=True)
 
     buf = b""
     end = time.time() + wait_s
+    success_at = None
     while time.time() < end:
         c = ser.read(4096)
         if c:
@@ -69,14 +71,22 @@ def main():
                         "按键",
                         "pulses:",
                         "仅噪声",
+                        "波形不像",
                     )
                 ):
                     print(ln[:240], flush=True)
-            if "学习成功" in text or "按键" in text and "成功" in text:
-                time.sleep(0.5)
-                buf += ser.read(8192)
-                break
-            if "学习失败" in text or "保存 NVS 失败" in text:
+            if success_at is None and ("学习成功" in text or ("按键" in text and "成功" in text)):
+                if time.time() - t0 < 1.2:
+                    print(f"忽略过早学习成功（{time.time()-t0:.2f}s，疑似噪音）", flush=True)
+                    # 丢掉这段误报，继续等
+                    buf = b""
+                    ser.read(8192)
+                else:
+                    success_at = time.time()
+                    time.sleep(0.5)
+                    buf += ser.read(8192)
+                    break
+            if "学习失败" in text or "保存 NVS 失败" in text or "波形不像" in text:
                 break
         else:
             time.sleep(0.05)

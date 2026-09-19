@@ -8,7 +8,10 @@ class RfCapture {
   void begin(int rxPin = PIN_RF_DATA, int txPin = PIN_RF_TX);
 
   // 分析用抓包（完整序列 + 与上次对比）
-  bool capture(uint32_t timeoutMs = RF_CAPTURE_TIMEOUT_MS);
+  // warmupMs: 先丢弃的预热噪声；learnMode: 学习专用（更严、不许噪音提前收尾）
+  bool capture(uint32_t timeoutMs = RF_CAPTURE_TIMEOUT_MS,
+               uint32_t warmupMs = 0,
+               bool learnMode = false);
 
   // 连续抓包：一直听，每收到一帧就打印 pulses 并继续；rfstop 结束
   bool captureContinuous();

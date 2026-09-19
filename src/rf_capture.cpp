@@ -6,6 +6,9 @@ static volatile uint16_t rfIdx = 0;
 static volatile bool rfCapturing = false;
 // 真·数据脉冲（≥80µs 且 <5ms）：有足够多才允许因帧间隙提前结束
 static volatile uint16_t rfDataN = 0;
+// 学习模式：预热/最短监听结束前禁止 ISR 用帧间隙提前收尾（否则噪音抢先成功）
+static volatile bool rfLearnMode = false;
+static uint16_t detectFrameLen(const uint16_t* p, uint16_t n);
 void (*RfCapture::idleHook_)() = nullptr;
 void (*RfCapture::startHook_)() = nullptr;
 volatile bool RfCapture::stopReq_ = false;
@@ -25,7 +28,8 @@ static void IRAM_ATTR rfIsr() {
   }
   if (dur >= RF_CAPTURE_GAP_US) {
     // 只有已经收到像样的数据帧才靠间隙收尾；纯底噪继续听满超时
-    if (rfDataN >= 15 && rfIdx > 10) rfCapturing = false;
+    // 学习模式下完全交给主循环按最短监听+静默判定，避免噪音提前截断
+    if (!rfLearnMode && rfDataN >= 15 && rfIdx > 10) rfCapturing = false;
     return;
   }
   if (rfIdx < RF_CAPTURE_MAX_PULSES) {
@@ -33,6 +37,26 @@ static void IRAM_ATTR rfIsr() {
     rfPulseBuf[rfIdx++] = store;
     if (rfIsDataPulse(dur)) rfDataN++;
   }
+}
+
+// 固定码单帧粗检：脉宽合理 + 短/长脉冲成对出现（纯噪音很难过）
+static bool frameLooksLikeFixedCode(const uint16_t* p, uint16_t n) {
+  if (n < 24 || n > RF_KEY_MAX_PULSES + 16) return false;
+  uint16_t inRange = 0, shortish = 0, longish = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    uint16_t v = p[i];
+    if (v >= 80 && v <= 3500) inRange++;
+    if (v >= 80 && v < 400) shortish++;
+    else if (v >= 400 && v <= 2500) longish++;
+  }
+  if (inRange * 10 < n * 8) return false;
+  if (shortish < 6 || longish < 6) return false;
+  // 有可识别重复周期更像 EV1527/PT2262 类固定码
+  if (n >= 32) {
+    uint16_t L = detectFrameLen(p, n);
+    if (L >= 16 && L <= n / 2) return true;
+  }
+  return n >= 32;
 }
 
 void RfCapture::begin(int rxPin, int txPin) {
@@ -44,7 +68,8 @@ void RfCapture::begin(int rxPin, int txPin) {
   for (int i = 0; i < RF_KEY_COUNT; i++) keyLen_[i] = 0;
 }
 
-bool RfCapture::capture(uint32_t timeoutMs) {
+// warmupMs：学习时先丢弃模块预热噪声；learnMode：最短监听结束前不许提前收尾
+bool RfCapture::capture(uint32_t timeoutMs, uint32_t warmupMs, bool learnMode) {
   if (rxPin_ < 0) return false;
 
   if (count_ > 0) {
@@ -53,23 +78,44 @@ bool RfCapture::capture(uint32_t timeoutMs) {
     hasLast_ = true;
   }
 
+  rfLearnMode = learnMode;
   rfIdx = 0;
   rfDataN = 0;
   rfCapturing = true;
   rfLastChangeUs = micros();
   count_ = 0;
 
-  Serial.printf("[RF] 等待信号... (RX=GPIO%d, 超时 %ums)\n", rxPin_, timeoutMs);
+  Serial.printf("[RF] 等待信号... (RX=GPIO%d, 超时 %ums%s)\n",
+                rxPin_, timeoutMs, learnMode ? ", 学习模式" : "");
   Serial.println("[RF] 请短按遥控器（5~10cm 对准天线）...");
 
   attachInterrupt(digitalPinToInterrupt(rxPin_), rfIsr, CHANGE);
 
   uint32_t start = millis();
+  // 学习预热：持续丢弃边沿，避免超再生模块起振噪音被当成码
+  if (warmupMs > 0) {
+    uint32_t warmEnd = start + warmupMs;
+    while (millis() < warmEnd) {
+      rfIdx = 0;
+      rfDataN = 0;
+      rfLastChangeUs = micros();
+      if (idleHook_) idleHook_();
+      delay(2);
+    }
+    rfIdx = 0;
+    rfDataN = 0;
+    rfLastChangeUs = micros();
+    start = millis();
+    Serial.printf("[RF] 预热完成，开始正式监听（最短 %ums）...\n",
+                  learnMode ? 2000u : 3500u);
+  }
+
   uint16_t lastPrinted = 0;
   uint32_t lastHookMs = 0;
   uint32_t lastProgMs = 0;
   bool sawData = false;
-  const uint32_t MIN_LISTEN_MS = 3500;
+  const uint32_t MIN_LISTEN_MS = learnMode ? 2000 : 3500;
+  const uint16_t minDataN = learnMode ? 24 : 15;
   while ((millis() - start) < timeoutMs) {
     if (!rfCapturing) break;
     if (idleHook_ && (millis() - lastHookMs) >= 20) {
@@ -78,7 +124,7 @@ bool RfCapture::capture(uint32_t timeoutMs) {
     }
     uint16_t n = rfIdx;
     uint16_t d = rfDataN;
-    if (d >= 15 && !sawData) {
+    if (d >= minDataN && !sawData) {
       sawData = true;
       Serial.printf("[RF] 检测到数据脉冲 %u（继续听满 %ums 以便再按遥控）...\n",
                     d, MIN_LISTEN_MS);
@@ -95,9 +141,12 @@ bool RfCapture::capture(uint32_t timeoutMs) {
                     (unsigned long)elapsed, n, d,
                     sawData ? " [有数据]" : "");
     }
-    if (sawData && n >= 10 && rfLastChangeUs > 0 &&
+    // 学习：必须听满最短时间且数据够，再等静默才允许结束
+    // 普通抓包：保持原逻辑
+    bool ready = learnMode ? (d >= minDataN && n >= 24) : (d >= 15 && n >= 10);
+    if (ready && sawData && rfLastChangeUs > 0 &&
         (millis() - start) >= MIN_LISTEN_MS) {
-      if ((micros() - rfLastChangeUs) > 25000) {
+      if ((micros() - rfLastChangeUs) > (learnMode ? 40000 : 25000)) {
         rfCapturing = false;
         break;
       }
@@ -108,6 +157,7 @@ bool RfCapture::capture(uint32_t timeoutMs) {
     delay(1);
   }
   rfCapturing = false;
+  rfLearnMode = false;
   detachInterrupt(digitalPinToInterrupt(rxPin_));
   delay(5);
 
@@ -115,14 +165,14 @@ bool RfCapture::capture(uint32_t timeoutMs) {
   for (uint16_t i = 0; i < count_; i++) pulses_[i] = rfPulseBuf[i];
   uint16_t dataN = rfDataN;
 
-  if (dataN < 15) {
+  if (dataN < (learnMode ? minDataN : 15)) {
     Serial.printf("[RF] 抓包失败：仅噪声（数据脉冲 %u，总 %u）\n", dataN, count_);
     Serial.println("[RF] 不是有效遥控码；请靠近天线/检查 RX 天线与 5V 后再抓");
     count_ = 0;
     Serial.println("[RF] RFCAP_END");
     return false;
   }
-  if (count_ < 10) {
+  if (count_ < (learnMode ? 24 : 10)) {
     Serial.printf("[RF] 抓包失败：仅 %u 个脉冲\n", count_);
     Serial.println("[RF] RFCAP_END");
     return false;
@@ -173,14 +223,23 @@ bool RfCapture::captureContinuous() {
   uint16_t lastTotal = 0;
 
   while (!stopReq_) {
-    // 在阻塞循环里也能收到 rfstop（否则串口命令进不来）
+    // 抓包中也能收命令
     while (Serial.available()) {
       char c = Serial.read();
       if (c == '\n' || c == '\r') {
         line.trim();
-        if (line == "rfstop") stopReq_ = true;
+        if (line == "rfstop") {
+          stopReq_ = true;
+        } else if (line == "open" || line.endsWith(" 0") || line == "rfplay" ||
+                   line.startsWith("rfplay 0")) {
+          Serial.println("[RF] 抓包中收到发射命令 → playKey(0)");
+          playKey(RF_KEY_OPEN);
+        } else if (line == "close" || line.startsWith("rfplay 1")) {
+          Serial.println("[RF] 抓包中收到发射命令 → playKey(1)");
+          playKey(RF_KEY_CLOSE);
+        }
         line = "";
-      } else if (line.length() < 32) {
+      } else if (line.length() < 64) {
         line += c;
       }
     }
@@ -438,12 +497,18 @@ static bool pulsesFromCsv(const char* s, uint16_t* out, uint16_t* n, uint16_t ma
 bool RfCapture::learnKey(int idx, bool (*saveFn)(int, const char*)) {
   if (idx < 0 || idx >= RF_KEY_COUNT) return false;
   Serial.printf("[RF] 学习按键 %d：请短按遥控对应键...\n", idx);
-  if (!capture()) return false;
+  // 500ms 预热丢噪 + 学习模式最短监听 2s，避免噪音在按键前就“学习成功”
+  if (!capture(8000, 500, true)) return false;
 
   uint16_t frame[RF_KEY_MAX_PULSES];
   uint16_t fn = 0;
-  if (!extractOneFrame(frame, &fn, RF_KEY_MAX_PULSES)) {
-    Serial.println("[RF] 学习失败：提不出单帧");
+  if (!extractOneFrame(frame, &fn, RF_KEY_MAX_PULSES) || fn < 24) {
+    Serial.println("[RF] 学习失败：提不出有效单帧");
+    return false;
+  }
+  if (!frameLooksLikeFixedCode(frame, fn)) {
+    Serial.printf("[RF] 学习失败：波形不像固定码（%u 脉冲，疑似噪音）\n", fn);
+    Serial.println("[RF] 请靠近天线 5~10cm，短按遥控后重试");
     return false;
   }
 

@@ -41,6 +41,7 @@ class RfLearnApp:
         self.running = False
         self.reader = None
         self.learning_idx = -1  # 当前学习中，-1 空闲
+        self.learn_sent_at = 0.0
         self.buf = b""
         self.status = tk.StringVar(value="未连接")
         self.port_var = tk.StringVar()
@@ -224,12 +225,19 @@ class RfLearnApp:
             messagebox.showwarning("提示", "请先连接串口")
             return
         self.learning_idx = idx
+        # 清掉可能残留的旧「学习成功」回显，避免误判
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        self.buf = b""
         _, label, short, hint = KEYS[idx]
         self.btns[idx].config(state="disabled", text="学习中…", bg="#f2c94c", fg="black")
         self.st_labels[idx].config(text=f"{short}: 学习中", fg="#f2c94c")
         self.phase_var.set(f"正在学习：{label}")
         self.hint_var.set(f"{hint}（距离天线 5~10cm，短按一下）")
         self.send_line(f"rflearn {idx}")
+        self.learn_sent_at = time.time()
         self.log(f"开始学习按键 {idx}（{label}），请按遥控…")
 
     def _finish_learn(self, idx: int, ok: bool, detail: str = ""):
@@ -288,13 +296,21 @@ class RfLearnApp:
             return
 
         if "学习成功" in text:
+            # 固件含 0.5s 预热 + ≥2s 最短监听；过早成功按噪音残留忽略
+            waited = time.time() - self.learn_sent_at if self.learn_sent_at else 0
+            if waited < 1.2:
+                self.log(f"忽略过早的学习成功（仅 {waited:.2f}s，疑似噪音/残留）")
+                return
             self.root.after(0, lambda: self._finish_learn(idx, True))
+            return
+        if "波形不像固定码" in text or "提不出有效单帧" in text:
+            self.root.after(0, lambda: self._finish_learn(idx, False, text))
             return
         if "保存 NVS 失败" in text or "提不出单帧" in text:
             self.root.after(0, lambda: self._finish_learn(idx, False, text))
             return
         if "抓包失败" in text:
-            self.root.after(0, lambda: self._finish_learn(idx, False, "未收到遥控信号"))
+            self.root.after(0, lambda: self._finish_learn(idx, False, "未收到遥控信号/仅噪声"))
             return
 
         if text.startswith("[RF] key "):
