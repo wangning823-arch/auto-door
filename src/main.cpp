@@ -8,6 +8,7 @@
 #include "ble_scan.h"
 #include "rf_capture.h"
 #include "nfc_reader.h"
+#include "default_rf_keys.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -30,6 +31,28 @@ static bool rfEmitDoor(bool open) {
   int idx = open ? RF_KEY_OPEN : RF_KEY_CLOSE;
   if (!gRf.keyValid(idx)) return false;
   return gRf.playKey(idx);
+}
+
+// 本机是否已「进库/开过门」——只有成立后才允许自动关，避免上电/库内唤醒闪断连发 close
+static bool gCloseArmed = false;
+
+static bool autoCloseGuarded(const char* why) {
+  if (millis() < AUTO_BOOT_GRACE_MS) {
+    Serial.printf("[FSM] 关门跳过（上电宽限 %us 内）(%s)\n",
+                  (unsigned)(AUTO_BOOT_GRACE_MS / 1000), why ? why : "");
+    return false;
+  }
+  if (!gCloseArmed) {
+    Serial.printf("[FSM] 关门跳过（未确认进库/开过门）(%s)\n", why ? why : "");
+    return false;
+  }
+  return gDoor.tryAutoClose(why);
+}
+
+static bool autoOpenThenArm(const char* why) {
+  bool ok = gDoor.tryAutoOpen(why);
+  if (ok) gCloseArmed = true;
+  return ok;
 }
 
 static int rfKeyIndexFromArg(const String& s) {
@@ -406,7 +429,17 @@ static void handleSerial() {
       } else if (line == "help") {
         Serial.println(
             "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
-            "rfexport | rfclear | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
+            "rfexport | rfclear | rfdefaults | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
+      } else if (line == "rfdefaults") {
+        // 强制写入实车验证的开/关码（修第二块板开码不对）
+        bool ok0 = gRf.setKeyFromCsv(RF_KEY_OPEN, RF_DEFAULT_OPEN_CSV);
+        bool ok1 = gRf.setKeyFromCsv(RF_KEY_CLOSE, RF_DEFAULT_CLOSE_CSV);
+        if (ok0) gCfg.saveRfKey(RF_KEY_OPEN, RF_DEFAULT_OPEN_CSV);
+        if (ok1) gCfg.saveRfKey(RF_KEY_CLOSE, RF_DEFAULT_CLOSE_CSV);
+        Serial.printf("[RF] 默认码已写入 open=%d close=%d\n", ok0, ok1);
+        rfPrintKeys();
+        if (ok0) gRf.exportKeyCsv(RF_KEY_OPEN);
+        if (ok1) gRf.exportKeyCsv(RF_KEY_CLOSE);
       } else {
         Serial.println("[CMD] unknown, try help");
       }
@@ -432,19 +465,37 @@ void setup() {
   gRf.setIdleHook(rfAutoTxService);
   gDoor.setRfEmit(rfEmitDoor);
 
-  // 加载已学习的 RF 按键
+  // 开关码统一：key0/key1 每次上电强制为实车验证默认码（多板一致）。
+  // key2/key3（暂停/锁）仍从 NVS 加载。rflearn 0/1 重启后会被默认码覆盖。
   {
-    bool any = false;
-    for (int i = 0; i < RF_KEY_COUNT; i++) {
+    for (int i = 2; i < RF_KEY_COUNT; i++) {
       String csv = gCfg.loadRfKey(i);
-      if (csv.length() && gRf.setKeyFromCsv(i, csv.c_str())) any = true;
+      if (csv.length()) gRf.setKeyFromCsv(i, csv.c_str());
     }
+
+    String nvs0 = gCfg.loadRfKey(RF_KEY_OPEN);
+    String nvs1 = gCfg.loadRfKey(RF_KEY_CLOSE);
+    bool changed = (nvs0 != RF_DEFAULT_OPEN_CSV) || (nvs1 != RF_DEFAULT_CLOSE_CSV);
+
+    bool ok0 = gRf.setKeyFromCsv(RF_KEY_OPEN, RF_DEFAULT_OPEN_CSV);
+    bool ok1 = gRf.setKeyFromCsv(RF_KEY_CLOSE, RF_DEFAULT_CLOSE_CSV);
+    if (ok0 && ok1) {
+      if (changed) {
+        gCfg.saveRfKey(RF_KEY_OPEN, RF_DEFAULT_OPEN_CSV);
+        gCfg.saveRfKey(RF_KEY_CLOSE, RF_DEFAULT_CLOSE_CSV);
+        Serial.println("[BOOT] 开关码已统一为默认开49p/关80p（NVS 已更新）");
+      } else {
+        Serial.println("[BOOT] 开关码已是统一默认开49p/关80p");
+      }
+    } else {
+      Serial.println("[BOOT] 默认开关码写入失败");
+    }
+
     Serial.println("[BOOT] RF keys:");
     rfPrintKeys();
     for (int i = 0; i < RF_KEY_COUNT; i++) {
       if (gRf.keyValid(i)) gRf.exportKeyCsv(i);
     }
-    if (!any) Serial.println("[BOOT] 尚未学习，串口: rflearn 0 再短按遥控");
   }
 
   // 上电恢复 rfauto（防止 RF.bat 连串口复位后丢掉周期发射）
@@ -558,9 +609,10 @@ void loop() {
             if (hasSignal && !suddenVeryStrong) {
               // 无→有：门口 -93 也要开，不等到 -80
               Serial.printf("[FSM] 无→有 rssi=%d，自动开\n", r);
-              gDoor.tryAutoOpen("无→有");
+              autoOpenThenArm("无→有");
               phase = BlePhase::APPEARING;
             } else if (suddenVeryStrong) {
+              // 库内唤醒：不自动开；进 STRONG 但不 arm 关门，防丢失闪断连发 close
               phase = BlePhase::STRONG;
               Serial.printf("[FSM] 无→强跳变 rssi=%d，不自动开（库内唤醒？）\n", r);
             }
@@ -568,13 +620,11 @@ void loop() {
 
           case BlePhase::APPEARING:
             if (isStrong) {
-              // 已在「无→有」开过；冷却内会拒绝重复开
-              gDoor.tryAutoOpen("无→有→强");
+              autoOpenThenArm("无→有→强");
               phase = BlePhase::STRONG;
             } else if (!hasSignal || lost) {
-              // 露了一下又没了且没进库变强：尝试关门（受 hold/冷却保护）
               Serial.println("[FSM] 弱信号消失，回 WAIT");
-              gDoor.tryAutoClose("有→无(未进库)");
+              autoCloseGuarded("有→无(未进库)");
               phase = BlePhase::WAIT_SIGNAL;
             }
             break;
@@ -582,17 +632,19 @@ void loop() {
           case BlePhase::STRONG:
             if (!isStrong && hasSignal) {
               phase = BlePhase::LEAVING;
+              gCloseArmed = true;  // 确认曾在库内变强后再变弱 → 允许随后关门
               Serial.println("[FSM] 强→弱，车开始离开");
             } else if (!hasSignal || lost) {
               Serial.println("[FSM] 强信号直接消失，尝试关门");
-              gDoor.tryAutoClose("强→无");
+              autoCloseGuarded("强→无");
               phase = BlePhase::WAIT_SIGNAL;
             }
             break;
 
           case BlePhase::LEAVING:
             if (!hasSignal || lost) {
-              gDoor.tryAutoClose("强→弱→无");
+              gCloseArmed = true;
+              autoCloseGuarded("强→弱→无");
               phase = BlePhase::WAIT_SIGNAL;
             } else if (isStrong) {
               phase = BlePhase::STRONG;
@@ -610,15 +662,17 @@ void loop() {
       }
     }
   } else {
-    // Classic：与 BLE 同一套 —— 无→有即开；首见≥-70 不开；强→弱→无=关
+    // Classic：与 BLE 同一套；仅在 seen/rssi 边沿评估，避免每 loop 空转
     enum class ClPhase : uint8_t {
       WAIT_SIGNAL, APPEARING, STRONG, LEAVING,
     };
     static ClPhase clPhase = ClPhase::WAIT_SIGNAL;
     static uint32_t lastClLogMs = 0;
+    static bool clPrevSeen = false;
+    static int clPrevRssi = -999;
+    static bool clInited = false;
 
     if (gBt.autoTrack() && gBt.hasTarget()) {
-      // Inquiry 约 3s 一轮，丢失窗口与 BLE 共用 15s，避免漏一帧就误判
       int r = gBt.lastRssi();
       bool seen = gBt.seenRecently(BLE_SILENT_GAP_MS);
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
@@ -626,59 +680,71 @@ void loop() {
       bool suddenVeryStrong = hasSignal && r >= RSSI_SUDDEN_STRONG;
       bool lost = !seen;
 
-      if (millis() - lastClLogMs >= 4000) {
-        lastClLogMs = millis();
-        const char* phaseName =
-            clPhase == ClPhase::WAIT_SIGNAL ? "WAIT" :
-            clPhase == ClPhase::APPEARING   ? "APPEAR" :
-            clPhase == ClPhase::STRONG      ? "STRONG" : "LEAVE";
-        Serial.printf("[CLASSIC] rssi=%d seen=%d strong=%d lost=%d phase=%s\n",
-                      r, (int)hasSignal, (int)isStrong, (int)lost, phaseName);
-      }
+      bool edge = !clInited || (seen != clPrevSeen) ||
+                  (seen && abs(r - clPrevRssi) >= 5);
+      if (!edge) {
+        // 无边沿只打周期日志
+      } else {
+        clInited = true;
+        clPrevSeen = seen;
+        clPrevRssi = r;
 
-      switch (clPhase) {
-        case ClPhase::WAIT_SIGNAL:
-          if (hasSignal && !suddenVeryStrong) {
-            Serial.printf("[FSM] C 无→有 rssi=%d，自动开\n", r);
-            gDoor.tryAutoOpen("经典无→有");
-            clPhase = ClPhase::APPEARING;
-          } else if (suddenVeryStrong) {
-            clPhase = ClPhase::STRONG;
-            Serial.printf("[FSM] C 无→强跳变 rssi=%d，不自动开（库内唤醒？）\n", r);
-          }
-          break;
+        if (millis() - lastClLogMs >= 2000) {
+          lastClLogMs = millis();
+          const char* phaseName =
+              clPhase == ClPhase::WAIT_SIGNAL ? "WAIT" :
+              clPhase == ClPhase::APPEARING   ? "APPEAR" :
+              clPhase == ClPhase::STRONG      ? "STRONG" : "LEAVE";
+          Serial.printf("[CLASSIC] rssi=%d seen=%d strong=%d lost=%d phase=%s\n",
+                        r, (int)hasSignal, (int)isStrong, (int)lost, phaseName);
+        }
 
-        case ClPhase::APPEARING:
-          if (isStrong) {
-            gDoor.tryAutoOpen("经典无→有→强");
-            clPhase = ClPhase::STRONG;
-          } else if (lost) {
-            Serial.println("[FSM] C 弱信号消失，回 WAIT");
-            gDoor.tryAutoClose("经典有→无(未进库)");
-            clPhase = ClPhase::WAIT_SIGNAL;
-          }
-          break;
+        switch (clPhase) {
+          case ClPhase::WAIT_SIGNAL:
+            if (hasSignal && !suddenVeryStrong) {
+              Serial.printf("[FSM] C 无→有 rssi=%d，自动开\n", r);
+              autoOpenThenArm("经典无→有");
+              clPhase = ClPhase::APPEARING;
+            } else if (suddenVeryStrong) {
+              clPhase = ClPhase::STRONG;
+              Serial.printf("[FSM] C 无→强跳变 rssi=%d，不自动开（库内唤醒？）\n", r);
+            }
+            break;
 
-        case ClPhase::STRONG:
-          if (!isStrong && hasSignal) {
-            clPhase = ClPhase::LEAVING;
-            Serial.println("[FSM] C 强→弱，开始离开");
-          } else if (lost) {
-            Serial.println("[FSM] C 强信号消失，尝试关门");
-            gDoor.tryAutoClose("经典强→无");
-            clPhase = ClPhase::WAIT_SIGNAL;
-          }
-          break;
+          case ClPhase::APPEARING:
+            if (isStrong) {
+              autoOpenThenArm("经典无→有→强");
+              clPhase = ClPhase::STRONG;
+            } else if (lost) {
+              Serial.println("[FSM] C 弱信号消失，回 WAIT");
+              autoCloseGuarded("经典有→无(未进库)");
+              clPhase = ClPhase::WAIT_SIGNAL;
+            }
+            break;
 
-        case ClPhase::LEAVING:
-          if (lost) {
-            gDoor.tryAutoClose("经典强→弱→无");
-            clPhase = ClPhase::WAIT_SIGNAL;
-          } else if (isStrong) {
-            clPhase = ClPhase::STRONG;
-            Serial.println("[FSM] C 弱→强，取消离开");
-          }
-          break;
+          case ClPhase::STRONG:
+            if (!isStrong && hasSignal) {
+              clPhase = ClPhase::LEAVING;
+              gCloseArmed = true;
+              Serial.println("[FSM] C 强→弱，开始离开");
+            } else if (lost) {
+              Serial.println("[FSM] C 强信号消失，尝试关门");
+              autoCloseGuarded("经典强→无");
+              clPhase = ClPhase::WAIT_SIGNAL;
+            }
+            break;
+
+          case ClPhase::LEAVING:
+            if (lost) {
+              gCloseArmed = true;
+              autoCloseGuarded("经典强→弱→无");
+              clPhase = ClPhase::WAIT_SIGNAL;
+            } else if (isStrong) {
+              clPhase = ClPhase::STRONG;
+              Serial.println("[FSM] C 弱→强，取消离开");
+            }
+            break;
+        }
       }
     }
   }

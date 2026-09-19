@@ -10,10 +10,10 @@ void DoorFsm::begin() {
 #else
   digitalWrite(relayPin_, LOW);
 #endif
-  pinMode(PIN_DOOR_MAGNET, INPUT_PULLUP);
   pinMode(PIN_TRIG_IN, INPUT_PULLUP);
   pinMode(PIN_LEARN_BTN, INPUT_PULLUP);
   pinMode(PIN_STATUS_LED, OUTPUT);
+  // 开/关为不同 RF 码，不用门磁推断门态
   doorState_ = DoorState::UNKNOWN;
   Serial.printf("[FSM] begin (F0, relay pin=%d active_%s OD)\n", relayPin_,
                 RELAY_ACTIVE_LOW ? "LOW" : "HIGH");
@@ -21,7 +21,7 @@ void DoorFsm::begin() {
 
 void DoorFsm::setRelayPin(int pin) {
   if (pin < 0 || pin > 39) return;
-  if (pin == 0 || pin == 1 || pin == 3 || pin == PIN_DOOR_MAGNET ||
+  if (pin == 0 || pin == 1 || pin == 3 ||
       pin == PIN_TRIG_IN || pin == PIN_STATUS_LED) {
     Serial.println("[FSM] relay pin reserved, try 21/13/32/33");
     return;
@@ -75,8 +75,7 @@ void DoorFsm::emitClose() {
 
 bool DoorFsm::canAutoOpenNow() const {
   if (holdOpen_) return false;
-  // 自动开不依赖门磁：关门后门磁常仍报 OPEN（无门磁/极性/关门行程中），
-  // 若用 doorState_==OPEN 拦会把「无→有→强」全部挡掉（本次不自动开的根因）
+  // 仅冷却+hold；门态由本机发开/关码维护，不用门磁
   uint32_t now = millis();
   if (lastAutoOpenTs_ && (now - lastAutoOpenTs_) < AUTO_COOLDOWN_OPEN_MS) return false;
   return true;
@@ -84,6 +83,7 @@ bool DoorFsm::canAutoOpenNow() const {
 
 bool DoorFsm::canAutoCloseNow() const {
   if (holdOpen_) return false;
+  // software CLOSED = 本机已发过关码；不读门磁
   if (doorState_ == DoorState::CLOSED) return false;
   uint32_t now = millis();
   if (lastAutoCloseTs_ && (now - lastAutoCloseTs_) < AUTO_COOLDOWN_CLOSE_MS) return false;
@@ -131,7 +131,7 @@ bool DoorFsm::tryAutoClose(const char* why) {
 }
 
 void DoorFsm::requestManualToggle(OpenSource src) {
-  // 无门磁时状态不可靠：UNKNOWN 也走「开」——网页请用明确的开/关按钮
+  // 开/关为不同 RF 码：有软件 OPEN 走关，否则走开（网页请用明确开/关按钮）
   if (doorState_ == DoorState::OPEN) {
     requestManualClose(src);
   } else {
@@ -161,36 +161,7 @@ void DoorFsm::requestManualClose(OpenSource src) {
   lastAnyActionTs_ = millis();
 }
 
-void DoorFsm::notifyMagnet(bool closed) {
-  magnetOk_ = true;
-  // 刚自动关门后的行程时间里，门磁常仍报“开着”，先别改状态
-  if (!closed && lastAutoCloseTs_ &&
-      (millis() - lastAutoCloseTs_) < 20000) {
-    return;
-  }
-  DoorState s = closed ? DoorState::CLOSED : DoorState::OPEN;
-  if (s != doorState_) {
-    // 若原遥控开关，标记 UNKNOWN 来源（仅当与系统状态不一致）
-    if (doorState_ != DoorState::UNKNOWN &&
-        openSource_ == OpenSource::NONE) {
-      openSource_ = OpenSource::UNKNOWN_SRC;
-    }
-    doorState_ = s;
-    if (s == DoorState::OPEN) doorOpenTs_ = millis();
-    if (s == DoorState::CLOSED) doorOpenTs_ = 0;
-    Serial.printf("[FSM] magnet -> %s\n", s == DoorState::OPEN ? "OPEN" : "CLOSED");
-  }
-}
-
 void DoorFsm::loop(BleTracker& bt) {
-  // 门磁
-  static uint32_t lastMag = 0;
-  if (millis() - lastMag > 200) {
-    lastMag = millis();
-    bool closed = digitalRead(PIN_DOOR_MAGNET) == LOW;
-    notifyMagnet(closed);
-  }
-
   // TRIG = 米家插座路径
   static bool lastTrig = true;
   bool trig = digitalRead(PIN_TRIG_IN);

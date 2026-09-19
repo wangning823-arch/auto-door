@@ -13,10 +13,8 @@
 #define RELAY_ACTIVE_LOW 1
 #endif
 
-// 门磁输入（上拉，闭合=门关）
-#ifndef PIN_DOOR_MAGNET
-#define PIN_DOOR_MAGNET 27
-#endif
+// 门磁输入：已停用（开/关为不同 RF 码，不靠门磁判门态）
+// #define PIN_DOOR_MAGNET 27
 
 // 米家插座路径：TRIG 干接点输入（上拉，短接到 GND=触发）
 #ifndef PIN_TRIG_IN
@@ -131,6 +129,8 @@
 #define AUTO_COOLDOWN_CLOSE_MS 30000  // 30 秒
 // 自动开后至少等这么久才能自动关（给车进库时间）
 #define AUTO_MIN_OPEN_HOLD_MS 60000   // 1 分钟
+// 上电宽限：此时间内禁止自动关（防第二块板启动即连发 close）
+#define AUTO_BOOT_GRACE_MS 15000
 
 // 串口调试
 #define SerialBaud 115200

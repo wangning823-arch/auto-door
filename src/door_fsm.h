@@ -32,10 +32,9 @@ class DoorFsm {
   void requestManualToggle(OpenSource src);
   void requestManualOpen(OpenSource src);
   void requestManualClose(OpenSource src);
-  void notifyMagnet(bool closed);
   void setHoldOpen(bool hold) { holdOpen_ = hold; }
 
-  // 简化自动开/关（不依赖门磁，只发脉冲）
+  // 自动开/关：开/关为不同 RF 码，不依赖门磁，只按软件状态+冷却发码
   bool tryAutoOpen(const char* why);
   bool tryAutoClose(const char* why);
   bool canAutoOpenNow() const;
@@ -67,5 +66,4 @@ class DoorFsm {
   uint32_t lastAutoCloseTs_ = 0;
   uint32_t lastAnyActionTs_ = 0;
   bool holdOpen_ = false;
-  bool magnetOk_ = false;
 };

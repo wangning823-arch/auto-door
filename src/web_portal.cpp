@@ -117,12 +117,12 @@ String WebPortal::pageHtml() const {
             "扫到后点列表即可填入 MAC。</div></div>");
 
   html += F("<div class=\"card\">"
-            "<div class=\"row\"><span class=\"k\">手动控制</span><span class=\"v\">发 RF 键，不依赖门磁</span></div>"
+            "<div class=\"row\"><span class=\"k\">手动控制</span><span class=\"v\">开/关各发 RF 码，不用门磁</span></div>"
             "<form method=\"GET\" action=\"/door\" style=\"display:flex;gap:8px\">"
             "<button name=\"a\" value=\"open\" type=\"submit\" style=\"flex:1\">开（上）</button>"
             "<button name=\"a\" value=\"close\" type=\"submit\" class=\"sec\" style=\"flex:1\">关（下）</button>"
             "</form>"
-            "<div class=\"tip\">无门磁时请用这两个按钮，不要靠状态猜开/关。"
+            "<div class=\"tip\">开、关是不同遥控码，请用明确的开/关按钮，不要靠模糊状态猜。"
             "串口也可: open / close</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">BLE 特征</span><span class=\"v\">");
@@ -267,7 +267,7 @@ void WebPortal::setupRoutes() {
     } else if (a == "close") {
       gPortal->door_->requestManualClose(OpenSource::NFC);
     } else {
-      // 兼容旧 toggle：无门磁时不可靠，默认当开
+      // 兼容旧 toggle：默认当开（开/关为不同 RF 码，无门磁）
       gPortal->door_->requestManualOpen(OpenSource::NFC);
     }
     server.sendHeader("Location", "/");
