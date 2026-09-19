@@ -52,6 +52,29 @@ static void rfPrintKeys() {
   }
 }
 
+// rfauto：周期自动发开门码。
+// 注意：rfcap 开头不再强制发射——否则会和「按真实遥控」抢窗口、也容易 1s 内收尾。
+static bool gRfAutoTx = false;
+static uint32_t gRfAutoNextMs = 0;
+static const uint32_t RF_AUTO_INTERVAL_MS = 5000;
+
+static void rfAutoTxFire(const char* why) {
+  if (!gRfAutoTx) return;
+  if (!gRf.keyValid(RF_KEY_OPEN)) {
+    Serial.println("[RF] AUTO TX 失败：key0 未学习");
+    return;
+  }
+  gRfAutoNextMs = millis() + RF_AUTO_INTERVAL_MS;
+  Serial.printf("[RF] AUTO TX open (%s) GPIO26...\n", why);
+  gRf.playKey(RF_KEY_OPEN);
+}
+
+static void rfAutoTxService() {
+  if (!gRfAutoTx) return;
+  if (millis() < gRfAutoNextMs) return;
+  rfAutoTxFire("interval");
+}
+
 // 运行中长按 BOOT(GPIO0) 3s：强制开 SoftAP
 // 注意：不能在「上电时按住」——GPIO0 会进 ROM 下载模式，应用根本不会跑
 static bool gForceApArmed = false;
@@ -106,8 +129,9 @@ static void handleSerial() {
       }
       line.trim();
       if (line == "status") {
-        Serial.println("[CMD] " + gDoor.debugLine() + " | " + gBt.debugLine() +
-                       " | mac=" + String(gMac) + " ap=" + gWeb.apSsid());
+        Serial.printf("[CMD] %s | %s | mac=%s ap=%s | rfauto=%s\n",
+                      gDoor.debugLine().c_str(), gBt.debugLine().c_str(), gMac,
+                      gWeb.apSsid().c_str(), gRfAutoTx ? "ON" : "OFF");
       } else if (line == "open" || line == "close") {
         gDoor.requestManualToggle(OpenSource::NFC);
       } else if (line == "hold on") {
@@ -223,7 +247,12 @@ static void handleSerial() {
         gBt.setAutoTrack(false);
         Serial.println("[CMD] autotrack OFF");
       } else if (line == "rfcap") {
-        gRf.capture();
+        // 连续抓包：一直听，直到 rfstop / GUI 停止
+        Serial.println("[RF] RFCAP_OK 进入连续抓包");
+        gRf.captureContinuous();
+      } else if (line == "rfstop") {
+        RfCapture::requestStop();
+        Serial.println("[RF] 收到 rfstop，正在结束连续抓包...");
       } else if (line == "rfdump") {
         gRf.dump(100);
       } else if (line.startsWith("rflearn ")) {
@@ -241,6 +270,83 @@ static void handleSerial() {
         } else {
           gRf.playKey(idx);
         }
+      } else if (line.startsWith("rfloop")) {
+        // rfloop / rfloop 0 / rfloop 0 3
+        int idx = RF_KEY_OPEN;
+        uint8_t reps = 2;
+        String rest = line.substring(6);
+        rest.trim();
+        if (rest.length()) {
+          int sp = rest.indexOf(' ');
+          if (sp > 0) {
+            idx = rfKeyIndexFromArg(rest.substring(0, sp));
+            int r = rest.substring(sp + 1).toInt();
+            if (r >= 1 && r <= 6) reps = (uint8_t)r;
+          } else {
+            idx = rfKeyIndexFromArg(rest);
+          }
+        }
+        if (idx < 0) {
+          Serial.println("[RF] 用法: rfloop [0-3] [repeats]  例: rfloop 0 2");
+        } else {
+          gRf.loopbackKey(idx, reps);
+        }
+      } else if (line.startsWith("rfauto")) {
+        // rfauto / rfauto on / rfauto off  （写入 NVS，重启仍保持）
+        String rest = line.substring(6);
+        rest.trim();
+        rest.toLowerCase();
+        if (rest == "off" || rest == "0") {
+          gRfAutoTx = false;
+          gCfg.saveRfAuto(false);
+          Serial.println("[RF] rfauto OFF（已保存）");
+        } else {
+          gRfAutoTx = true;
+          gRfAutoNextMs = millis();
+          gCfg.saveRfAuto(true);
+          Serial.printf("[RF] rfauto ON：每 %ums 发 key0(open)，已写入 NVS\n",
+                        (unsigned)RF_AUTO_INTERVAL_MS);
+          rfAutoTxFire("rfauto-on");
+        }
+      } else if (line.startsWith("rfbench")) {
+        // rfbench / rfbench 0 / rfbench 0 6
+        int idx = RF_KEY_OPEN;
+        uint8_t rounds = 6;
+        String rest = line.substring(7);
+        rest.trim();
+        if (rest.length()) {
+          int sp = rest.indexOf(' ');
+          if (sp > 0) {
+            idx = rfKeyIndexFromArg(rest.substring(0, sp));
+            int r = rest.substring(sp + 1).toInt();
+            if (r >= 1 && r <= 20) rounds = (uint8_t)r;
+          } else {
+            idx = rfKeyIndexFromArg(rest);
+          }
+        }
+        if (idx < 0) {
+          Serial.println("[RF] 用法: rfbench [0-3] [rounds]  例: rfbench 0 6（每10s发一次）");
+        } else {
+          gRf.benchLoopbackKey(idx, rounds, 10000);
+        }
+      } else if (line.startsWith("rfcloop")) {
+        // rfcloop / rfcloop 800
+        uint32_t ms = 800;
+        int sp = line.indexOf(' ');
+        if (sp > 0) {
+          long v = line.substring(sp + 1).toInt();
+          if (v >= 100 && v <= 3000) ms = (uint32_t)v;
+        }
+        gRf.carrierLoopback(ms);
+      } else if (line.startsWith("rfcarrier")) {
+        // rfcarrier / rfcarrier 2000
+        uint32_t ms = 1000;
+        int sp = line.indexOf(' ');
+        if (sp > 0) {
+          long v = line.substring(sp + 1).toInt();
+          if (v >= 50 && v <= 5000) ms = (uint32_t)v;
+        }
+        gRf.carrierTest(ms);
       } else if (line.startsWith("rfset ")) {
         // rfset 0 123,456,... 手动灌码
         String rest = line.substring(6);
@@ -299,14 +405,14 @@ static void handleSerial() {
         Serial.println("[NFC] 已清除授权卡");
       } else if (line == "help") {
         Serial.println(
-            "cmds: status | open | close | rfcap | rflearn 0-3 | rfplay 0-3 | rfkeys | "
+            "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
             "rfexport | rfclear | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
       } else {
         Serial.println("[CMD] unknown, try help");
       }
       line = "";
     } else {
-      if (line.length() < 64) line += c;
+      if (line.length() < 1024) line += c;
     }
   }
 }
@@ -323,6 +429,7 @@ void setup() {
   gDoor.begin();
   gCfg.begin();
   gRf.begin(PIN_RF_DATA, PIN_RF_TX);
+  gRf.setIdleHook(rfAutoTxService);
   gDoor.setRfEmit(rfEmitDoor);
 
   // 加载已学习的 RF 按键
@@ -338,6 +445,15 @@ void setup() {
       if (gRf.keyValid(i)) gRf.exportKeyCsv(i);
     }
     if (!any) Serial.println("[BOOT] 尚未学习，串口: rflearn 0 再短按遥控");
+  }
+
+  // 上电恢复 rfauto（防止 RF.bat 连串口复位后丢掉周期发射）
+  gRfAutoTx = gCfg.loadRfAuto(false);
+  if (gRfAutoTx) {
+    gRfAutoNextMs = millis() + 1000;
+    Serial.println("[BOOT] rfauto=ON（NVS），每 5s 自动发 key0");
+  } else {
+    Serial.println("[BOOT] rfauto=OFF，串口: rfauto on 可开启并保存");
   }
 
   Serial.println("[BOOT] NFC init...");
@@ -383,6 +499,7 @@ void loop() {
   gDoor.loop(gBt);
   serviceBootLongPress();
   handleSerial();
+  rfAutoTxService();
   gBt.loop();
 
   // NFC 刷卡：授权卡 → 手动开关门
@@ -412,7 +529,9 @@ void loop() {
     };
     static BlePhase phase = BlePhase::WAIT_SIGNAL;
 
-    if (gBleScan.trackOn()) {
+    // 手机连着 SoftAP 时停掉 BLE 周期扫描，否则 2.4G 抢射频 → 热点一会有一会无
+    const bool wifiClient = WiFi.softAPgetStationNum() > 0;
+    if (gBleScan.trackOn() && !wifiClient) {
       bool before = gBleScan.busy();
       gBleScan.trackPoll(6000, 2000);
       if (!before && gBleScan.busy()) {
@@ -478,6 +597,13 @@ void loop() {
             }
             break;
         }
+      }
+    } else if (wifiClient && gBleScan.busy() == false) {
+      // 连着热点就不启新 BLE 扫；日志方便确认
+      static uint32_t lastWifiSkipLog = 0;
+      if (millis() - lastWifiSkipLog > 15000) {
+        lastWifiSkipLog = millis();
+        Serial.println("[BLE] track paused (SoftAP client connected)");
       }
     }
   } else {

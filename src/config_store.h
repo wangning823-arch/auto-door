@@ -31,6 +31,10 @@ class ConfigStore {
   bool saveRfKey(int idx, const char* csv);
   bool clearRfKey(int idx);
 
+  // rfauto：上电恢复周期发射（默认关）
+  bool loadRfAuto(bool defaultOn = false);
+  bool saveRfAuto(bool on);
+
  private:
   bool ready_ = false;
 };

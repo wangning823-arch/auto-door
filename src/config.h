@@ -46,7 +46,7 @@
 // ===== 固定码多键学习回放（315/433 遥控）=====
 #define RF_KEY_COUNT         4       // 0=开/上 1=关/下 2=暂停 3=锁定
 #define RF_KEY_MAX_PULSES    80      // 单帧上限（一帧约50）
-#define RF_PLAY_REPEATS      6       // 回放重复帧数（按住效果）
+#define RF_PLAY_REPEATS      12      // 回放重复帧数（门机常要按久一点）
 #define RF_FRAME_GAP_US      5000    // 帧间隔
 #define RF_INTER_FRAME_MIN_US 4000   // ≥此值视为帧间隔，存单帧时丢弃
 

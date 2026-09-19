@@ -93,3 +93,13 @@ bool ConfigStore::clearRfKey(int idx) {
   snprintf(k, sizeof(k), "rfk%d", idx);
   return prefs.remove(k);
 }
+
+bool ConfigStore::loadRfAuto(bool defaultOn) {
+  if (!ready_) return defaultOn;
+  return prefs.getBool("rf_auto", defaultOn);
+}
+
+bool ConfigStore::saveRfAuto(bool on) {
+  if (!ready_) return false;
+  return prefs.putBool("rf_auto", on);
+}

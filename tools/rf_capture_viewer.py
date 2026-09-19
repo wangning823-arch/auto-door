@@ -125,6 +125,9 @@ class RfCaptureApp:
         self.waiting_pulses = False
         self.capture_started = False  # 已看到固件 [RF] 等待信号
         self.capture_deadline = 0.0   # 抓包总超时（工具侧兜底）
+        self.board_ready = False
+        self.continuous = False
+        self._watchdog_started = False
 
         self.status = tk.StringVar(value="未连接")
         self.port_var = tk.StringVar()
@@ -166,11 +169,11 @@ class RfCaptureApp:
 
         self.cap_btn = tk.Button(
             top,
-            text="抓包 (rfcap)",
+            text="开始抓包",
             bg="#3dd68c",
             fg="black",
             width=12,
-            command=self.trigger_capture,
+            command=self.toggle_capture,
             state="disabled",
         )
         self.cap_btn.pack(side="left", padx=4)
@@ -318,44 +321,112 @@ class RfCaptureApp:
         self.running = True
         self.capturing = False
         self.capture_started = False
+        self.continuous = False
+        self.board_ready = False
+        self._ready_deadline = time.time() + 35.0
         self.connect_btn.config(text="断开", bg="#c0392b")
         # 启动期间禁用抓包，等板子跑完再允许
         self.cap_btn.config(state="disabled", text="启动中...", bg="#2a3548")
-        self.status.set(f"已连接 {port}（等待启动…）")
+        self.status.set(f"已连接 {port}（等待固件 ready…）")
         self.reader = threading.Thread(target=self.read_loop, daemon=True)
         self.reader.start()
         self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 已连接 {port}")
-        self.log("[*] 等待 ESP32 启动约 2.5s（若曾被复位）…")
-        self.root.after(2500, self._on_boot_ready)
+        self.log("[*] 等待 [BOOT] ready / help 响应（NFC 初始化约 20s，勿提前点抓包）…")
+        self.root.after(500, self._probe_ready)
+        if not getattr(self, "_watchdog_started", False):
+            self._watchdog_started = True
+            self.root.after(400, self.tick_watchdog)
 
-    def _on_boot_ready(self):
+    def _probe_ready(self):
+        """轮询 help，直到固件真正进入 loop() 再允许抓包。"""
+        if not self.running or not self.ser or not self.ser.is_open:
+            return
+        if getattr(self, "board_ready", False):
+            return
+        try:
+            self.ser.write(b"help\n")
+            self.ser.flush()
+        except Exception:
+            pass
+        if time.time() > self._ready_deadline:
+            self.log("[WARN] 35s 仍未见 help 响应，仍尝试启用抓包")
+            self._mark_ready("超时强制启用")
+            return
+        self.root.after(1000, self._probe_ready)
+
+    def _set_cap_btn(self, enabled: bool, text: str, bg: str):
+        self.cap_btn.config(state=("normal" if enabled else "disabled"), text=text, bg=bg)
+
+    def _mark_ready(self, why: str):
         if not self.running:
             return
-        if self.ser and self.ser.is_open:
+        first = not self.board_ready
+        self.board_ready = True
+        if self.capturing:
+            # 连续抓包中：按钮可点，用于「停止」
+            self.cap_btn.config(state="normal", text="停止抓包", bg="#e74c3c")
+            return
+        self.cap_btn.config(state="normal", text="开始抓包", bg="#3dd68c")
+        if first:
+            self.status.set(self.status.get().replace("（等待固件 ready…）", "") + " 就绪")
+            self.log(f"[*] 固件就绪（{why}），点「开始抓包」持续听，点「停止抓包」结束")
+            # 复位后 rfauto 可能丢；就绪后自动打开（固件也会从 NVS 恢复）
             try:
-                self.ser.reset_input_buffer()
-                # 探活：空行触发回显/忽略，主要为冲掉残留
-                self.ser.write(b"\n")
-            except Exception:
-                pass
-        self.cap_btn.config(state="normal", text="抓包 (rfcap)", bg="#3dd68c")
-        self.status.set(self.status.get().replace("（等待启动…）", "") + " 就绪")
-        self.log("[*] 就绪，可点「抓包」；固件出现「等待信号」后再按遥控")
+                self.ser.write(b"rfauto on\n")
+                self.ser.flush()
+                self.log("[*] 已自动发送 rfauto on（每 5s 发开门码）")
+            except Exception as e:
+                self.log(f"[WARN] 自动 rfauto on 失败: {e}")
+
+    def _on_boot_ready(self):
+        self._probe_ready()
 
     def disconnect(self):
         self.running = False
         time.sleep(0.2)
         if self.ser and self.ser.is_open:
             try:
+                if self.capturing:
+                    self.ser.write(b"rfstop\n")
+                    self.ser.flush()
+                    time.sleep(0.2)
                 self.ser.close()
             except Exception:
                 pass
         self.ser = None
         self.capturing = False
         self.capture_started = False
+        self.continuous = False
+        self.board_ready = False
         self.connect_btn.config(text="连接", bg="#2f80ed")
-        self.cap_btn.config(state="disabled", text="抓包 (rfcap)", bg="#3dd68c")
+        self.cap_btn.config(state="disabled", text="开始抓包", bg="#2a3548")
         self.status.set("未连接")
+
+    def toggle_capture(self):
+        if self.capturing:
+            self.stop_capture()
+        else:
+            self.trigger_capture()
+
+    def stop_capture(self):
+        if not self.ser or not self.ser.is_open:
+            self.capture_done()
+            return
+        self.log("[*] 发送 rfstop，停止连续抓包…")
+        self.cap_btn.config(state="disabled", text="停止中...", bg="#8e44ad")
+        try:
+            self.ser.write(b"rfstop\n")
+            self.ser.flush()
+        except Exception as e:
+            self.log(f"[ERROR] rfstop 失败: {e}")
+            self.capture_done()
+        # 看门狗：若固件 3s 内没回 RFCAP_END，强制恢复 UI
+        self.root.after(3000, self._force_stop_ui)
+
+    def _force_stop_ui(self):
+        if self.capturing:
+            self.log("[WARN] 3s 未收到 RFCAP_END，强制恢复按钮")
+            self.capture_done()
 
     def trigger_capture(self):
         if not self.ser or not self.ser.is_open:
@@ -363,27 +434,50 @@ class RfCaptureApp:
             return
         if self.capturing:
             return
+        if not self.board_ready:
+            messagebox.showwarning("提示", "固件尚未就绪，请等按钮变为「开始抓包」")
+            return
         self.capturing = True
         self.capture_started = False
         self.waiting_pulses = False
-        self.capture_deadline = time.time() + 12.0  # 固件8s + 余量
-        self.cap_btn.config(state="disabled", text="等待固件...", bg="#f2c94c")
-        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 发送 rfcap…")
+        self.continuous = True
+        # 连续模式：不设短超时；ACK 用 8s 看门狗
+        self.capture_deadline = time.time() + 8.0
+        self.cap_btn.config(state="normal", text="停止抓包", bg="#e74c3c")
+        self.status.set("连续抓包中 — 收到帧会不断累加；点「停止抓包」结束")
+        self.log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 发送 rfcap…（连续模式）")
         try:
-            self.ser.reset_input_buffer()
             self.ser.write(b"rfcap\n")
             self.ser.flush()
         except Exception as e:
             self.log(f"[ERROR] 发送失败: {e}")
             self.capture_done()
             return
-        # 等 ACK（后台）：看到「等待信号」才算真正开始
-        self.root.after(800, self._check_ack, 1)
+        self.root.after(1500, self._check_ack, 1)
+        self._tick_capture_ui()
+
+    def _tick_capture_ui(self):
+        if not self.capturing:
+            return
+        if not self.continuous:
+            remain = max(0, int(self.capture_deadline - time.time()))
+            label = f"抓包中 {remain}s" if self.capture_started else f"等待ACK {remain}s"
+            self.cap_btn.config(state="disabled", text=label, bg="#f2c94c")
+        else:
+            # 连续：按钮保持可点 = 停止
+            if time.time() > self.capture_deadline and not self.capture_started:
+                # ACK 超时仍未开始
+                self.log("[WARN] 8s 未见 ACK，仍保持停止按钮（固件可能已在听）")
+                self.capture_deadline = time.time() + 60.0
+            n = len(self.captures)
+            self.cap_btn.config(state="normal", text=f"停止 ({n}帧)", bg="#e74c3c")
+        self.root.after(1000, self._tick_capture_ui)
 
     def _check_ack(self, attempt: int):
-        if not self.capturing or self.capture_started:
-            if self.capturing and self.capture_started:
-                self.cap_btn.config(state="disabled", text="抓包中...", bg="#f2c94c")
+        if not self.capturing:
+            return
+        if self.capture_started:
+            self.cap_btn.config(state="normal", text="停止抓包", bg="#e74c3c")
             return
         if attempt <= 3 and self.ser and self.ser.is_open:
             self.log(f"[*] 未收到固件 ACK，重发 rfcap（{attempt}/3）…")
@@ -394,15 +488,31 @@ class RfCaptureApp:
                 self.log(f"[ERROR] 重发失败: {e}")
                 self.capture_done()
                 return
-            self.root.after(1200, self._check_ack, attempt + 1)
+            self.root.after(2000, self._check_ack, attempt + 1)
             return
-        self.log("[ERROR] 固件未响应 rfcap（可能复位/占线），本次取消")
-        self.capture_done()
+        self.log("[WARN] 未见 ACK，保持「停止」按钮（固件可能已在连续听）")
+        self.capture_started = True
 
     def tick_watchdog(self):
-        if self.capturing and self.capture_deadline and time.time() > self.capture_deadline:
+        # 连续模式：只在 ACK 阶段用短看门狗；已 ACK 则不因时间强制结束
+        if (
+            self.capturing
+            and not self.continuous
+            and self.capture_deadline
+            and time.time() > self.capture_deadline
+        ):
             self.log("[ERROR] 工具侧超时，复位抓包状态（可再点一次）")
             self.capture_done()
+        elif (
+            self.capturing
+            and self.continuous
+            and not self.capture_started
+            and self.capture_deadline
+            and time.time() > self.capture_deadline
+        ):
+            self.log("[WARN] ACK 看门狗到期，仍保持停止按钮")
+            self.capture_started = True
+            self.capture_deadline = 0
         self.root.after(400, self.tick_watchdog)
 
     def read_loop(self):
@@ -422,16 +532,25 @@ class RfCaptureApp:
                 self.handle_line(line)
 
     def handle_line(self, line: str):
-        if line.startswith("[RF]") or "rfcap" in line.lower() or line.startswith("[CMD]"):
+        if line.startswith("[RF]") or "rfcap" in line.lower() or line.startswith("[CMD]") or "cmds:" in line:
             self.log(line)
 
-        # 固件已进入等待 → ACK
-        if "等待信号" in line or "请按遥控器" in line:
+        # 固件确认进入连续抓包 → 按钮保持可点的「停止」
+        if "RFCAP_OK" in line or "等待信号" in line or "请短按遥控器" in line:
+            was_idle = not self.capture_started
             self.capture_started = True
             if self.capturing:
                 self.root.after(0, lambda: self.cap_btn.config(
-                    state="disabled", text="抓包中...", bg="#f2c94c"))
-                self.log("[*] 固件就绪，请短按遥控器")
+                    state="normal", text="停止抓包", bg="#e74c3c"))
+                if was_idle:
+                    self.log("[*] 固件 ACK，连续抓包中 — 可反复按遥控，点「停止抓包」结束")
+
+        if "cmds:" in line or "[BOOT] ready" in line:
+            self.root.after(0, lambda: self._mark_ready("help/ready"))
+
+        if "RFCAP_FRAME" in line:
+            self.log("[*] 本帧完成，继续监听下一帧…")
+            return
 
         if RE_COUNT.search(line):
             self.waiting_pulses = True
@@ -448,10 +567,9 @@ class RfCaptureApp:
             self.waiting_pulses = False
             if len(pulses) >= 10:
                 cap = CaptureData(pulses)
-                self.root.after(0, lambda c=cap: self.on_capture(c))
+                self.root.after(0, lambda c=cap: self.on_capture_frame(c))
             else:
                 self.log("[ERROR] 解析到的脉冲太少")
-                self.root.after(0, self.capture_done)
             return
 
         m2 = RE_PULSES_OLD.match(line)
@@ -460,7 +578,7 @@ class RfCaptureApp:
             self.waiting_pulses = False
             if len(pulses) >= 10:
                 cap = CaptureData(pulses)
-                self.root.after(0, lambda c=cap: self.on_capture(c))
+                self.root.after(0, lambda c=cap: self.on_capture_frame(c))
             return
 
         if RE_SAME.search(line) and "结论" in line:
@@ -470,14 +588,20 @@ class RfCaptureApp:
             self.root.after(0, lambda: self.result_var.set("滚码（需解码）"))
             self.root.after(0, lambda: self.result_var.configure(fg="#f2c94c"))
 
-        if "抓包失败" in line or "超时" in line:
+        if "RFCAP_END" in line:
+            self.log("[*] 收到 RFCAP_END，连续抓包结束")
+            self.root.after(0, self.capture_done)
+            return
+
+        # 连续模式下单次「抓包失败」不退出
+        if "抓包失败" in line and not getattr(self, "continuous", False):
             self.root.after(0, self.capture_done)
 
-    def on_capture(self, cap: CaptureData):
-        self.capture_done()
+    def on_capture_frame(self, cap: CaptureData):
+        """连续模式：每帧入列表，不结束抓包。"""
         self.captures.append(cap)
-        if len(self.captures) > 6:
-            self.captures = self.captures[-6:]
+        if len(self.captures) > 12:
+            self.captures = self.captures[-12:]
         self.count_var.set(f"{len(self.captures)} 次抓包")
         self.stats_var.set(
             f"最近: {cap.count} 脉冲 / {cap.duration_ms:.1f}ms / 帧长≈{cap.frame_len} / hash=0x{cap.hash:08X}"
@@ -485,14 +609,30 @@ class RfCaptureApp:
         self.redraw()
         if len(self.captures) >= 2:
             self.compare_captures()
+        if self.capturing:
+            self.cap_btn.config(
+                state="normal", text=f"停止 ({len(self.captures)}帧)", bg="#e74c3c"
+            )
+            self.log(f"[*] 已收录第 {len(self.captures)} 帧，继续监听…")
+
+    def on_capture(self, cap: CaptureData):
+        self.on_capture_frame(cap)
+        if not getattr(self, "continuous", False):
+            self.capture_done()
 
     def capture_done(self):
         self.capturing = False
         self.capture_started = False
+        self.continuous = False
         self.waiting_pulses = False
         self.capture_deadline = 0.0
-        if self.running:
-            self.cap_btn.config(state="normal", text="抓包 (rfcap)", bg="#3dd68c")
+        if self.running and self.board_ready:
+            self.cap_btn.config(state="normal", text="开始抓包", bg="#3dd68c")
+            self.status.set("就绪 — 点「开始抓包」可再次连续抓")
+        elif self.running:
+            self.cap_btn.config(state="disabled", text="启动中...", bg="#2a3548")
+        else:
+            self.cap_btn.config(state="disabled", text="开始抓包", bg="#2a3548")
 
     def compare_captures(self):
         if len(self.captures) < 2:
