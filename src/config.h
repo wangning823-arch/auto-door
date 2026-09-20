@@ -94,17 +94,21 @@
 #define RELAY_PULSE_MS        2000    // 遥控按压时长；1s 电机常不认，改 2s
 
 // ===== BLE 状态机 =====
-// 开：无→有 就开（门关着信号弱也要开，例如门口 -93）
-// 例外：无→一上来就极强（≥ RSSI_SUDDEN_STRONG）= 库内唤醒，不开
-// 关：有→强 后再 变弱→无 = 关（进库变强，离开变无）
-// 用于 SU7 等有 BLE 广播的车
+// 开：无→有 且 rssi < -80 → 立刻开（关着门贴近约 -90 也能开，不等渐强）
+// 例外：无→有 且 rssi ≥ -80 → 不开（库内开关蓝牙等突变，一次就很“强”）
+// 关：进库变强后离开；RSSI≤RSSI_FAR_CLOSE 连续 N 次 ≈ 走出约10m 即关
 // 实测参考（ESP32 在库内靠门侧）：
 //   车在库外远处 ~-97；库外门口 ~-75~-93（关门）；库内强 ~-70 以上
 #define RSSI_APPEAR_MIN       -110    // 出现信号下限（≥此值算「有」）
-#define RSSI_STRONG           -80     // 强信号阈值（≥此值算「强」，关门路径用）
-#define RSSI_SUDDEN_STRONG    -70     // 首见就 ≥ 此值：库内唤醒，不自动开
-#define BLE_SILENT_GAP_MS     15000   // BLE 多久没匹配算「无信号」
-#define BLE_MISS_FOR_LOST     3       // 连续 N 次未匹配算「丢」
+#define RSSI_STRONG           -80     // 强信号阈值（离场路径用）
+// 首见就 ≥ 此值：视为库内突变（开关蓝牙），不自动开；与 RSSI_STRONG 同为 -80
+#define RSSI_SUDDEN_STRONG    -80
+#define RSSI_FAR_CLOSE        -90     // 离场关门：≤此约走出 10m（开门时可略调 -88~-92）
+#define BLE_CLOSE_FAR_SCANS   2       // 连续 N 次 ≤ FAR 才关（防抖）
+#define BLE_SILENT_GAP_MS     8000    // 多久没匹配算「无」（原 15s，偏晚）
+#define BLE_MISS_FOR_LOST     2       // 连续 N 次未匹配算「丢」（原 3）
+#define BLE_TRACK_INTERVAL_MS 4000    // 跟踪扫描间隔（原 6000，反应更快）
+#define BLE_TRACK_SCAN_MS     1500    // 单次扫描时长
 
 // ===== 经典蓝牙（与 BLE 共用开/关状态机阈值）=====
 // 开/关逻辑与 BLE 相同：无→有开；首见≥RSSI_SUDDEN_STRONG 不开；强→弱→无关
@@ -127,8 +131,8 @@
 #define AUTO_COOLDOWN_OPEN_MS 300000  // 5 分钟
 // 关门冷却：车走了及时关，不需要长
 #define AUTO_COOLDOWN_CLOSE_MS 30000  // 30 秒
-// 自动开后至少等这么久才能自动关（给车进库时间）
-#define AUTO_MIN_OPEN_HOLD_MS 60000   // 1 分钟
+// 自动开后至少等这么久才能自动关（下车走出去约需十几秒；过短易关到人）
+#define AUTO_MIN_OPEN_HOLD_MS 20000   // 20 秒（原 60s，离场关门偏晚）
 // 上电宽限：此时间内禁止自动关（防第二块板启动即连发 close）
 #define AUTO_BOOT_GRACE_MS 15000
 

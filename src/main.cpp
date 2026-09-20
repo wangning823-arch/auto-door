@@ -9,6 +9,7 @@
 #include "rf_capture.h"
 #include "nfc_reader.h"
 #include "default_rf_keys.h"
+#include "ble_bond.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -18,7 +19,7 @@ static BleTracker gBt;
 static DoorFsm gDoor;
 static ConfigStore gCfg;
 static WebPortal gWeb;
-static BleScanTool gBleScan;
+BleScanTool gBleScan;
 static RfCapture gRf;
 static NfcReader gNfc;
 static char gMac[24] = CAR_BT_MAC;
@@ -252,17 +253,39 @@ static void handleSerial() {
         gBleScan.runScan(ms);
       } else if (line == "bletrack on") {
         gBleScan.setTrack(true);
-        Serial.println("[CMD] BLE track ON filter=" + gBleScan.filter());
+        Serial.println("[CMD] BLE IRK track ON (paired phone only)");
       } else if (line == "bletrack off") {
         gBleScan.setTrack(false);
         Serial.println("[CMD] BLE track OFF");
-      } else if (line.startsWith("blefilter ")) {
-        String f = line.substring(10);
-        f.trim();
-        gBleScan.setFilter(f);
-        gCfg.saveBleFilter(f);
-        gBleScan.setTrack(f.length() > 0);
-        Serial.println("[CMD] BLE filter=" + f);
+      } else if (line.startsWith("blefilter")) {
+        Serial.println(
+            "[CMD] 名称/MAC 特征通道已移除；请用手机配对 (blepair) 后 IRK 跟踪");
+      } else if (line == "blebond") {
+        Serial.printf(
+            "[CMD] IRK=%s id=%s pair=%s pin=%s(%u) track=%s\n",
+            gBleBond.hasIrk() ? "YES" : "NO",
+            gBleBond.identityMac().c_str(),
+            gBleBond.pairingOpen() ? "OPEN" : "CLOSED",
+            gBleBond.hasPasskey() ? "YES" : "NO",
+            (unsigned)gBleBond.pairingPin().length(),
+            gBleScan.trackOn() ? "ON" : "OFF");
+        if (gBleBond.hasPasskey()) {
+          Serial.printf("[CMD] PIN value=%s\n", gBleBond.pairingPin().c_str());
+        }
+      } else if (line == "blepair") {
+        gBleBond.requestOpenPairing(90000);
+      } else if (line.startsWith("blepair ")) {
+        int sec = atoi(line.substring(8).c_str());
+        if (sec <= 0)
+          gBleBond.requestOpenPairing(0);
+        else
+          gBleBond.requestOpenPairing((uint32_t)sec * 1000);
+      } else if (line == "blepair off") {
+        gBleBond.closePairingWindow("manual");
+      } else if (line == "bleunpair") {
+        gBleBond.clearBond("serial");
+      } else if (line.startsWith("blepin ")) {
+        gBleBond.setPairingPin(line.substring(7));
       } else if (line == "autotrack on") {
         gBt.setAutoTrack(true);
         Serial.println("[CMD] autotrack ON (periodic inquiry)");
@@ -429,7 +452,7 @@ static void handleSerial() {
       } else if (line == "help") {
         Serial.println(
             "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
-            "rfexport | rfclear | rfdefaults | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off");
+            "rfexport | rfclear | rfdefaults | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off | blebond | blepair [sec] | bleunpair");
       } else if (line == "rfdefaults") {
         // 强制写入实车验证的开/关码（修第二块板开码不对）
         bool ok0 = gRf.setKeyFromCsv(RF_KEY_OPEN, RF_DEFAULT_OPEN_CSV);
@@ -532,6 +555,15 @@ void setup() {
     Serial.println("[BOOT] Classic BT init failed");
   }
 
+  // BLE 配对/IRK：无密钥则广播 GarageDoorBLE 供手机配对；有则扫描时解析 RPA
+  Serial.println("[BOOT] BLE bond/IRK init...");
+  gBleBond.begin();
+  // 必须在 gBleBond.begin() 之后：否则 IRK 已存却 track 仍 OFF，RSSI 一直是 -
+  if (gBleBond.hasIrk()) {
+    gBleScan.setTrack(true);
+    Serial.println("[BOOT] IRK track ON (paired phone)");
+  }
+
   Serial.println("[BOOT] ready. wifi=" + String(wifiOn ? "ON" : "OFF") +
                  " autotrack=" + String(gBt.autoTrack() ? "ON" : "OFF"));
   if (wifiOn) {
@@ -552,6 +584,7 @@ void loop() {
   handleSerial();
   rfAutoTxService();
   gBt.loop();
+  gBleBond.service();
 
   // NFC 刷卡：授权卡 → 手动开关门
   {
@@ -573,18 +606,21 @@ void loop() {
   // ===== 跟踪模式分发 =====
   int trackMode = gWeb.trackMode();  // 实时从 WebPortal 读取（网页可改）
   if (trackMode == TRACK_MODE_BLE) {
-    // BLE：无→有=开（弱也开）；无→极强=库内唤醒不开；强→弱→无=关
+    // BLE：无→有且<-80立刻开；无→有且≥-80不开（库内开关蓝牙突变）；离场≤-90关
     enum class BlePhase : uint8_t {
       WAIT_SIGNAL, APPEARING, STRONG, LEAVING,
     };
     static BlePhase phase = BlePhase::WAIT_SIGNAL;
+    static uint8_t leaveFarStreak = 0;
 
-    // 手机连着 SoftAP 时停掉 BLE 周期扫描，否则 2.4G 抢射频 → 热点一会有一会无
+    // 手机连 SoftAP 时降低 BLE 扫占空比（不要完全停，否则看网页时 RSSI 一直为 -）
     const bool wifiClient = WiFi.softAPgetStationNum() > 0;
-    if (gBleScan.trackOn() && !wifiClient) {
+    if (gBleScan.trackOn()) {
       // runScan() 是阻塞的：busy 边沿在同一轮 trackPoll 内完成，不能靠 busy 跨轮判断
       const uint32_t prevScanEnd = gBleScan.lastScanEndMs();
-      gBleScan.trackPoll(6000, 2000);
+      const uint32_t iv = wifiClient ? 10000 : BLE_TRACK_INTERVAL_MS;
+      const uint32_t sc = wifiClient ? 1000 : BLE_TRACK_SCAN_MS;
+      gBleScan.trackPoll(iv, sc);
       const bool scanJustFinished = gBleScan.lastScanEndMs() != prevScanEnd;
       if (scanJustFinished) {
         int r = gBleScan.matchRssi();
@@ -593,7 +629,8 @@ void loop() {
                     (millis() - gBleScan.lastMatchMs()) < BLE_SILENT_GAP_MS;
         bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
         bool isStrong = hasSignal && r >= RSSI_STRONG;
-        // 首见就极强：人在库里蓝牙刚醒，不是“从远处走近”
+        bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;  // ≈走出 10m
+        // 无→有且≥-80：库内开关蓝牙等突变，不开门（弱出现 <-80 才开）
         bool suddenVeryStrong = hasSignal && r >= RSSI_SUDDEN_STRONG;
 
         const char* phaseName =
@@ -601,24 +638,27 @@ void loop() {
             phase == BlePhase::APPEARING  ? "APPEAR" :
             phase == BlePhase::STRONG     ? "STRONG" : "LEAVE";
 
-        Serial.printf("[BLE] rssi=%d seen=%d strong=%d lost=%d phase=%s\n",
-                      r, (int)hasSignal, (int)isStrong, (int)lost, phaseName);
+        Serial.printf("[BLE] rssi=%d seen=%d strong=%d far=%d lost=%d phase=%s\n",
+                      r, (int)hasSignal, (int)isStrong, (int)isFar, (int)lost,
+                      phaseName);
 
         switch (phase) {
           case BlePhase::WAIT_SIGNAL:
+            leaveFarStreak = 0;
             if (hasSignal && !suddenVeryStrong) {
-              // 无→有：门口 -93 也要开，不等到 -80
-              Serial.printf("[FSM] 无→有 rssi=%d，自动开\n", r);
+              // 无→有且 < -80：关门贴近约 -90 也立刻开，不等渐强
+              Serial.printf("[FSM] 无→有 rssi=%d (<-80)，自动开\n", r);
               autoOpenThenArm("无→有");
               phase = BlePhase::APPEARING;
             } else if (suddenVeryStrong) {
-              // 库内唤醒：不自动开；进 STRONG 但不 arm 关门，防丢失闪断连发 close
+              // 无→有且 ≥ -80：库内开关蓝牙类突变，不操作
               phase = BlePhase::STRONG;
-              Serial.printf("[FSM] 无→强跳变 rssi=%d，不自动开（库内唤醒？）\n", r);
+              Serial.printf("[FSM] 无→强跳变 rssi=%d (≥-80)，不自动开（库内突变？）\n", r);
             }
             break;
 
           case BlePhase::APPEARING:
+            leaveFarStreak = 0;
             if (isStrong) {
               autoOpenThenArm("无→有→强");
               phase = BlePhase::STRONG;
@@ -630,6 +670,7 @@ void loop() {
             break;
 
           case BlePhase::STRONG:
+            leaveFarStreak = 0;
             if (!isStrong && hasSignal) {
               phase = BlePhase::LEAVING;
               gCloseArmed = true;  // 确认曾在库内变强后再变弱 → 允许随后关门
@@ -642,13 +683,28 @@ void loop() {
             break;
 
           case BlePhase::LEAVING:
-            if (!hasSignal || lost) {
-              gCloseArmed = true;
-              autoCloseGuarded("强→弱→无");
-              phase = BlePhase::WAIT_SIGNAL;
-            } else if (isStrong) {
-              phase = BlePhase::STRONG;
-              Serial.println("[FSM] 弱→强（回到门口），取消离开");
+            // 主路径：RSSI≤-90 连续 2 次 ≈ 走出约 10m，不等信号完全消失
+            if (isFar) {
+              leaveFarStreak++;
+              Serial.printf("[FSM] 离场远信号 rssi=%d %u/%u\n", r,
+                            (unsigned)leaveFarStreak,
+                            (unsigned)BLE_CLOSE_FAR_SCANS);
+              if (leaveFarStreak >= BLE_CLOSE_FAR_SCANS) {
+                gCloseArmed = true;
+                autoCloseGuarded("离场约10m");
+                phase = BlePhase::WAIT_SIGNAL;
+                leaveFarStreak = 0;
+              }
+            } else {
+              leaveFarStreak = 0;
+              if (!hasSignal || lost) {
+                gCloseArmed = true;
+                autoCloseGuarded("强→弱→无");
+                phase = BlePhase::WAIT_SIGNAL;
+              } else if (isStrong) {
+                phase = BlePhase::STRONG;
+                Serial.println("[FSM] 弱→强（回到门口），取消离开");
+              }
             }
             break;
         }
@@ -671,17 +727,23 @@ void loop() {
     static bool clPrevSeen = false;
     static int clPrevRssi = -999;
     static bool clInited = false;
+    static uint8_t clFarStreak = 0;
 
     if (gBt.autoTrack() && gBt.hasTarget()) {
       int r = gBt.lastRssi();
       bool seen = gBt.seenRecently(BLE_SILENT_GAP_MS);
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
       bool isStrong = hasSignal && r >= RSSI_STRONG;
+      bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
       bool suddenVeryStrong = hasSignal && r >= RSSI_SUDDEN_STRONG;
       bool lost = !seen;
 
+      // 远信号连续计数：即使 rssi 变化 <5dB 也要评估（防漏掉 -90 边沿）
+      bool farEdge = (isFar != (clPrevRssi > -999 && clPrevRssi <= RSSI_FAR_CLOSE &&
+                                 clPrevRssi >= RSSI_APPEAR_MIN));
       bool edge = !clInited || (seen != clPrevSeen) ||
-                  (seen && abs(r - clPrevRssi) >= 5);
+                  (seen && abs(r - clPrevRssi) >= 5) || farEdge ||
+                  (clPhase == ClPhase::LEAVING && seen);
       if (!edge) {
         // 无边沿只打周期日志
       } else {
@@ -695,23 +757,26 @@ void loop() {
               clPhase == ClPhase::WAIT_SIGNAL ? "WAIT" :
               clPhase == ClPhase::APPEARING   ? "APPEAR" :
               clPhase == ClPhase::STRONG      ? "STRONG" : "LEAVE";
-          Serial.printf("[CLASSIC] rssi=%d seen=%d strong=%d lost=%d phase=%s\n",
-                        r, (int)hasSignal, (int)isStrong, (int)lost, phaseName);
+          Serial.printf("[CLASSIC] rssi=%d seen=%d strong=%d far=%d lost=%d phase=%s\n",
+                        r, (int)hasSignal, (int)isStrong, (int)isFar, (int)lost,
+                        phaseName);
         }
 
         switch (clPhase) {
           case ClPhase::WAIT_SIGNAL:
+            clFarStreak = 0;
             if (hasSignal && !suddenVeryStrong) {
-              Serial.printf("[FSM] C 无→有 rssi=%d，自动开\n", r);
+              Serial.printf("[FSM] C 无→有 rssi=%d (<-80)，自动开\n", r);
               autoOpenThenArm("经典无→有");
               clPhase = ClPhase::APPEARING;
             } else if (suddenVeryStrong) {
               clPhase = ClPhase::STRONG;
-              Serial.printf("[FSM] C 无→强跳变 rssi=%d，不自动开（库内唤醒？）\n", r);
+              Serial.printf("[FSM] C 无→强跳变 rssi=%d (≥-80)，不自动开（库内突变？）\n", r);
             }
             break;
 
           case ClPhase::APPEARING:
+            clFarStreak = 0;
             if (isStrong) {
               autoOpenThenArm("经典无→有→强");
               clPhase = ClPhase::STRONG;
@@ -723,6 +788,7 @@ void loop() {
             break;
 
           case ClPhase::STRONG:
+            clFarStreak = 0;
             if (!isStrong && hasSignal) {
               clPhase = ClPhase::LEAVING;
               gCloseArmed = true;
@@ -735,13 +801,27 @@ void loop() {
             break;
 
           case ClPhase::LEAVING:
-            if (lost) {
-              gCloseArmed = true;
-              autoCloseGuarded("经典强→弱→无");
-              clPhase = ClPhase::WAIT_SIGNAL;
-            } else if (isStrong) {
-              clPhase = ClPhase::STRONG;
-              Serial.println("[FSM] C 弱→强，取消离开");
+            if (isFar) {
+              clFarStreak++;
+              Serial.printf("[FSM] C 离场远信号 rssi=%d %u/%u\n", r,
+                            (unsigned)clFarStreak,
+                            (unsigned)BLE_CLOSE_FAR_SCANS);
+              if (clFarStreak >= BLE_CLOSE_FAR_SCANS) {
+                gCloseArmed = true;
+                autoCloseGuarded("经典离场约10m");
+                clPhase = ClPhase::WAIT_SIGNAL;
+                clFarStreak = 0;
+              }
+            } else {
+              clFarStreak = 0;
+              if (lost) {
+                gCloseArmed = true;
+                autoCloseGuarded("经典强→弱→无");
+                clPhase = ClPhase::WAIT_SIGNAL;
+              } else if (isStrong) {
+                clPhase = ClPhase::STRONG;
+                Serial.println("[FSM] C 弱→强，取消离开");
+              }
             }
             break;
         }
@@ -754,6 +834,7 @@ void loop() {
     lastLog = millis();
     Serial.println("[LOG] " + gDoor.debugLine() + " | " + gBt.debugLine() +
                    " | ble_rssi=" + String(gBleScan.matchRssi()) +
-                   " f=" + gBleScan.filter() + " | " + gNfc.debugLine());
+                   " bond=" + String(gBleBond.hasIrk() ? "Y" : "N") + " | " +
+                   gNfc.debugLine());
   }
 }

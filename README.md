@@ -16,10 +16,10 @@ garage_door_firmware/
 ## 核心功能
 
 - **跟踪模式二选一**：BLE / 经典蓝牙（网页切换，存 NVS）
-- **自动开/关（BLE 与经典同一套状态机）**：
-  - 无 → 有即开（弱信号也开，例如门口约 -93）
-  - 首见 ≥ -70 不开（库内蓝牙唤醒）
-  - 强(-80) → 弱 → 无 = 关
+- **自动开/关（两通道）**
+  - **BLE 手机**：仅已配对 IRK+RSSI；无→有且 **&lt; -80** 开；**≥ -80** 不开；离场 **≤ -90** 约 10m 关
+  - **经典车机**：固定 MAC + 同样 RSSI 阈值（小蚂蚁等）
+  - **已移除**：BLE 名称/MAC 特征扫描与 filter 通道
   - 详见 `docs/联调记录_20260919_RF学习与BLE自动门.md`
 - **冷却保护**：开门 5min / 关门 30s / 开后保持 60s
 - **315/433 固定码**：**key0 开 / key1 关每次上电强制为同一套已验证码**（多板一致）；key2/3 仍可 NVS 学习，但 `rflearn 0/1` 重启后会被默认开/关码覆盖
@@ -68,8 +68,13 @@ rfcap / rfstop  连续抓包
 rfkeys/rfexport 查看/导出按键
 rfdefaults      写入实车验证的默认开/关码
 ble [sec]       BLE 扫描
-bletrack on/off BLE 跟踪开关
-blefilter XXX   设置 BLE 特征
+bletrack on/off BLE IRK 跟踪（仅已配对手机）
+blefilter       已移除名称/MAC 特征通道（请用 blepair 配对）
+blebond         配对/IRK 状态
+blepair [sec]   打开配对窗口（默认 90s；`blepair 0`=保持开）；网页也有开关
+blepair off     关闭配对
+bleunpair       清除已授权手机
+blepin xxx      设置/清空配对密码（网页开窗时校验；空参数=清除）
 autotrack on/off 经典蓝牙自动跟踪
 wifi on/off     WiFi 开关
 ```

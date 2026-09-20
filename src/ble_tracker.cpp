@@ -130,11 +130,11 @@ bool BleTracker::begin(const char* macStr) {
       Serial.println("[BT] SerialBT.begin FAILED");
       return false;
     }
-    // 不设长期 Discoverable，减少射频占用；扫描时才 Inquiry
+    // 默认不可被搜索/不可连：避免关配对后仍被手机搜到 GarageDoor
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
     esp_bt_gap_register_callback(gapCallback);
     gBtReady = true;
-    Serial.println("[BT] Classic BT ready (WiFi-priority, inquiry on demand)");
+    Serial.println("[BT] Classic ready, NON_DISCOVERABLE (仅按需 inquiry)");
   }
 
   Serial.printf("[BT] target MAC %s -> %s\n", macStr, targetSet_ ? "OK" : "INVALID");

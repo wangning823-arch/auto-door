@@ -2,6 +2,7 @@
 #include "config.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include "ble_bond.h"
 
 static WebServer server(80);
 static WebPortal* gPortal = nullptr;
@@ -32,10 +33,8 @@ String WebPortal::pageHtml() const {
     else if (s == DoorState::CLOSED) door = "关";
   }
   String rssi = bt_ ? String(bt_->lastRssi()) : "-";
-  String bleFilt = store_ ? store_->loadBleFilter() : "";
-  if (ble_ && ble_->filter().length()) bleFilt = ble_->filter();
   String bleRssi = "-";
-  String bleLab = bleFilt;
+  String bleLab = gBleBond.hasIrk() ? gBleBond.identityMac() : String("(未配对)");
   if (ble_ && ble_->matchRssi() > -127) {
     bleRssi = String(ble_->matchRssi());
     if (ble_->matchLabel().length()) bleLab = ble_->matchLabel();
@@ -95,13 +94,53 @@ String WebPortal::pageHtml() const {
             "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
             "<input type=\"radio\" name=\"m\" value=\"0\" ");
   if (trackMode_ == TRACK_MODE_BLE) html += F("checked ");
-  html += F(">BLE（SU7 等有 BLE 广播的车）</label>"
+  html += F(">BLE（配对手机 IRK 跟踪）</label>"
             "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
             "<input type=\"radio\" name=\"m\" value=\"1\" ");
   if (trackMode_ == TRACK_MODE_CLASSIC) html += F("checked ");
-  html += F(">经典蓝牙（小蚂蚁等无 BLE 的车）</label>"
+  html += F(">经典蓝牙（小蚂蚁等车机 MAC）</label>"
             "<button type=\"submit\">保存模式</button></form>"
-            "<div class=\"tip\">BLE 与经典同一套：无→有即开（弱也开）；首见≥-70 不开；强→弱→无关。</div></div>");
+            "<div class=\"tip\">开/关：无→有且&lt;-80立刻开；≥-80不开；离场≤-90约10m关。"
+            "BLE 模式只认已配对手机；经典模式认车机 MAC。</div></div>");
+
+  // ===== 手机配对：开关 + 6位PIN（手机配对时输入，真正有意义）=====
+  html += F("<div class=\"card\">"
+            "<div class=\"row\"><span class=\"k\">手机配对</span><span class=\"v ");
+  if (gBleBond.pairingOpen())
+    html += F("warn\">开 · 90秒内可绑 GarageDoorBLE</span></div>");
+  else
+    html += F("ok\">关 · 拒绝新绑定</span></div>");
+  html += F("<div class=\"row\"><span class=\"k\">已配对手机</span><span class=\"v\">");
+  html += gBleBond.hasIrk() ? gBleBond.identityMac() : String("(尚未绑定)");
+  html += F("</span></div>"
+            "<div class=\"row\"><span class=\"k\">手机配对 PIN</span><span class=\"v\">");
+  html += gBleBond.hasPasskey() ? gBleBond.pairingPin()
+                                : String("未设置(Just Works)");
+  html += F("</span></div>"
+            "<form method=\"GET\" action=\"/pair\" style=\"display:flex;gap:8px;margin-top:8px\">"
+            "<input type=\"hidden\" name=\"a\" value=\"on\">"
+            "<button type=\"submit\" style=\"margin-top:0;flex:1\">打开配对（90秒）</button>"
+            "</form>"
+            "<form method=\"GET\" action=\"/pair\">"
+            "<input type=\"hidden\" name=\"a\" value=\"off\">"
+            "<button type=\"submit\" class=\"sec\" style=\"margin-top:8px\">关闭配对</button>"
+            "</form>"
+            "<form method=\"GET\" action=\"/pairpin\" style=\"display:flex;gap:8px;margin-top:10px\">"
+            "<input type=\"password\" name=\"p\" placeholder=\"6位数字PIN（手机配对时输入；留空清除）\" "
+            "maxlength=\"6\" inputmode=\"numeric\" "
+            "style=\"flex:1;min-width:0;padding:10px 12px;border-radius:8px;"
+            "border:1px solid #2e3d52;background:#0f1419;color:#e7ecf1;letter-spacing:4px\">"
+            "<button type=\"submit\" class=\"sec\" style=\"margin-top:0;flex:1\">保存 PIN</button>"
+            "</form>"
+            "<form method=\"GET\" action=\"/pair\">"
+            "<input type=\"hidden\" name=\"a\" value=\"unpair\">"
+            "<button type=\"submit\" class=\"sec\" style=\"margin-top:8px;background:#5a2a2a\">"
+            "解绑并清系统蓝牙</button>"
+            "</form>"
+            "<div class=\"tip\">打开后 90 秒手机可搜 <b>GarageDoorBLE</b>。"
+            "若已设 6 位 PIN，手机配对时要输入该 PIN（串口会打印同一 PIN）。"
+            "关闭配对 = 停广播 + 拒绝绑定 + 断开连接。"
+            "换手机：解绑再开配对。</div></div>");
 
   html += F("<div class=\"card\"><form method=\"GET\" action=\"/save\" id=\"macform\">"
             "<label>车机 / 钥匙 蓝牙 MAC</label>"
@@ -125,13 +164,14 @@ String WebPortal::pageHtml() const {
             "<div class=\"tip\">开、关是不同遥控码，请用明确的开/关按钮，不要靠模糊状态猜。"
             "串口也可: open / close</div></div>");
 
-  html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">BLE 特征</span><span class=\"v\">");
-  html += bleFilt.length() ? bleFilt : String("(未选)");
-  html += F("</span></div><div class=\"row\"><span class=\"k\">BLE RSSI</span><span class=\"v\">");
+  html += F("<div class=\"card\">"
+            "<div class=\"row\"><span class=\"k\">配对手机跟踪</span><span class=\"v\">");
+  html += bleLab;
+  html += F("</span></div><div class=\"row\"><span class=\"k\">手机 RSSI</span><span class=\"v\">");
   html += bleRssi;
   html += F("</span></div>"
-            "<button type=\"button\" onclick=\"startBle()\" id=\"bleBtn\">扫描 BLE 设备（约8秒）</button>"
-            "<div id=\"bleBox\" class=\"tip\">支持手机、汽车等任意 BLE 设备。点选要跟踪的设备名称保存为特征。</div></div>");
+            "<div class=\"tip\">BLE 模式只用已配对手机的 IRK+RSSI 判断进出，"
+            "不再按名称/MAC 特征过滤。名称扫描已移除；经典车机仍用上方 MAC 扫描。</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
             "<span class=\"v\">WiFi 与蓝牙共用 2.4G</span></div>"
@@ -181,37 +221,6 @@ String WebPortal::pageHtml() const {
             " }).catch(function(){var b=document.getElementById('scanBtn');b.disabled=false;b.textContent='扫描失败，重试';});"
             "}"
             "function pick(m){document.getElementById('mac').value=m;document.getElementById('mac').scrollIntoView();}"
-            "function startBle(){"
-            " var b=document.getElementById('bleBtn');"
-            " var box=document.getElementById('bleBox');"
-            " b.disabled=true; b.textContent='BLE 扫描中…';"
-            " box.innerHTML='约 8 秒，请靠近/停稳后等待…';"
-            " fetch('/ble/scan').then(function(){setTimeout(pollBle,2000);});"
-            "}"
-            "function pollBle(){"
-            " fetch('/ble/results').then(function(r){return r.json();}).then(function(j){"
-            "  var box=document.getElementById('bleBox');"
-            "  var b=document.getElementById('bleBtn');"
-            "  if(j.busy){box.innerHTML='扫描中… 已发现 '+j.n+' 个候选…';setTimeout(pollBle,1500);return;}"
-            "  b.disabled=false; b.textContent='扫描 BLE 设备（约8秒）';"
-            "  if(!j.devices||!j.devices.length){box.innerHTML='未扫到 BLE 设备，请确认周围有蓝牙设备在广播';return;}"
-            "  var h='<div style=\"margin-top:8px\">';"
-            "  j.devices.forEach(function(d){"
-            "   var nm=d.name&&d.name.length?d.name:'(无名)';"
-            "   h+='<div onclick=\"saveBle(\\''+encodeURIComponent(d.name||d.mac)+'\\')\" "
-            "style=\"padding:10px;margin:6px 0;background:#0f1419;border-radius:8px;"
-            "cursor:pointer;border:1px solid #2e3d52\">"
-            "   <div style=\"font-weight:600\">'+nm+'</div>"
-            "   <div style=\"color:#8b9aab;font-size:.85rem;margin-top:2px\">'+d.mac+' · RSSI '+d.rssi+'</div></div>';"
-            "  });"
-            "  h+='</div><div class=\"tip\">点要跟踪的设备名称，会写入 BLE 特征并开始跟踪</div>';"
-            "  box.innerHTML=h;"
-            " }).catch(function(){var b=document.getElementById('bleBtn');b.disabled=false;b.textContent='BLE 扫描失败';});"
-            "}"
-            "function saveBle(v){"
-            " var name=decodeURIComponent(v);"
-            " location.href='/ble/save?f='+encodeURIComponent(name);"
-            "}"
             "</script>");
 
   html += F("</div></body></html>");
@@ -288,6 +297,86 @@ void WebPortal::setupRoutes() {
     server.send(302, "text/plain", "ok");
   });
 
+  server.on("/pairpin", HTTP_GET, []() {
+    if (!gPortal) {
+      server.send(500, "text/plain", "no portal");
+      return;
+    }
+    gBleBond.setPairingPin(server.arg("p"));
+    String st = gBleBond.hasPasskey()
+                    ? String("当前 PIN=") + gBleBond.pairingPin()
+                    : String("当前未设 PIN（Just Works）");
+    String body =
+        F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
+          "content='width=device-width,initial-scale=1'>"
+          "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
+          "padding:24px;text-align:center'><h2>手机配对 PIN 已保存</h2><p>");
+    body += st;
+    body += F("</p><p style='color:#8b9aab'>手机需先删除旧的 GarageDoorBLE 配对，"
+              "再重新连接才会要求输入 PIN</p>"
+              "<p><a style='color:#2f80ed' href='/'>返回首页</a></p></body>");
+    server.send(200, "text/html; charset=utf-8", body);
+  });
+
+  server.on("/pair", HTTP_GET, []() {
+    if (!gPortal) {
+      server.send(500, "text/plain", "no portal");
+      return;
+    }
+    String a = server.hasArg("a") ? server.arg("a") : String();
+    String p = server.arg("p");
+    Serial.printf("[WEB] /pair a='%s' p_len=%u open=%d\n", a.c_str(),
+                  (unsigned)p.length(), (int)gBleBond.pairingOpen());
+
+    auto back = [](const char* title, const char* msg, const char* color) {
+      String body =
+          F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
+            "content='width=device-width,initial-scale=1'>"
+            "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
+            "padding:24px;text-align:center'><h2>");
+      body += title;
+      body += F("</h2><p style='color:");
+      body += color;
+      body += "'>";
+      body += msg;
+      body += F("</p><p><a style='color:#2f80ed' href='/'>返回首页</a></p></body>");
+      return body;
+    };
+
+    if (a == "off") {
+      gBleBond.closePairingWindow("web");
+      server.send(200, "text/html; charset=utf-8",
+                  back("配对已关闭",
+                       "已停广播、断开连接；手机应搜不到 GarageDoorBLE，且无法再绑定",
+                       "#3dd68c"));
+      return;
+    }
+    if (a == "unpair") {
+      gBleBond.clearBond("web");
+      gBleBond.closePairingWindow("unpair");
+      server.send(200, "text/html; charset=utf-8",
+                  back("已解绑",
+                       "已清 IRK 与系统蓝牙 bond；请再点「打开配对」绑新手机",
+                       "#f2c94c"));
+      return;
+    }
+    if (a != "on") {
+      server.send(400, "text/html; charset=utf-8",
+                  back("参数错误", "缺少 a=on/off（表单请用 hidden 字段）",
+                       "#e74c3c"));
+      return;
+    }
+    // 只请求开窗；真正 startAdv 在 loop/service 里，避免 HTTP 回调打断 SoftAP
+    gBleBond.requestOpenPairing(90000);
+    String pinMsg = gBleBond.hasPasskey()
+                        ? String("请先在手机删除旧 GarageDoorBLE，再搜索并输入 PIN ") +
+                              gBleBond.pairingPin()
+                        : String("手机搜索 GarageDoorBLE 并确认配对");
+    server.send(200, "text/html; charset=utf-8",
+                back("已请求打开配对（约1秒后生效）", pinMsg.c_str(),
+                     "#f2c94c"));
+  });
+
   server.on("/status", HTTP_GET, []() {
     String j = "{";
     if (gPortal && gPortal->door_) {
@@ -341,67 +430,6 @@ void WebPortal::setupRoutes() {
     Serial.println("[WEB] WiFi SoftAP re-enabled");
   });
 
-  server.on("/ble/scan", HTTP_GET, []() {
-    if (!gPortal || !gPortal->ble_) {
-      server.send(500, "application/json", "{\"error\":\"no ble\"}");
-      return;
-    }
-    // 同步扫 8 秒（请求会等一会儿，手机上显示加载即可）
-    gPortal->ble_->runScan(8000);
-    server.send(200, "application/json", "{\"ok\":1}");
-  });
-
-  server.on("/ble/results", HTTP_GET, []() {
-    if (!gPortal || !gPortal->ble_) {
-      server.send(500, "application/json", "{\"error\":\"no ble\"}");
-      return;
-    }
-    auto list = gPortal->ble_->interestingHits();
-    String j = "{\"busy\":false,\"n\":";
-    j += String((int)list.size());
-    j += ",\"filter\":\"" + gPortal->ble_->filter();
-    j += "\",\"match_rssi\":" + String(gPortal->ble_->matchRssi());
-    j += ",\"devices\":[";
-    for (size_t i = 0; i < list.size(); i++) {
-      if (i) j += ",";
-      String nm = list[i].name;
-      nm.replace("\"", "'");
-      j += "{\"mac\":\"" + list[i].addr + "\",\"rssi\":" + String(list[i].rssi);
-      j += ",\"name\":\"" + nm + "\"}";
-    }
-    j += "]}";
-    server.send(200, "application/json", j);
-  });
-
-  server.on("/ble/save", HTTP_GET, []() {
-    if (!gPortal) {
-      server.send(500, "text/plain", "no portal");
-      return;
-    }
-    String f = server.arg("f");
-    f.trim();
-    if (f.length() == 0) {
-      server.send(400, "text/plain", "empty filter");
-      return;
-    }
-    if (gPortal->store_) gPortal->store_->saveBleFilter(f);
-    if (gPortal->ble_) {
-      gPortal->ble_->setFilter(f);
-      gPortal->ble_->setTrack(true);
-    }
-    Serial.println("[WEB] BLE filter saved+track: " + f);
-    String body =
-        F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
-          "content='width=device-width,initial-scale=1'>"
-          "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
-          "padding:24px;text-align:center'>"
-          "<h2>BLE 特征已保存</h2><p><code>");
-    body += f;
-    body += F("</code></p><p style='color:#3dd68c'>已开始周期跟踪，可回到首页看 RSSI</p>"
-              "<p><a style='color:#2f80ed' href='/'>返回</a></p></body>");
-    server.send(200, "text/html; charset=utf-8", body);
-  });
-
   server.on("/scan/start", HTTP_GET, []() {
     if (!gPortal || !gPortal->bt_) {
       server.send(500, "application/json", "{\"error\":\"no bt\"}");
@@ -446,13 +474,10 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
     trackMode_ = store_->loadTrackMode(TRACK_MODE_DEFAULT);
   }
 
-  if (ble_ && store_) {
-    String f = store_->loadBleFilter();
-    if (f.length()) {
-      ble_->setFilter(f);
-      ble_->setTrack(true);
-      Serial.println("[WEB] BLE filter from NVS: " + f);
-    }
+  // BLE 模式：有配对 IRK 就开跟踪（不再依赖名称特征）
+  if (ble_ && gBleBond.hasIrk()) {
+    ble_->setTrack(true);
+    Serial.println("[WEB] BLE IRK track ON (paired phone)");
   }
 
   uint64_t chipid = ESP.getEfuseMac();
@@ -508,6 +533,21 @@ void WebPortal::loop() {
   if (!apActive_) return;
 
   server.handleClient();
+
+  // 配对/扫描后 SoftAP 可能被顶掉：不关 WiFi，只补一次 softAP
+  static uint32_t lastReassert = 0;
+  if (millis() - lastReassert >= 5000) {
+    lastReassert = millis();
+    IPAddress ip = WiFi.softAPIP();
+    if (ip == IPAddress(0, 0, 0, 0)) {
+      Serial.println("[WEB] SoftAP IP=0.0.0.0，尝试重新 softAP");
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(apSsid_.c_str(), AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_CONN);
+      Serial.printf("[WEB] softAP retry -> %s\n",
+                    WiFi.softAPIP().toString().c_str());
+    }
+  }
+
   // 有客户端连热点时：只停「后台跟踪 inquiry」，不停用户点的扫描
   if (bt_) {
     int clients = WiFi.softAPgetStationNum();

@@ -10,15 +10,14 @@ struct BleAdvHit {
   String mfg;
 };
 
-// 按需 BLE 扫描 + 可选特征跟踪（名称前缀或 MAC）
+// BLE 只服务：配对 IRK 跟踪 RSSI（名称/MAC 特征通道已移除）
+// 车机经典蓝牙走 BleTracker，不经本类
 class BleScanTool {
  public:
   void runScan(uint32_t durationMs = 10000);
   bool busy() const { return busy_; }
 
   const std::vector<BleAdvHit>& hits() const { return hits_; }
-  String filter() const { return filter_; }
-  void setFilter(const String& f) { filter_ = f; filter_.trim(); }
 
   int matchRssi() const { return matchRssi_; }
   String matchLabel() const { return matchLabel_; }
@@ -28,14 +27,15 @@ class BleScanTool {
   bool lostCar() const { return lostCar_; }
   void clearLostFlag() { lostCar_ = false; }
 
-  // 周期跟踪：scanMs 建议 800–1500；intervalMs 3000+
+  // 周期跟踪：有配对 IRK 时应保持 on
   void setTrack(bool on) { trackOn_ = on; }
   bool trackOn() const { return trackOn_; }
   void trackPoll(uint32_t intervalMs = 3000, uint32_t scanMs = 1000);
 
-  // 给 Web 用：有名称的 BLE 设备列表（按 RSSI 降序），支持任意设备
-  std::vector<BleAdvHit> interestingHits() const;
+  // 是否命中：仅 IRK 配对设备
   bool matchHits(const BleAdvHit& h) const;
+  // 仅命中设备（给排障用，不按名称过滤）
+  std::vector<BleAdvHit> matchOnlyHits() const;
 
  private:
   bool busy_ = false;
@@ -43,7 +43,6 @@ class BleScanTool {
   uint32_t nextTrackMs_ = 0;
   uint32_t lastScanEndMs_ = 0;
   std::vector<BleAdvHit> hits_;
-  String filter_;
   int matchRssi_ = -127;
   String matchLabel_;
   uint32_t lastMatchMs_ = 0;

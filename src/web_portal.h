@@ -4,6 +4,7 @@
 #include "door_fsm.h"
 #include "config_store.h"
 #include "ble_scan.h"
+#include "ble_bond.h"
 #include "config.h"
 
 // SoftAP + 手机网页：设置车机蓝牙 MAC / BLE 特征 / 查看状态 / 手动开关

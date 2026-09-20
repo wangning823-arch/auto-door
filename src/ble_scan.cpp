@@ -1,4 +1,5 @@
 #include "ble_scan.h"
+#include "ble_bond.h"
 #include "config.h"
 #include <WiFi.h>
 
@@ -17,7 +18,7 @@ static String hexDump(const uint8_t* d, size_t n, size_t maxN = 24) {
   for (size_t i = 0; i < m; i++) {
     if (d[i] < 16) s += '0';
     s += String(d[i], HEX);
-    if (i + 1 < m) s += ' ';
+    if (i < m - 1) s += ' ';
   }
   if (n > maxN) s += "...";
   s.toUpperCase();
@@ -52,50 +53,15 @@ class AdvCb : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-static bool isXiaomiCarish(const BleAdvHit& h) {
-  String n = h.name;
-  n.toUpperCase();
-  if (n.startsWith("MICAR")) return true;
-  String s = h.services;
-  s.toLowerCase();
-  if (s.indexOf("fcd1") >= 0) return true;
-  if (h.addr.startsWith("58:C4:1E")) return true;
-  return false;
-}
-
-// 有名称的 BLE 设备都算候选（手机、车、手表等）
-static bool isInterestingBle(const BleAdvHit& h) {
-  if (h.name.length() > 0) return true;
-  return isXiaomiCarish(h);  // 无名但像小米车的也保留
-}
-
+// 仅配对 IRK 命中（名称/MAC 特征通道已移除）
 bool BleScanTool::matchHits(const BleAdvHit& h) const {
-  if (filter_.length() == 0) return false;
-  String f = filter_;
-  f.toUpperCase();
-  String n = h.name;
-  n.toUpperCase();
-  String a = h.addr;
-  a.toUpperCase();
-  if (f.indexOf(':') > 0) {
-    return a.indexOf(f) >= 0;
-  }
-  return n.indexOf(f) >= 0;
+  return gBleBond.matchesAddr(h.addr);
 }
 
-std::vector<BleAdvHit> BleScanTool::interestingHits() const {
+std::vector<BleAdvHit> BleScanTool::matchOnlyHits() const {
   std::vector<BleAdvHit> out;
   for (const auto& h : hits_) {
-    if (isInterestingBle(h) || matchHits(h)) out.push_back(h);
-  }
-  for (size_t i = 0; i < out.size(); i++) {
-    for (size_t j = i + 1; j < out.size(); j++) {
-      if (out[j].rssi > out[i].rssi) {
-        BleAdvHit t = out[i];
-        out[i] = out[j];
-        out[j] = t;
-      }
-    }
+    if (matchHits(h)) out.push_back(h);
   }
   return out;
 }
@@ -105,16 +71,14 @@ void BleScanTool::runScan(uint32_t durationMs) {
     Serial.println("[BLE] scan already running");
     return;
   }
-  // 距上次扫太近容易 err 259；至少隔 2.5s
   if (millis() - lastScanEndMs_ < 2500) {
     return;
   }
   busy_ = true;
   hits_.clear();
-  // 不要清 matchRssi_：失败时保留上次成功值，避免网页显示 -
 
-  Serial.printf("[BLE] scan %ums filter=\"%s\"\n", durationMs,
-                filter_.c_str());
+  Serial.printf("[BLE] scan %ums (IRK-only track=%d bond=%d)\n", durationMs,
+                (int)trackOn_, (int)gBleBond.hasIrk());
 
   if (!gBleInited) {
     BLEDevice::init("GarageDoorBLE");
@@ -128,7 +92,6 @@ void BleScanTool::runScan(uint32_t durationMs) {
   scan->setActiveScan(true);
   scan->setInterval(120);
   scan->setWindow(90);
-  // 连续扫描时 duration 用秒；1s 太短，跟踪用 >=1.5s
   uint32_t sec = (durationMs + 999) / 1000;
   if (sec < 2) sec = 2;
   if (sec > 15) sec = 15;
@@ -139,10 +102,14 @@ void BleScanTool::runScan(uint32_t durationMs) {
 
   int best = -127;
   String label;
+  int bondHits = 0;
   for (const auto& h : hits_) {
-    if (matchHits(h) && h.rssi > best) {
-      best = h.rssi;
-      label = h.name.length() ? h.name : h.addr;
+    if (matchHits(h)) {
+      bondHits++;
+      if (h.rssi > best) {
+        best = h.rssi;
+        label = h.name.length() ? h.name : h.addr;
+      }
     }
   }
   lostCar_ = false;
@@ -158,15 +125,16 @@ void BleScanTool::runScan(uint32_t durationMs) {
     }
   }
 
-  Serial.printf("[BLE] hits=%u match_rssi=%d label=%s miss=%u%s\n",
-                (unsigned)hits_.size(), matchRssi_, matchLabel_.c_str(),
-                missStreak_, lostCar_ ? " LOST" : "");
-  auto list = interestingHits();
-  size_t show = list.size() < 8 ? list.size() : 8;
-  for (size_t i = 0; i < show; i++) {
-    const BleAdvHit& h = list[i];
-    Serial.printf("[BLE] %s rssi=%d name=\"%s\"%s\n", h.addr.c_str(), h.rssi,
-                  h.name.c_str(), matchHits(h) ? " <-MATCH" : "");
+  Serial.printf("[BLE] hits=%u bond=%d match_rssi=%d label=%s miss=%u%s\n",
+                (unsigned)hits_.size(), bondHits, matchRssi_,
+                matchLabel_.c_str(), missStreak_, lostCar_ ? " LOST" : "");
+
+  // 只打印命中的配对设备，避免全表刷屏
+  for (const auto& h : hits_) {
+    if (matchHits(h)) {
+      Serial.printf("[BLE] BOND %s rssi=%d name=\"%s\"\n", h.addr.c_str(),
+                    h.rssi, h.name.c_str());
+    }
   }
 
   scan->clearResults();
@@ -176,9 +144,9 @@ void BleScanTool::runScan(uint32_t durationMs) {
 void BleScanTool::trackPoll(uint32_t intervalMs, uint32_t scanMs) {
   if (!trackOn_ || busy_) return;
   if (millis() < nextTrackMs_) return;
+  // trackPoll 本身有 interval；scanMs 过短会被抬到 2000，热点模式允许更短
   nextTrackMs_ = millis() + intervalMs;
-  // 跟踪扫长一点，提高命中率
-  if (scanMs < 2000) scanMs = 2000;
+  if (scanMs < 1000) scanMs = 1000;
   runScan(scanMs);
 }
 
@@ -187,6 +155,6 @@ void BleScanTool::runScan(uint32_t) {
   Serial.println("[BLE] BLE not enabled in this build");
 }
 void BleScanTool::trackPoll(uint32_t, uint32_t) {}
-std::vector<BleAdvHit> BleScanTool::interestingHits() const { return {}; }
+std::vector<BleAdvHit> BleScanTool::matchOnlyHits() const { return {}; }
 bool BleScanTool::matchHits(const BleAdvHit&) const { return false; }
 #endif
