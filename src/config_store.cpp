@@ -103,3 +103,13 @@ bool ConfigStore::saveRfAuto(bool on) {
   if (!ready_) return false;
   return prefs.putBool("rf_auto", on);
 }
+
+bool ConfigStore::loadAutoTrack(bool defaultOn) {
+  if (!ready_) return defaultOn;
+  return prefs.getBool("auto_trk", defaultOn);
+}
+
+bool ConfigStore::saveAutoTrack(bool on) {
+  if (!ready_) return false;
+  return prefs.putBool("auto_trk", on);
+}

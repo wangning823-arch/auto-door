@@ -32,15 +32,20 @@ class BleTracker {
   bool begin(const char* macStr);
   void loop();
 
-  // WiFi 优先：有手机连热点时暂停后台 Inquiry，不影响用户点的扫描
+  // WiFi 优先：有手机连热点时降低后台 Inquiry 频率，不完全停
   void setInquiryPaused(bool paused);
   bool inquiryPaused() const { return inquiryPaused_; }
+  // SoftAP 有客户端时慢速 Inquiry（保住跟踪，尽量让出射频给网页）
+  void setInquirySlow(bool slow);
+  void cancelActiveInquiry();
   void setAutoTrack(bool on) { autoTrack_ = on; }
   bool autoTrack() const { return autoTrack_; }
 
   bool hasTarget() const { return targetSet_; }
   bool seenRecently(uint32_t withinMs) const;
-  int lastRssi() const { return lastRssi_; }
+  // 超过 20s 未再扫到 → 返回 -127，避免网页显示卡住的旧 RSSI
+  int lastRssi() const;
+  int lastRssiRaw() const { return lastRssi_; }
   float slope() const { return slope_; }
   SignalTrend trend() const { return trend_; }
   CarZone zone() const { return zone_; }
@@ -87,10 +92,11 @@ class BleTracker {
   uint32_t discEndMs_ = 0;
   std::vector<BleDeviceItem> discList_;
 
-  // 周期性 inquiry 用于跟踪目标（默认关闭，避免抢 WiFi）
+  // 周期性 inquiry 用于跟踪目标
   uint32_t nextInquiryMs_ = 0;
   bool inquiryBusy_ = false;
   volatile bool inquiryPaused_ = false;
+  bool inquirySlow_ = false;
   bool autoTrack_ = false;
-  uint8_t missCount_ = 0;  // 连续未扫到目标的轮次
+  uint8_t missCount_ = 0;
 };

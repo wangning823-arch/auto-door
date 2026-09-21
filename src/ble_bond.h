@@ -24,6 +24,8 @@ class BleBond {
   uint32_t staticPasskey() const;
   bool hasPasskey() const;
   bool allowSmp() const { return pairingOpen(); }
+  // 调试：打印 IRK/身份地址/系统 bond 列表
+  void debugDump();
   // 配对成功后从系统 bond 表抠 IRK/身份地址
   bool trySaveFromSystemBond(const uint8_t* peerAddr6);
   void requestDelayedClose(const char* why, uint32_t ms = 2000);

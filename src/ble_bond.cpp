@@ -45,18 +45,28 @@ static bool parseMac(const String& s, uint8_t out[6]) {
 }
 
 static bool resolveRpa(const uint8_t addr[6], const uint8_t irk[16]) {
-  if ((addr[0] & 0xC0) != 0x40) return false;
+  if ((addr[0] & 0xC0) != 0x40) return false;  // prand 两位标志 01
+  // 对齐 Bluedroid btm_ble_resolve_rpa + SMP_Encrypt：
+  // plain = (a2,a1,a0)||0^104 后整体 reverse；key 也 reverse；AES 后输出再 reverse
+  // 与 hash=(a5,a4,a3) 比前 3 字节
   uint8_t plain[16] = {0};
-  plain[0] = addr[0];
+  plain[0] = addr[2];
   plain[1] = addr[1];
-  plain[2] = addr[2];
+  plain[2] = addr[0];
+  uint8_t plainRev[16];
+  uint8_t keyRev[16];
+  for (int i = 0; i < 16; i++) {
+    plainRev[i] = plain[15 - i];
+    keyRev[i] = irk[15 - i];
+  }
   mbedtls_aes_context aes;
   mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_enc(&aes, irk, 128);
+  mbedtls_aes_setkey_enc(&aes, keyRev, 128);
   uint8_t out[16];
-  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plain, out);
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plainRev, out);
   mbedtls_aes_free(&aes);
-  return out[0] == addr[3] && out[1] == addr[4] && out[2] == addr[5];
+  uint8_t x0 = out[15], x1 = out[14], x2 = out[13];
+  return x0 == addr[5] && x1 == addr[4] && x2 == addr[3];
 }
 
 class SecCbs : public BLESecurityCallbacks {
@@ -554,8 +564,10 @@ bool BleBond::matchesAddr(const String& addrColon) const {
   if (identity_.length() == 17) {
     uint8_t id[6];
     if (parseMac(identity_, id) && memcmp(a, id, 6) == 0) return true;
+    // BLE 库地址串可能反字节序，再比一次
+    uint8_t idr[6] = {id[5], id[4], id[3], id[2], id[1], id[0]};
+    if (parseMac(identity_, id) && memcmp(a, idr, 6) == 0) return true;
   }
-  // 仅当 IRK 是有效 16 字节且非全 0 时做 RPA 解析
   bool irkNonZero = false;
   for (int i = 0; i < 16; i++) {
     if (irk_[i]) {
@@ -564,7 +576,47 @@ bool BleBond::matchesAddr(const String& addrColon) const {
     }
   }
   if (!irkNonZero) return false;
-  return resolveRpa(a, irk_);
+  if (resolveRpa(a, irk_)) return true;
+  // IRK 可能按小端存进 bond，再试反转
+  uint8_t irkRev[16];
+  for (int i = 0; i < 16; i++) irkRev[i] = irk_[15 - i];
+  return resolveRpa(a, irkRev);
+}
+
+void BleBond::debugDump() {
+  char hex[33];
+  for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", irk_[i]);
+  hex[32] = 0;
+  Serial.printf("[BOND] hasIrk=%d id=%s irk=%s track=%d\n", (int)hasIrk_,
+                identity_.c_str(), hasIrk_ ? hex : "(none)",
+                gBleScan.trackOn() ? 1 : 0);
+  // 已知配对期 RPA：离线校验 resolveRpa 是否与 Bluedroid 一致
+  const char* pairRpa = "74:6F:87:A1:9A:56";
+  Serial.printf("[BOND] selftest pairRpa %s -> %d\n", pairRpa,
+                (int)matchesAddr(pairRpa));
+  int n = esp_ble_get_bond_device_num();
+  Serial.printf("[BOND] system bond count=%d\n", n);
+  if (n > 0) {
+    if (n > 8) n = 8;
+    esp_ble_bond_dev_t list[8];
+    int cnt = n;
+    if (esp_ble_get_bond_device_list(&cnt, list) == ESP_OK) {
+      for (int i = 0; i < cnt; i++) {
+        Serial.printf("[BOND] sys[%d] %s mask=0x%x\n", i,
+                      macFromNative(list[i].bd_addr).c_str(),
+                      (unsigned)list[i].bond_key.key_mask);
+        if (list[i].bond_key.key_mask & ESP_BLE_ID_KEY_MASK) {
+          const auto& pid = list[i].bond_key.pid_key;
+          char ph[33];
+          for (int j = 0; j < 16; j++)
+            snprintf(ph + j * 2, 3, "%02x", pid.irk[j]);
+          ph[32] = 0;
+          Serial.printf("[BOND] sys[%d] irk=%s static=%s\n", i, ph,
+                        macFromNative(pid.static_addr).c_str());
+        }
+      }
+    }
+  }
 }
 
 #else
@@ -593,5 +645,6 @@ bool BleBond::trySaveFromSystemBond(const uint8_t*) { return false; }
 void BleBond::requestDelayedClose(const char*, uint32_t) {}
 bool BleBond::hasPasskey() const { return false; }
 bool BleBond::allowSmp() const { return false; }
+void BleBond::debugDump() {}
 
 #endif

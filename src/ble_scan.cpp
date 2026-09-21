@@ -129,11 +129,20 @@ void BleScanTool::runScan(uint32_t durationMs) {
                 (unsigned)hits_.size(), bondHits, matchRssi_,
                 matchLabel_.c_str(), missStreak_, lostCar_ ? " LOST" : "");
 
-  // 只打印命中的配对设备，避免全表刷屏
-  for (const auto& h : hits_) {
-    if (matchHits(h)) {
-      Serial.printf("[BLE] BOND %s rssi=%d name=\"%s\"\n", h.addr.c_str(),
+  // 未命中时打全表，便于查 RPA/身份地址
+  if (bondHits == 0) {
+    for (const auto& h : hits_) {
+      Serial.printf("[BLE] hit %s rssi=%d name=\"%s\"\n", h.addr.c_str(),
                     h.rssi, h.name.c_str());
+    }
+    Serial.printf("[BOND] irk_nonzero=%d id=%s\n",
+                  gBleBond.hasIrk() ? 1 : 0, gBleBond.identityMac().c_str());
+  } else {
+    for (const auto& h : hits_) {
+      if (matchHits(h)) {
+        Serial.printf("[BLE] BOND %s rssi=%d name=\"%s\"\n", h.addr.c_str(),
+                      h.rssi, h.name.c_str());
+      }
     }
   }
 

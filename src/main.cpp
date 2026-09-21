@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include "config.h"
 #include "ble_tracker.h"
 #include "door_fsm.h"
@@ -272,6 +273,7 @@ static void handleSerial() {
         if (gBleBond.hasPasskey()) {
           Serial.printf("[CMD] PIN value=%s\n", gBleBond.pairingPin().c_str());
         }
+        gBleBond.debugDump();
       } else if (line == "blepair") {
         gBleBond.requestOpenPairing(90000);
       } else if (line.startsWith("blepair ")) {
@@ -288,10 +290,12 @@ static void handleSerial() {
         gBleBond.setPairingPin(line.substring(7));
       } else if (line == "autotrack on") {
         gBt.setAutoTrack(true);
-        Serial.println("[CMD] autotrack ON (periodic inquiry)");
+        gCfg.saveAutoTrack(true);
+        Serial.println("[CMD] autotrack ON (periodic inquiry, saved)");
       } else if (line == "autotrack off") {
         gBt.setAutoTrack(false);
-        Serial.println("[CMD] autotrack OFF");
+        gCfg.saveAutoTrack(false);
+        Serial.println("[CMD] autotrack OFF (saved)");
       } else if (line == "rfcap") {
         // 连续抓包：一直听，直到 rfstop / GUI 停止
         Serial.println("[RF] RFCAP_OK 进入连续抓包");
@@ -422,18 +426,115 @@ static void handleSerial() {
       } else if (line == "rfexport") {
         for (int i = 0; i < RF_KEY_COUNT; i++) gRf.exportKeyCsv(i);
         Serial.println("[RF] export done");
+      } else if (line == "gpio17" || line == "i2cscan" || line == "i2cscan2") {
+        // 推拉测试只给 gpio17：i2cscan 前不要动 SCL，否则会把 PN532 弄挂
+        if (line == "gpio17") {
+          pinMode(PIN_NFC_SCL, OUTPUT);
+          digitalWrite(PIN_NFC_SCL, HIGH);
+          delay(2);
+          int driven = digitalRead(PIN_NFC_SCL);
+          digitalWrite(PIN_NFC_SCL, LOW);
+          delay(2);
+          int drivenLow = digitalRead(PIN_NFC_SCL);
+          pinMode(PIN_NFC_SCL, INPUT_PULLUP);
+          delay(5);
+          int released = digitalRead(PIN_NFC_SCL);
+          pinMode(PIN_NFC_SDA, INPUT_PULLUP);
+          delay(2);
+          int sda = digitalRead(PIN_NFC_SDA);
+          Serial.printf(
+              "[GPIO] SCL17 driveH=%d driveL=%d release_pullup=%d | SDA16=%d\n",
+              driven, drivenLow, released, sda);
+          if (driven == 1 && released == 0) {
+            Serial.println("[GPIO] 结论: 能推高但松开后为0 → 外部器件拉住 SCL");
+          } else if (driven == 0) {
+            Serial.println("[GPIO] 结论: 推高仍为0 → SCL 对地硬短路");
+          } else if (released == 1) {
+            Serial.println("[GPIO] 结论: 松开后为1 → 总线空闲正常");
+          }
+        } else {
+        bool multi = (line == "i2cscan2");
+        static const int pairs[][2] = {
+            {PIN_NFC_SDA, PIN_NFC_SCL}, {4, 15},  {18, 19}, {32, 33},
+            {12, 14},     {13, 32},     {23, 22}, {2, 15},
+        };
+        int nPairs = multi ? (int)(sizeof(pairs) / sizeof(pairs[0])) : 1;
+        int total = 0;
+        for (int p = 0; p < nPairs; p++) {
+          int sdaP = pairs[p][0], sclP = pairs[p][1];
+          if (sdaP == PIN_RELAY || sclP == PIN_RELAY || sdaP == PIN_RF_DATA ||
+              sclP == PIN_RF_DATA || sdaP == PIN_RF_TX || sclP == PIN_RF_TX) {
+            continue;
+          }
+          Wire.end();
+          pinMode(sdaP, INPUT_PULLUP);
+          pinMode(sclP, INPUT_PULLUP);
+          Wire.begin(sdaP, sclP);
+          Wire.setTimeOut(50);
+          int lvlSda = digitalRead(sdaP), lvlScl = digitalRead(sclP);
+          int found = 0;
+          uint8_t codes[3] = {255, 255, 255};
+          int nTry = 0;
+          for (uint8_t a = 0x08; a <= 0x77; a++) {
+            Wire.beginTransmission(a);
+            uint8_t e = Wire.endTransmission();
+            if (nTry < 3) codes[nTry++] = e;
+            if (e == 0) {
+              Serial.printf("[I2C] FOUND sda=%d scl=%d addr=0x%02X\n", sdaP,
+                            sclP, a);
+              found++;
+            }
+            if (e == 5) break;
+          }
+          Serial.printf(
+              "[I2C] pair sda=%d scl=%d lvl=%d/%d found=%d e0=%u e1=%u e2=%u\n",
+              sdaP, sclP, lvlSda, lvlScl, found, codes[0], codes[1], codes[2]);
+          total += found;
+        }
+        Serial.printf("[I2C] multi-scan done total=%d\n", total);
+        Wire.end();
+        Wire.begin(PIN_NFC_SDA, PIN_NFC_SCL);
+        // 不调用 gNfc.begin()：会清掉已 PN532 ready 的状态
+        }
+      } else if (line == "sclhold") {
+        gNfc.holdSclHigh();
+      } else if (line == "sclrelease") {
+        gNfc.releaseScl();
+      } else if (line == "buspull") {
+        pinMode(PIN_NFC_SDA, INPUT_PULLUP);
+        pinMode(PIN_NFC_SCL, INPUT_PULLUP);
+        Serial.printf("[BUS] buspull SDA16=%d SCL17=%d\n",
+                      digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
+      } else if (line == "busfree") {
+        // 只松 Wire，不碰 PN532 命令（Error263 后 SCL 卡 0.04 时用）
+        Wire.end();
+        pinMode(PIN_NFC_SDA, INPUT_PULLUP);
+        pinMode(PIN_NFC_SCL, INPUT_PULLUP);
+        Serial.printf("[BUS] busfree Wire.end SDA16=%d SCL17=%d\n",
+                      digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
+      } else if (line == "nfcinit") {
+        Serial.println("[CMD] nfcinit 强制重新初始化...");
+        if (gNfc.forceInit()) {
+          Serial.println("[CMD] nfcinit OK");
+        } else {
+          Serial.println("[CMD] nfcinit FAIL");
+        }
       } else if (line == "nfcscan") {
-        Serial.println("[CMD] 等待刷卡 5 秒...");
+        Serial.println("[CMD] NFC 持续监听已开，贴卡（最多 30 秒）...");
+        if (!gNfc.ok()) gNfc.forceInit();
+        gNfc.startListen(0);  // 持续
         String uid;
         uint32_t t0 = millis();
-        while (millis() - t0 < 5000) {
+        while (millis() - t0 < 30000) {
           if (gNfc.poll(uid)) {
             Serial.println("[NFC] 读到卡: " + uid);
             break;
           }
-          delay(50);
+          delay(20);
         }
         if (uid.length() == 0) Serial.println("[NFC] 超时未读到卡");
+        Serial.printf("[NFC] scan end SCL17=%d\n",
+                      digitalRead(PIN_NFC_SCL));
       } else if (line.startsWith("nfcsave ")) {
         String uid = line.substring(8);
         uid.trim();
@@ -452,7 +553,7 @@ static void handleSerial() {
       } else if (line == "help") {
         Serial.println(
             "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
-            "rfexport | rfclear | rfdefaults | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off | blebond | blepair [sec] | bleunpair");
+            "rfexport | rfclear | rfdefaults | i2cscan | i2cscan2 | buspull | busfree | sclhold | sclrelease | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off | blebond | blepair [sec] | bleunpair");
       } else if (line == "rfdefaults") {
         // 强制写入实车验证的开/关码（修第二块板开码不对）
         bool ok0 = gRf.setKeyFromCsv(RF_KEY_OPEN, RF_DEFAULT_OPEN_CSV);
@@ -481,6 +582,14 @@ void setup() {
   Serial.println(" Garage Door Controller  P0.1");
   Serial.println(" SoftAP web config + gradual BT");
   Serial.println("========================================");
+
+  // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
+  pinMode(PIN_NFC_SDA, INPUT_PULLUP);
+  pinMode(PIN_NFC_SCL, INPUT_PULLUP);
+  delay(2);
+  Serial.printf("[BOOT] early SDA16=%d SCL17=%d t=%ums\n",
+                digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL),
+                (unsigned)millis());
 
   gDoor.begin();
   gCfg.begin();
@@ -530,13 +639,7 @@ void setup() {
     Serial.println("[BOOT] rfauto=OFF，串口: rfauto on 可开启并保存");
   }
 
-  Serial.println("[BOOT] NFC init...");
-  if (gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL)) {
-    String auth = gCfg.loadNfcUid();
-    gNfc.setAuthUid(auth);
-    Serial.println("[BOOT] NFC auth: " + (auth.length() ? auth : String("(未注册)")));
-  }
-
+  // SoftAP/HTTP 必须先起；NFC 绝不能挡启动
   String saved = gCfg.loadMac(CAR_BT_MAC);
   saved.toCharArray(gMac, sizeof(gMac));
   Serial.println("[BOOT] car MAC from NVS: " + saved);
@@ -544,21 +647,47 @@ void setup() {
   bool wifiOn = gCfg.loadWifiEnabled(true);
   Serial.println("[BOOT] wifiOn=" + String(wifiOn ? 1 : 0));
 
-  // 顺序：先起 SoftAP/TCP-IP，再起 Classic BT
-  // 否则易触发 assert failed: tcpip_send_msg_wait_sem (Invalid mbox) 死循环重启
+  // NFC：仅记录状态，不碰 Wire；量电压阶段后台绝不自动 init
+  Serial.println("[BOOT] NFC deferred (nfcinit only)");
+  gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL);
+  pinMode(PIN_NFC_SDA, INPUT_PULLUP);
+  pinMode(PIN_NFC_SCL, INPUT_PULLUP);
+  {
+    String auth = gCfg.loadNfcUid();
+    gNfc.setAuthUid(auth);
+    Serial.println("[BOOT] NFC auth: " + (auth.length() ? auth : String("(未注册)")));
+  }
+  Serial.printf("[BOOT] after-nfc-begin t=%ums SCL17=%d\n", (unsigned)millis(),
+                digitalRead(PIN_NFC_SCL));
+
   Serial.println("[BOOT] web/WiFi first...");
+  Serial.printf("[BOOT] before-web t=%ums SCL17=%d\n", (unsigned)millis(),
+                digitalRead(PIN_NFC_SCL));
   gWeb.begin(&gCfg, &gBt, &gDoor, &gBleScan, wifiOn);
   delay(300);
+  Serial.printf("[BOOT] after-web t=%ums SCL17=%d\n", (unsigned)millis(),
+                digitalRead(PIN_NFC_SCL));
 
   Serial.println("[BOOT] Classic BT second...");
   if (!gBt.begin(gMac)) {
     Serial.println("[BOOT] Classic BT init failed");
   }
+  Serial.printf("[BOOT] after-bt t=%ums SCL17=%d\n", (unsigned)millis(),
+                digitalRead(PIN_NFC_SCL));
 
-  // BLE 配对/IRK：无密钥则广播 GarageDoorBLE 供手机配对；有则扫描时解析 RPA
+  // 经典模式：必须开周期 Inquiry，否则离开时 RSSI 卡住、永不关门
+  {
+    int tm = gWeb.trackMode();
+    bool classic = (tm == TRACK_MODE_CLASSIC);
+    bool autoOn = gCfg.loadAutoTrack(classic);  // 默认：经典=开，BLE=关
+    if (classic && gBt.hasTarget()) autoOn = true;
+    gBt.setAutoTrack(autoOn);
+    Serial.println("[BOOT] trackMode=" + String(classic ? "CLASSIC" : "BLE") +
+                   " autotrack=" + String(autoOn ? "ON" : "OFF"));
+  }
+
   Serial.println("[BOOT] BLE bond/IRK init...");
   gBleBond.begin();
-  // 必须在 gBleBond.begin() 之后：否则 IRK 已存却 track 仍 OFF，RSSI 一直是 -
   if (gBleBond.hasIrk()) {
     gBleScan.setTrack(true);
     Serial.println("[BOOT] IRK track ON (paired phone)");
@@ -566,6 +695,8 @@ void setup() {
 
   Serial.println("[BOOT] ready. wifi=" + String(wifiOn ? "ON" : "OFF") +
                  " autotrack=" + String(gBt.autoTrack() ? "ON" : "OFF"));
+  Serial.printf("[BOOT] ready t=%ums SDA16=%d SCL17=%d\n", (unsigned)millis(),
+                digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
   if (wifiOn) {
     Serial.println("[BOOT] 手机WiFi连接: " + gWeb.apSsid() + "  密码: " + AP_PASSWORD);
     Serial.println("[BOOT] 浏览器打开: http://192.168.4.1/");
@@ -578,6 +709,26 @@ void setup() {
 }
 
 void loop() {
+  // SCL 掉压监视：边沿必打，稳态每 2s 心跳，方便和万用表对时间
+  {
+    static int lastSda = -1, lastScl = -1;
+    static uint32_t lastBusLog = 0;
+    int sda = digitalRead(PIN_NFC_SDA);
+    int scl = digitalRead(PIN_NFC_SCL);
+    uint32_t now = millis();
+    if (sda != lastSda || scl != lastScl) {
+      Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d%s\n", (unsigned)now, sda,
+                    scl, (scl ? " (idle high)" : " (SCL LOW)"));
+      lastSda = sda;
+      lastScl = scl;
+      lastBusLog = now;
+    } else if (now - lastBusLog >= 2000) {
+      Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d\n", (unsigned)now, sda,
+                    scl);
+      lastBusLog = now;
+    }
+  }
+
   gWeb.loop();
   gDoor.loop(gBt);
   serviceBootLongPress();
@@ -613,14 +764,12 @@ void loop() {
     static BlePhase phase = BlePhase::WAIT_SIGNAL;
     static uint8_t leaveFarStreak = 0;
 
-    // 手机连 SoftAP 时降低 BLE 扫占空比（不要完全停，否则看网页时 RSSI 一直为 -）
+    // 手机连 SoftAP 时：跳过阻塞式 BLE 扫描，优先保证网页能响应
     const bool wifiClient = WiFi.softAPgetStationNum() > 0;
-    if (gBleScan.trackOn()) {
+    if (gBleScan.trackOn() && !wifiClient) {
       // runScan() 是阻塞的：busy 边沿在同一轮 trackPoll 内完成，不能靠 busy 跨轮判断
       const uint32_t prevScanEnd = gBleScan.lastScanEndMs();
-      const uint32_t iv = wifiClient ? 10000 : BLE_TRACK_INTERVAL_MS;
-      const uint32_t sc = wifiClient ? 1000 : BLE_TRACK_SCAN_MS;
-      gBleScan.trackPoll(iv, sc);
+      gBleScan.trackPoll(BLE_TRACK_INTERVAL_MS, BLE_TRACK_SCAN_MS);
       const bool scanJustFinished = gBleScan.lastScanEndMs() != prevScanEnd;
       if (scanJustFinished) {
         int r = gBleScan.matchRssi();
@@ -709,12 +858,11 @@ void loop() {
             break;
         }
       }
-    } else if (wifiClient && gBleScan.busy() == false) {
-      // 连着热点就不启新 BLE 扫；日志方便确认
+    } else if (wifiClient) {
       static uint32_t lastWifiSkipLog = 0;
       if (millis() - lastWifiSkipLog > 15000) {
         lastWifiSkipLog = millis();
-        Serial.println("[BLE] track paused (SoftAP client connected)");
+        Serial.println("[BLE] track scan skipped (SoftAP client, keep web alive)");
       }
     }
   } else {

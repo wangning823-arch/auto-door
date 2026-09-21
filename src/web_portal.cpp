@@ -32,7 +32,14 @@ String WebPortal::pageHtml() const {
     if (s == DoorState::OPEN) door = "开";
     else if (s == DoorState::CLOSED) door = "关";
   }
-  String rssi = bt_ ? String(bt_->lastRssi()) : "-";
+  String rssi = "-";
+  if (bt_) {
+    int rv = bt_->lastRssi();
+    if (rv <= -127)
+      rssi = "丢失(未再扫到)";
+    else
+      rssi = String(rv) + (bt_->seenRecently(20000) ? "" : " (旧)");
+  }
   String bleRssi = "-";
   String bleLab = gBleBond.hasIrk() ? gBleBond.identityMac() : String("(未配对)");
   if (ble_ && ble_->matchRssi() > -127) {
@@ -89,6 +96,8 @@ String WebPortal::pageHtml() const {
   // 跟踪模式选择
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">跟踪模式</span><span class=\"v\">");
   html += (trackMode_ == TRACK_MODE_BLE) ? "BLE" : "经典蓝牙";
+  html += F("</span></div><div class=\"row\"><span class=\"k\">自动跟踪</span><span class=\"v\">");
+  html += (bt_ && bt_->autoTrack()) ? "开" : "关";
   html += F("</span></div>"
             "<form method=\"GET\" action=\"/mode\" style=\"margin-top:8px\">"
             "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
@@ -101,7 +110,7 @@ String WebPortal::pageHtml() const {
   html += F(">经典蓝牙（小蚂蚁等车机 MAC）</label>"
             "<button type=\"submit\">保存模式</button></form>"
             "<div class=\"tip\">开/关：无→有且&lt;-80立刻开；≥-80不开；离场≤-90约10m关。"
-            "BLE 模式只认已配对手机；经典模式认车机 MAC。</div></div>");
+            "经典模式保存后会自动打开周期 Inquiry；网页会显示「自动跟踪」状态。</div></div>");
 
   // ===== 手机配对：开关 + 6位PIN（手机配对时输入，真正有意义）=====
   html += F("<div class=\"card\">"
@@ -384,6 +393,8 @@ void WebPortal::setupRoutes() {
     }
     if (gPortal && gPortal->bt_) {
       j += ",\"rssi\":" + String(gPortal->bt_->lastRssi());
+      j += ",\"seen\":" + String(gPortal->bt_->seenRecently(20000) ? 1 : 0);
+      j += ",\"auto\":" + String(gPortal->bt_->autoTrack() ? 1 : 0);
       j += ",\"trend\":" + String((int)gPortal->bt_->trend());
       j += ",\"zone\":" + String((int)gPortal->bt_->zone());
     }
@@ -548,15 +559,20 @@ void WebPortal::loop() {
     }
   }
 
-  // 有客户端连热点时：只停「后台跟踪 inquiry」，不停用户点的扫描
+  // 有客户端连热点：经典 Inquiry 改慢速（不完全停），并立刻 cancel 当前 inquiry
   if (bt_) {
     int clients = WiFi.softAPgetStationNum();
     static int lastC = -1;
     if (clients != lastC) {
       lastC = clients;
       Serial.printf("[WEB] softAP clients=%d\n", clients);
+      if (clients > 0) {
+        bt_->cancelActiveInquiry();
+        bt_->setInquirySlow(true);
+      } else {
+        bt_->setInquirySlow(false);
+      }
     }
-    bt_->setInquiryPaused(clients > 0);
   }
 }
 
@@ -564,5 +580,12 @@ void WebPortal::setTrackMode(int mode) {
   if (mode != TRACK_MODE_BLE && mode != TRACK_MODE_CLASSIC) return;
   trackMode_ = mode;
   if (store_) store_->saveTrackMode(mode);
-  Serial.println("[WEB] track mode -> " + String(mode == TRACK_MODE_BLE ? "BLE" : "Classic"));
+  // 经典模式必须开周期 Inquiry，否则 RSSI 卡住、离开永不关门
+  if (bt_) {
+    bool autoOn = (mode == TRACK_MODE_CLASSIC);
+    bt_->setAutoTrack(autoOn);
+    if (store_) store_->saveAutoTrack(autoOn);
+  }
+  Serial.println("[WEB] track mode -> " + String(mode == TRACK_MODE_BLE ? "BLE" : "Classic") +
+                 " autotrack=" + String((bt_ && bt_->autoTrack()) ? "ON" : "OFF"));
 }

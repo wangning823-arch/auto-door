@@ -143,8 +143,29 @@ bool BleTracker::begin(const char* macStr) {
 }
 
 void BleTracker::setInquiryPaused(bool paused) {
-  // 只影响后台跟踪，不 cancel 用户点的扫描
   inquiryPaused_ = paused;
+  if (paused) cancelActiveInquiry();
+}
+
+void BleTracker::setInquirySlow(bool slow) {
+  inquirySlow_ = slow;
+  if (slow) {
+    // 让出射频给 SoftAP，但仍保留跟踪
+    if (nextInquiryMs_ < millis() + 8000) nextInquiryMs_ = millis() + 8000;
+  }
+}
+
+void BleTracker::cancelActiveInquiry() {
+  if (!gBtReady) return;
+  if (inquiryBusy_ && !discRunning_) {
+    esp_bt_gap_cancel_discovery();
+  }
+}
+
+int BleTracker::lastRssi() const {
+  // 旧值会误导网页/状态：太久没扫到就当作丢失
+  if (lastSeenMs_ != 0 && (millis() - lastSeenMs_) > 20000) return -127;
+  return lastRssi_;
 }
 
 void BleTracker::startDiscovery(uint32_t durationMs) {
@@ -345,25 +366,27 @@ void BleTracker::updateZone() {
 }
 
 void BleTracker::loop() {
-  // 用户主动扫描（discRunning_）不受 inquiryPaused_ 影响
-  // inquiryPaused_ 只禁止「后台周期跟踪」
   if (discRunning_ && millis() > discEndMs_) {
     discRunning_ = false;
     inquiryBusy_ = false;
     Serial.printf("[BT] discovery done, %u devices\n", (unsigned)discList_.size());
   }
 
+  // 显式暂停时才停后台跟踪；SoftAP 慢速模式仍要扫（否则手机连热点时车走了永远不关）
   if (!autoTrack_ || inquiryPaused_ || !gBtReady || !targetSet_ || discRunning_ ||
       inquiryBusy_) {
     return;
   }
   if (millis() >= nextInquiryMs_) {
     inquiryBusy_ = true;
-    // 无 WiFi 时 3s 一轮；len=2 ≈ 2.56s inquiry
-    nextInquiryMs_ = millis() + 3000;
+    uint32_t gap = inquirySlow_ ? 15000 : 3000;
+    nextInquiryMs_ = millis() + gap;
+    uint8_t len = inquirySlow_ ? 1 : 2;  // 1≈1.28s，短一些少打网页
     esp_err_t err =
-        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 2, 0);
-    Serial.printf("[BT] auto inquiry ret=%d\n", (int)err);
+        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, len, 0);
+    Serial.printf("[BT] auto inquiry slow=%d ret=%d\n", (int)inquirySlow_,
+                  (int)err);
+    if (err != ESP_OK) inquiryBusy_ = false;
   }
 }
 
@@ -374,9 +397,10 @@ bool BleTracker::seenRecently(uint32_t withinMs) const {
 void BleTracker::markLeftForCloseEval() {}
 
 String BleTracker::debugLine() const {
-  char buf[160];
-  snprintf(buf, sizeof(buf), "rssi=%d slope=%.2f trend=%d zone=%d seen=%lu",
-           lastRssi_, (double)slope_, (int)trend_, (int)zone_,
-           (unsigned long)lastSeenMs_);
+  char buf[180];
+  snprintf(buf, sizeof(buf),
+           "rssi=%d raw=%d slope=%.2f trend=%d zone=%d seen=%lu auto=%d slow=%d",
+           lastRssi(), lastRssiRaw(), (double)slope_, (int)trend_, (int)zone_,
+           (unsigned long)lastSeenMs_, (int)autoTrack_, (int)inquirySlow_);
   return String(buf);
 }
