@@ -152,7 +152,7 @@ void BleScanTool::runScan(uint32_t durationMs) {
 
 void BleScanTool::trackPoll(uint32_t intervalMs, uint32_t scanMs) {
   if (!trackOn_ || busy_) return;
-  if (millis() < nextTrackMs_) return;
+  if (!millisReached(millis(), nextTrackMs_)) return;
   // trackPoll 本身有 interval；scanMs 过短会被抬到 2000，热点模式允许更短
   nextTrackMs_ = millis() + intervalMs;
   if (scanMs < 1000) scanMs = 1000;

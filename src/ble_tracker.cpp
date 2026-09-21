@@ -9,6 +9,9 @@
 #error "Classic Bluetooth not enabled"
 #endif
 
+// 自动 Inquiry 回调丢失时的强清超时（len≈2 → 约 2.6s；留足余量）
+static const uint32_t INQUIRY_STUCK_MS = 8000;
+
 static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;
 static bool gBtReady = false;
@@ -151,7 +154,8 @@ void BleTracker::setInquirySlow(bool slow) {
   inquirySlow_ = slow;
   if (slow) {
     // 让出射频给 SoftAP，但仍保留跟踪
-    if (nextInquiryMs_ < millis() + 8000) nextInquiryMs_ = millis() + 8000;
+    uint32_t want = millis() + 8000;
+    if (millisBefore(nextInquiryMs_, want)) nextInquiryMs_ = want;
   }
 }
 
@@ -159,6 +163,8 @@ void BleTracker::cancelActiveInquiry() {
   if (!gBtReady) return;
   if (inquiryBusy_ && !discRunning_) {
     esp_bt_gap_cancel_discovery();
+    // 回调可能不回：记起点，由 loop 超时强清
+    if (inquiryStartMs_ == 0) inquiryStartMs_ = millis();
   }
 }
 
@@ -182,6 +188,7 @@ void BleTracker::startDiscovery(uint32_t durationMs) {
   discRunning_ = true;
   discEndMs_ = millis() + durationMs;
   inquiryBusy_ = true;
+  inquiryStartMs_ = millis();
   // length 单位 1.28s，0x01–0x30；用 8 ≈ 10s
   uint8_t len = (uint8_t)constrain((durationMs + 1279) / 1280, 2, 48);
   esp_err_t err =
@@ -190,12 +197,13 @@ void BleTracker::startDiscovery(uint32_t durationMs) {
                 err == ESP_OK ? "OK" : esp_err_to_name(err));
   if (err != ESP_OK) {
     inquiryBusy_ = false;
+    inquiryStartMs_ = 0;
     discRunning_ = false;
   }
 }
 
 bool BleTracker::discoveryRunning() const {
-  return discRunning_ && millis() <= discEndMs_;
+  return discRunning_ && !millisReached(millis(), discEndMs_ + 1);
 }
 
 void BleTracker::onClassicDevice(const String& mac, int rssi, const String& name) {
@@ -204,7 +212,7 @@ void BleTracker::onClassicDevice(const String& mac, int rssi, const String& name
   Serial.printf("[BT] FOUND %s rssi=%d name=%s\n", m.c_str(), rssi,
                 name.length() ? name.c_str() : "(none)");
 
-  if (discRunning_ && millis() <= discEndMs_) {
+  if (discRunning_ && !millisReached(millis(), discEndMs_ + 1)) {
     bool found = false;
     for (auto& it : discList_) {
       if (it.mac == m) {
@@ -248,6 +256,7 @@ void BleTracker::onDeviceName(const String& mac, const String& name) {
 
 void BleTracker::onInquiryDone() {
   inquiryBusy_ = false;
+  inquiryStartMs_ = 0;
   Serial.printf("[BT] inquiry stopped, list=%u miss=%u rssi=%d\n",
                 (unsigned)discList_.size(), missCount_, lastRssi_);
   // 漏扫不清零：连续 3 轮未见才算不可见
@@ -260,8 +269,9 @@ void BleTracker::onInquiryDone() {
       updateZone();
     }
   }
-  if (discRunning_ && millis() <= discEndMs_ && !inquiryPaused_) {
+  if (discRunning_ && !millisReached(millis(), discEndMs_ + 1) && !inquiryPaused_) {
     inquiryBusy_ = true;
+    inquiryStartMs_ = millis();
     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 3, 0);
   }
 }
@@ -366,10 +376,23 @@ void BleTracker::updateZone() {
 }
 
 void BleTracker::loop() {
-  if (discRunning_ && millis() > discEndMs_) {
+  const uint32_t now = millis();
+
+  if (discRunning_ && millisReached(now, discEndMs_ + 1)) {
     discRunning_ = false;
     inquiryBusy_ = false;
+    inquiryStartMs_ = 0;
     Serial.printf("[BT] discovery done, %u devices\n", (unsigned)discList_.size());
+  }
+
+  // Inquiry 回调丢失兜底：busy 超时强清，否则经典跟踪永久卡死
+  if (inquiryBusy_ && !discRunning_ && inquiryStartMs_ != 0 &&
+      (now - inquiryStartMs_) >= INQUIRY_STUCK_MS) {
+    Serial.printf("[BT] inquiry stuck >%ums → cancel + clear busy\n",
+                  (unsigned)INQUIRY_STUCK_MS);
+    if (gBtReady) esp_bt_gap_cancel_discovery();
+    inquiryBusy_ = false;
+    inquiryStartMs_ = 0;
   }
 
   // 显式暂停时才停后台跟踪；SoftAP 慢速模式仍要扫（否则手机连热点时车走了永远不关）
@@ -377,16 +400,20 @@ void BleTracker::loop() {
       inquiryBusy_) {
     return;
   }
-  if (millis() >= nextInquiryMs_) {
+  if (millisReached(now, nextInquiryMs_)) {
     inquiryBusy_ = true;
+    inquiryStartMs_ = now;
     uint32_t gap = inquirySlow_ ? 15000 : 3000;
-    nextInquiryMs_ = millis() + gap;
+    nextInquiryMs_ = now + gap;
     uint8_t len = inquirySlow_ ? 1 : 2;  // 1≈1.28s，短一些少打网页
     esp_err_t err =
         esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, len, 0);
     Serial.printf("[BT] auto inquiry slow=%d ret=%d\n", (int)inquirySlow_,
                   (int)err);
-    if (err != ESP_OK) inquiryBusy_ = false;
+    if (err != ESP_OK) {
+      inquiryBusy_ = false;
+      inquiryStartMs_ = 0;
+    }
   }
 }
 

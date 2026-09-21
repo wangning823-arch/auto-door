@@ -24,6 +24,40 @@ BleScanTool gBleScan;
 static RfCapture gRf;
 static NfcReader gNfc;
 static char gMac[24] = CAR_BT_MAC;
+static bool gBtStackInited = false;
+
+// 经典 BT + BLE 配对栈：SoftAP 调试时推迟，优先让网页先出来
+static void initBtStacks() {
+  if (gBtStackInited) return;
+  gBtStackInited = true;
+  Serial.printf("[BT] init stacks t=%ums mac=%s\n", (unsigned)millis(), gMac);
+  if (!gBt.begin(gMac)) {
+    Serial.println("[BOOT] Classic BT init failed");
+  }
+  {
+    int tm = gWeb.trackMode();
+    bool classic = (tm == TRACK_MODE_CLASSIC);
+    bool autoOn = gCfg.loadAutoTrack(classic);
+    if (classic && gBt.hasTarget()) autoOn = true;
+    gBt.setAutoTrack(autoOn);
+    Serial.println("[BOOT] trackMode=" + String(classic ? "CLASSIC" : "BLE") +
+                   " autotrack=" + String(autoOn ? "ON" : "OFF"));
+  }
+  Serial.println("[BOOT] BLE bond/IRK init...");
+  gBleBond.begin();
+  if (gBleBond.hasIrk()) {
+    gBleScan.setTrack(true);
+    Serial.println("[BOOT] IRK track ON (paired phone)");
+  }
+}
+
+static void serviceBtStackInit() {
+  if (gBtStackInited) return;
+  // 热点打开期间一律不初始化 BT/BLE：
+  // Bluedroid 起栈会拖垮 SoftAP 的 DHCP/HTTP（SSID 能连、网页永远打不开）
+  if (gWeb.apActive()) return;
+  initBtStacks();
+}
 
 static bool rfSaveKeyCb(int idx, const char* csv) {
   return gCfg.saveRfKey(idx, csv);
@@ -96,7 +130,7 @@ static void rfAutoTxFire(const char* why) {
 
 static void rfAutoTxService() {
   if (!gRfAutoTx) return;
-  if (millis() < gRfAutoNextMs) return;
+  if (!millisReached(millis(), gRfAutoNextMs)) return;
   rfAutoTxFire("interval");
 }
 
@@ -154,9 +188,11 @@ static void handleSerial() {
       }
       line.trim();
       if (line == "status") {
-        Serial.printf("[CMD] %s | %s | mac=%s ap=%s | rfauto=%s\n",
+        Serial.printf("[CMD] %s | %s | mac=%s ap=%s ip=%s sta=%d bt=%d rfauto=%s\n",
                       gDoor.debugLine().c_str(), gBt.debugLine().c_str(), gMac,
-                      gWeb.apSsid().c_str(), gRfAutoTx ? "ON" : "OFF");
+                      gWeb.apSsid().c_str(), WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPgetStationNum(), (int)gBtStackInited,
+                      gRfAutoTx ? "ON" : "OFF");
       } else if (line == "open" || line == "close") {
         gDoor.requestManualToggle(OpenSource::NFC);
       } else if (line == "hold on") {
@@ -185,6 +221,8 @@ static void handleSerial() {
         gWeb.stopAp();
         gBt.setInquiryPaused(false);
         Serial.println("[CMD] WiFi OFF + saved (BT inquiry free)");
+        // 关热点后若尚未 init BT，立刻起栈，便于测自动门
+        if (!gBtStackInited) initBtStacks();
       } else if (line == "wifi on") {
         gCfg.saveWifiEnabled(true);
         if (gWeb.startAp()) {
@@ -193,6 +231,22 @@ static void handleSerial() {
         } else {
           Serial.println("[CMD] WiFi ON failed");
         }
+      } else if (line == "wifi restart") {
+        Serial.println("[CMD] WiFi restart SoftAP+HTTP...");
+        gWeb.stopAp();
+        delay(200);
+        bool ok2 = gWeb.startAp();
+        Serial.printf("[CMD] wifi restart -> %s ip=%s sta=%d\n",
+                      ok2 ? "OK" : "FAIL",
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPgetStationNum());
+      } else if (line == "wifi status") {
+        Serial.printf("[CMD] mode=%d ap=%s ip=%s sta=%d apmac=%s heap=%u bt=%d\n",
+                      (int)WiFi.getMode(), gWeb.apSsid().c_str(),
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPgetStationNum(),
+                      WiFi.softAPmacAddress().c_str(),
+                      (unsigned)ESP.getFreeHeap(), (int)gBtStackInited);
       } else if (line == "relay high" || line == "relay low" || line == "relay pulse") {
         int pin = gDoor.relayPin();
         if (line == "relay high") {
@@ -645,10 +699,18 @@ void setup() {
   Serial.println("[BOOT] car MAC from NVS: " + saved);
 
   bool wifiOn = gCfg.loadWifiEnabled(true);
-  Serial.println("[BOOT] wifiOn=" + String(wifiOn ? 1 : 0));
+#if WIFI_DEBUG_BOOT_ON
+  // 调试：上电一律开热点；网页关 WiFi 只影响本次，断电/复位后自动回来
+  if (!wifiOn) {
+    wifiOn = true;
+    Serial.println("[BOOT] WIFI_DEBUG_BOOT_ON=1 → 忽略 NVS wifi_on=0，强制开 SoftAP");
+  }
+#endif
+  Serial.println("[BOOT] wifiOn=" + String(wifiOn ? 1 : 0) +
+                 " debug_boot=" + String(WIFI_DEBUG_BOOT_ON ? 1 : 0));
 
-  // NFC：仅记录状态，不碰 Wire；量电压阶段后台绝不自动 init
-  Serial.println("[BOOT] NFC deferred (nfcinit only)");
+  // NFC：上电约 5s 后自动 init（原先永久 deferred，断电后刷卡会失效）
+  Serial.println("[BOOT] NFC auto-init scheduled (~5s)");
   gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL);
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
@@ -663,66 +725,74 @@ void setup() {
   Serial.println("[BOOT] web/WiFi first...");
   Serial.printf("[BOOT] before-web t=%ums SCL17=%d\n", (unsigned)millis(),
                 digitalRead(PIN_NFC_SCL));
-  gWeb.begin(&gCfg, &gBt, &gDoor, &gBleScan, wifiOn);
+  gWeb.begin(&gCfg, &gBt, &gDoor, &gBleScan, &gNfc, wifiOn);
   delay(300);
   Serial.printf("[BOOT] after-web t=%ums SCL17=%d\n", (unsigned)millis(),
                 digitalRead(PIN_NFC_SCL));
 
-  Serial.println("[BOOT] Classic BT second...");
-  if (!gBt.begin(gMac)) {
-    Serial.println("[BOOT] Classic BT init failed");
-  }
-  Serial.printf("[BOOT] after-bt t=%ums SCL17=%d\n", (unsigned)millis(),
-                digitalRead(PIN_NFC_SCL));
-
-  // 经典模式：必须开周期 Inquiry，否则离开时 RSSI 卡住、永不关门
-  {
-    int tm = gWeb.trackMode();
-    bool classic = (tm == TRACK_MODE_CLASSIC);
-    bool autoOn = gCfg.loadAutoTrack(classic);  // 默认：经典=开，BLE=关
-    if (classic && gBt.hasTarget()) autoOn = true;
-    gBt.setAutoTrack(autoOn);
-    Serial.println("[BOOT] trackMode=" + String(classic ? "CLASSIC" : "BLE") +
-                   " autotrack=" + String(autoOn ? "ON" : "OFF"));
+  // SoftAP 调试：网页优先。BT/BLE 推迟；NFC 自动 init 避开「有人连热点」时
+  // （不在此长期 postpone：无人连热点时 T+5s 仍可 init，保证之后 NFC+蓝牙能并存）
+  if (wifiOn) {
+    Serial.println("[BOOT] SoftAP on → BT/BLE 栈推迟到关热点后；NFC 空闲时自动 init");
+  } else {
+    initBtStacks();
   }
 
-  Serial.println("[BOOT] BLE bond/IRK init...");
-  gBleBond.begin();
-  if (gBleBond.hasIrk()) {
-    gBleScan.setTrack(true);
-    Serial.println("[BOOT] IRK track ON (paired phone)");
-  }
-
-  Serial.println("[BOOT] ready. wifi=" + String(wifiOn ? "ON" : "OFF") +
-                 " autotrack=" + String(gBt.autoTrack() ? "ON" : "OFF"));
+  Serial.println("[BOOT] ready. wifi=" + String(wifiOn ? 1 : 0) +
+                 " bt_inited=" + String(gBtStackInited ? 1 : 0));
   Serial.printf("[BOOT] ready t=%ums SDA16=%d SCL17=%d\n", (unsigned)millis(),
                 digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
   if (wifiOn) {
     Serial.println("[BOOT] 手机WiFi连接: " + gWeb.apSsid() + "  密码: " + AP_PASSWORD);
     Serial.println("[BOOT] 浏览器打开: http://192.168.4.1/");
-    Serial.println("[BOOT] 网页点「关闭 WiFi」后，无网模式 BT Inquiry 独占射频");
+    Serial.println("[BOOT] 注意：热点打开期间不初始化蓝牙栈（保证 DHCP/网页）");
+    Serial.println("[BOOT] 测自动门：网页关 WiFi 或串口 wifi off 后才会 init BT");
+#if WIFI_DEBUG_BOOT_ON
+    Serial.println("[BOOT] WiFi=调试模式：重新上电会自动再开热点");
+#endif
   } else {
     Serial.println("[BOOT] SoftAP off. 运行中长按 BOOT 3 秒（LED 闪两下）可强制开热点");
     Serial.println("[BOOT] 或串口发 wifi on");
   }
+
+  // WiFi 事件：关联/拿 IP 与网页打不开时对照
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    (void)info;
+    switch (event) {
+      case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+        Serial.printf("[WiFi] STA 已关联 clients=%d\n",
+                      WiFi.softAPgetStationNum());
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+        Serial.println("[WiFi] STA 已分配 IP（应能打开 192.168.4.1）");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+        Serial.printf("[WiFi] STA 断开 clients=%d\n",
+                      WiFi.softAPgetStationNum());
+        break;
+      default:
+        break;
+    }
+  });
   Serial.println("[BOOT] 蓝牙扫描用的是经典蓝牙 Inquiry（车机需开启「可被搜索」）");
 }
 
 void loop() {
-  // SCL 掉压监视：边沿必打，稳态每 2s 心跳，方便和万用表对时间
+  // SCL 掉压监视：边沿必打；热点调试期降低稳态心跳频率，少占串口/loop
   {
     static int lastSda = -1, lastScl = -1;
     static uint32_t lastBusLog = 0;
     int sda = digitalRead(PIN_NFC_SDA);
     int scl = digitalRead(PIN_NFC_SCL);
     uint32_t now = millis();
+    uint32_t busPeriod = gWeb.apActive() ? 5000 : 2000;
     if (sda != lastSda || scl != lastScl) {
       Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d%s\n", (unsigned)now, sda,
                     scl, (scl ? " (idle high)" : " (SCL LOW)"));
       lastSda = sda;
       lastScl = scl;
       lastBusLog = now;
-    } else if (now - lastBusLog >= 2000) {
+    } else if (now - lastBusLog >= busPeriod) {
       Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d\n", (unsigned)now, sda,
                     scl);
       lastBusLog = now;
@@ -734,22 +804,70 @@ void loop() {
   serviceBootLongPress();
   handleSerial();
   rfAutoTxService();
-  gBt.loop();
-  gBleBond.service();
+  // 先跑蓝牙调度，再跑 NFC：避免 I2C 抢在 Inquiry/BLE 之前占满 loop
+  serviceBtStackInit();
+  if (gBtStackInited) {
+    gBt.loop();
+    gBleBond.service();
+  }
 
-  // NFC 刷卡：授权卡 → 手动开关门
+  // ===== NFC 与 WiFi/蓝牙的共存策略 =====
+  // 射频层：NFC=13.56MHz，BT=2.4GHz，互不干扰。
+  // 软件层：PN532 poll/hwInit 会阻塞 loop，会拖慢网页和 Inquiry → 按场景调度。
+  //  · SoftAP 有客户端：暂停刷卡轮询，保证网页（可接受的二选一）
+  //  · 无网/热点无人：NFC + 蓝牙必须同时工作；NFC 降频，且不在 Inquiry 忙时做 hwInit
   {
-    String uid;
-    if (gNfc.poll(uid)) {
-      Serial.println("[NFC] card: " + uid);
-      if (gNfc.isAuthorized(uid)) {
-        Serial.println("[NFC] authorized -> toggle");
-        gDoor.requestManualToggle(OpenSource::NFC);
-      } else if (gNfc.authUid().length() == 0) {
-        // 未注册任何卡：打印 UID 方便用户注册
-        Serial.println("[NFC] 未注册卡，串口执行: nfcsave " + uid);
-      } else {
-        Serial.println("[NFC] 未授权卡");
+    const bool apOn = gWeb.apActive();
+    const bool apClient = apOn && WiFi.softAPgetStationNum() > 0;
+    const bool btTrack =
+        gBtStackInited && (gBt.autoTrack() || gBleScan.trackOn());
+    const bool btBusy = gBtStackInited && gBt.inquiryBusy();
+    const bool bleBusy = gBtStackInited && gBleScan.busy();
+
+    static bool nfcPausedForWeb = false;
+    if (apClient != nfcPausedForWeb) {
+      nfcPausedForWeb = apClient;
+      if (apClient) {
+        gNfc.setListen(false);
+        Serial.println("[NFC] 暂停轮询（热点有客户端，网页优先；断开后恢复）");
+      } else if (gNfc.ok()) {
+        gNfc.setListen(true);
+        Serial.println("[NFC] 恢复轮询");
+      }
+    }
+
+    // 跟踪中：加大 NFC 间隔并缩短单次 I2C 超时，给蓝牙留 loop
+    if (btTrack) {
+      gNfc.setPollGapMs(1200);
+    } else if (apOn) {
+      gNfc.setPollGapMs(500);
+    } else {
+      gNfc.setPollGapMs(350);
+    }
+
+    // 热点开着但无人连：允许刷卡；关热点后也允许
+    if (!apClient && gNfc.ok() && !gNfc.listen()) {
+      gNfc.setListen(true);
+    }
+
+    // NFC 未就绪时：仅在 BT Inquiry/BLE 不忙时才走 recover/hwInit
+    if (!gNfc.ok()) {
+      if (!apClient && !btBusy && !bleBusy) {
+        String uid0;
+        gNfc.poll(uid0);  // 内部 maybeRecover / 上电自动 init
+      }
+    } else {
+      String uid;
+      if (gNfc.poll(uid)) {
+        Serial.println("[NFC] card: " + uid);
+        if (gNfc.isAuthorized(uid)) {
+          Serial.println("[NFC] authorized -> toggle");
+          gDoor.requestManualToggle(OpenSource::NFC);
+        } else if (gNfc.authUid().length() == 0) {
+          Serial.println("[NFC] 未注册卡，串口执行: nfcsave " + uid);
+        } else {
+          Serial.println("[NFC] 未授权卡");
+        }
       }
     }
   }
@@ -764,9 +882,11 @@ void loop() {
     static BlePhase phase = BlePhase::WAIT_SIGNAL;
     static uint8_t leaveFarStreak = 0;
 
-    // 手机连 SoftAP 时：跳过阻塞式 BLE 扫描，优先保证网页能响应
+    // SoftAP 调试期 / 有客户端：阻塞式 BLE 扫描会让热点时有时无、网页半截
+    // 注意：关联完成前 softAPgetStationNum() 往往还是 0，必须以「热点是否打开」为准
     const bool wifiClient = WiFi.softAPgetStationNum() > 0;
-    if (gBleScan.trackOn() && !wifiClient) {
+    const bool apYield = gWeb.wifiRfPriority() || gWeb.rfQuietActive();
+    if (gBtStackInited && gBleScan.trackOn() && !wifiClient && !apYield) {
       // runScan() 是阻塞的：busy 边沿在同一轮 trackPoll 内完成，不能靠 busy 跨轮判断
       const uint32_t prevScanEnd = gBleScan.lastScanEndMs();
       gBleScan.trackPoll(BLE_TRACK_INTERVAL_MS, BLE_TRACK_SCAN_MS);
@@ -858,11 +978,14 @@ void loop() {
             break;
         }
       }
-    } else if (wifiClient) {
+    } else {
       static uint32_t lastWifiSkipLog = 0;
       if (millis() - lastWifiSkipLog > 15000) {
         lastWifiSkipLog = millis();
-        Serial.println("[BLE] track scan skipped (SoftAP client, keep web alive)");
+        if (wifiClient)
+          Serial.println("[BLE] track scan skipped (SoftAP client, keep web alive)");
+        else if (apYield)
+          Serial.println("[BLE] track scan skipped (SoftAP RF yield; 关热点后恢复自动门扫描)");
       }
     }
   } else {

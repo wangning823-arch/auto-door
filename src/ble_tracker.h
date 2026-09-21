@@ -43,6 +43,8 @@ class BleTracker {
 
   bool hasTarget() const { return targetSet_; }
   bool seenRecently(uint32_t withinMs) const;
+  // 经典 Inquiry / 用户扫描是否占用中（NFC 初始化要避开）
+  bool inquiryBusy() const { return inquiryBusy_ || discRunning_; }
   // 超过 20s 未再扫到 → 返回 -127，避免网页显示卡住的旧 RSSI
   int lastRssi() const;
   int lastRssiRaw() const { return lastRssi_; }
@@ -95,6 +97,7 @@ class BleTracker {
   // 周期性 inquiry 用于跟踪目标
   uint32_t nextInquiryMs_ = 0;
   bool inquiryBusy_ = false;
+  uint32_t inquiryStartMs_ = 0;  // busy 起点：回调丢失时超时强清
   volatile bool inquiryPaused_ = false;
   bool inquirySlow_ = false;
   bool autoTrack_ = false;

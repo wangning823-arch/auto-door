@@ -23,6 +23,9 @@ garage_door_firmware/
   - 详见 `docs/联调记录_20260919_RF学习与BLE自动门.md`
 - **冷却保护**：开门 5min / 关门 30s / 开后保持 60s
 - **315/433 固定码**：**key0 开 / key1 关每次上电强制为同一套已验证码**（多板一致）；key2/3 仍可 NVS 学习，但 `rflearn 0/1` 重启后会被默认开/关码覆盖
+- **NFC 上电自恢复**：约 5s 后自动 `nfcinit`；失败则约每 10 分钟慢速重试（最多约 20 次）；网页有「重新初始化 NFC」
+- **Inquiry 卡死兜底**：经典蓝牙 busy 超过约 8s 强制取消并清标志，避免跟踪永久停死
+- **millis 回绕安全**：调度截止时间统一用有符号差比较，降低约 50 天后停扫/停刷卡风险
 - 手动开关（网页/串口/NFC/米家 TRIG）
 - **不用门磁**：开/关为不同 RF 码，门态只按本机发码后的软件状态维护
 
@@ -54,6 +57,17 @@ cd D:\mimo\车库门自动化\garage_door_firmware
 4. BLE：扫描并点选设备特征
    经典蓝牙：保存车机 MAC
 5. 可选：关闭 WiFi（释放射频给蓝牙）
+
+### WiFi 调试开关（`config.h`）
+
+| 宏 | 行为 |
+|---|---|
+| `WIFI_DEBUG_BOOT_ON=1`（当前） | 网页可关 WiFi，但**重新上电会自动再开热点** |
+| `WIFI_DEBUG_BOOT_ON=0`（稳定后） | 尊重 NVS：关掉后需串口 `wifi on` / BOOT 长按 3s |
+| `WIFI_AP_YIELD_BT=1`（当前） | **热点打开期间蓝牙让射频**：启动静默 `WIFI_AP_BOOT_QUIET_MS`（默认 45s）停 Inquiry/BLE；之后热点仍开则 Inquiry 慢速、且不跑阻塞 BLE 扫描 |
+| `WIFI_AP_BOOT_QUIET_MS` | SoftAP 启动后的射频静默窗口（毫秒） |
+
+原因：ESP32 单射频；手机**关联完成前** `softAPgetStationNum()` 常为 0，旧逻辑只在「已有客户端」时降级蓝牙，导致热点「时有时无、连上打不开网页」。测自动门仍应关掉 SoftAP。
 
 ## 串口命令
 

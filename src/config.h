@@ -87,6 +87,29 @@
 #ifndef AP_MAX_CONN
 #define AP_MAX_CONN 4
 #endif
+// WiFi 调试模式：1=每次上电强制开 SoftAP（网页「关闭 WiFi」只影响本次运行，
+// 重新上电会再开，方便调试）；0=尊重 NVS，关掉后需运行中长按 BOOT 3s 或串口 wifi on
+// 完全稳定后改回 0 即可
+#ifndef WIFI_DEBUG_BOOT_ON
+#define WIFI_DEBUG_BOOT_ON 1
+#endif
+// SoftAP 打开期间蓝牙让射频：手机才能稳定关联并打开网页
+// （关联完成前 stationNum 仍可能为 0，不能只在「有客户端」时才降级）
+#ifndef WIFI_AP_YIELD_BT
+#define WIFI_AP_YIELD_BT 1
+#endif
+// SoftAP 启动后射频静默窗口：暂停经典 Inquiry / BLE 扫描，优先让热点+HTTP 稳定
+#ifndef WIFI_AP_BOOT_QUIET_MS
+#define WIFI_AP_BOOT_QUIET_MS 45000
+#endif
+// SoftAP 调试：经典BT/BLE 栈推迟初始化（网页优先）
+// 无客户端时至少等到 WIFI_AP_BT_START_MS；有客户端则继续等，最长 WIFI_AP_BT_START_MAX_MS
+#ifndef WIFI_AP_BT_START_MS
+#define WIFI_AP_BT_START_MS 12000
+#endif
+#ifndef WIFI_AP_BT_START_MAX_MS
+#define WIFI_AP_BT_START_MAX_MS 90000
+#endif
 
 // ===== 信号与安全参数 =====
 #define RSSI_SAMPLE_MS        1000
@@ -138,3 +161,15 @@
 
 // 串口调试
 #define SerialBaud 115200
+
+// ===== millis 回绕安全比较（uint32 约 49.7 天溢出）=====
+// 禁止写成 millis() >= deadline；统一用下面的有符号差比较
+static inline bool millisReached(uint32_t now, uint32_t deadline) {
+  return (int32_t)(now - deadline) >= 0;
+}
+static inline bool millisBefore(uint32_t now, uint32_t deadline) {
+  return (int32_t)(now - deadline) < 0;
+}
+static inline bool millisNotAfter(uint32_t now, uint32_t deadline) {
+  return (int32_t)(now - deadline) <= 0;
+}

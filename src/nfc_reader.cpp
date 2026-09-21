@@ -1,6 +1,7 @@
 #include "nfc_reader.h"
 #include "config.h"
 #include <Wire.h>
+#include <WiFi.h>
 #include <Adafruit_PN532.h>
 #include <driver/gpio.h>
 
@@ -29,6 +30,11 @@ static void forceIdlePullups(int sda, int scl) {
 #define NFC_RECOVER_GAP_MS 15000
 #define NFC_INIT_DELAY_MS 8000
 #define NFC_FAIL_BEFORE_RESYNC 3
+// 上电自动 init：给 WiFi/BT 起完再碰 I2C，避免和启动抢总线
+#define NFC_BOOT_INIT_DELAY_MS 5000
+// 失败后慢速自动重试（防止 15s 级 Error263 风暴锁死 SCL）
+#define NFC_AUTO_RETRY_GAP_MS (10UL * 60UL * 1000UL)
+#define NFC_AUTO_RETRY_MAX 20
 
 static void i2cBusRecover(int sda, int scl) {
   // 先推拉顶一下：PN532 从机拉住 SCL 时，仅开漏 9-clock 顶不开
@@ -334,35 +340,94 @@ bool NfcReader::begin(int sda, int scl) {
   sda_ = sda;
   scl_ = scl;
   ok_ = false;
-  deferred_ = true;
-  listen_ = false;
+  // 不再上电即永久 deferred：排程一次自动 init，断电重启后刷卡可自恢复
+  deferred_ = false;
+  bootInitDone_ = false;
+  bootInitAt_ = millis() + NFC_BOOT_INIT_DELAY_MS;
+  lastAutoRetryMs_ = 0;
+  autoRetryCount_ = 0;
+  listen_ = false;  // hwInit 成功后自动 listen
   nextPollMs_ = millis() + 200;
   lastRecoverMs_ = millis() - NFC_RECOVER_GAP_MS;
   forceIdlePullups(sda_, scl_);
-  Serial.println("[NFC] setup 跳过硬件初始化（仅 nfcinit），t=" +
-                 String((unsigned)millis()) + "ms");
+  Serial.printf("[NFC] setup：硬件初始化已排程，约 %ums 后自动 nfcinit\n",
+                (unsigned)NFC_BOOT_INIT_DELAY_MS);
   return false;
+}
+
+void NfcReader::postponeBootInit(uint32_t delayMs) {
+  if (ok_ || bootInitDone_) return;
+  uint32_t at = millis() + delayMs;
+  if ((int32_t)(at - bootInitAt_) > 0) bootInitAt_ = at;
 }
 
 void NfcReader::maybeRecover() {
   uint32_t now = millis();
   if (ok_) return;
-  // 失败后只许手动 nfcinit，避免 Error263 风暴把 SCL 再锁死
-  if (deferred_) return;
-  if (now - lastRecoverMs_ < NFC_RECOVER_GAP_MS) {
+
+  // 1) 上电自动 init（一次性；成功即恢复刷卡）
+  if (!bootInitDone_) {
+    // 手机正连热点看网页时：推迟 I2C 初始化，避免 pageHtml/HTTP 被阻塞
+    if (WiFi.softAPgetStationNum() > 0) {
+      bootInitAt_ = now + 2000;
+      return;
+    }
+    if (!millisReached(now, bootInitAt_)) return;
+    bootInitDone_ = true;
+    Serial.printf("[NFC] 上电自动 init t=%ums SCL=%d\n", (unsigned)now,
+                  digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL));
+    if (hwInit()) {
+      Serial.println("[NFC] 上电自动 init OK");
+      return;
+    }
+    // hwInit 失败路径已 deferred_=true
+    lastAutoRetryMs_ = now;
+    autoRetryCount_ = 1;
+    Serial.println("[NFC] 上电自动 init 失败 → 进入慢速自动重试");
+    return;
+  }
+
+  // 2) deferred：慢速有限次重试，避免 Error263 风暴；超限后仅串口/网页 forceInit
+  if (deferred_) {
+    if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX) return;
+    if (!millisReached(now, lastAutoRetryMs_ + NFC_AUTO_RETRY_GAP_MS)) return;
+    lastAutoRetryMs_ = now;
+    autoRetryCount_++;
+    Serial.printf("[NFC] 自动重试 %u/%u t=%ums fail=%u\n", autoRetryCount_,
+                  (unsigned)NFC_AUTO_RETRY_MAX, (unsigned)now, failStreak_);
+    if (hwInit()) {
+      autoRetryCount_ = 0;
+      Serial.println("[NFC] 自动重试成功");
+    }
+    // 失败时 hwInit 保持 deferred_=true
+    return;
+  }
+
+  // 3) 非 deferred 且未 ok：运行中总线恢复节流
+  if (!millisReached(now, lastRecoverMs_ + NFC_RECOVER_GAP_MS)) {
     return;
   }
   lastRecoverMs_ = now;
   Serial.printf("[NFC] recover try fail=%u\n", failStreak_);
-  if (!hwInit()) deferred_ = true;
+  if (!hwInit()) {
+    deferred_ = true;
+    lastAutoRetryMs_ = now;
+  }
 }
 
 bool NfcReader::forceInit() {
   lastRecoverMs_ = millis();
+  bootInitDone_ = true;  // 手动初始化后不必再等上电排程
   Serial.printf("[NFC] forceInit t=%ums\n", (unsigned)millis());
   bool ok = hwInit();
-  // 失败不许后台自动再撞（上次 nfcinit 后 Error263 风暴把 SCL 锁 0.04）
-  deferred_ = !ok;
+  if (ok) {
+    deferred_ = false;
+    autoRetryCount_ = 0;
+  } else {
+    deferred_ = true;
+    lastAutoRetryMs_ = millis();
+    if (autoRetryCount_ < NFC_AUTO_RETRY_MAX) autoRetryCount_ = autoRetryCount_ ? autoRetryCount_ : 1;
+  }
   return ok;
 }
 
@@ -396,7 +461,7 @@ bool NfcReader::poll(String& uid) {
   uint32_t now = millis();
 
   if (!ok_) {
-    if (now >= nextPollMs_) {
+    if (millisReached(now, nextPollMs_)) {
       maybeRecover();
       nextPollMs_ = now + 400;
     }
@@ -404,19 +469,22 @@ bool NfcReader::poll(String& uid) {
   }
 
   if (!listen_) return false;
-  if (listenUntilMs_ && now >= listenUntilMs_) {
+  if (listenUntilMs_ && millisReached(now, listenUntilMs_)) {
     listen_ = false;
     Serial.println("[NFC] listen window end");
   }
-  if (now < nextPollMs_) return false;
+  if (!millisReached(now, nextPollMs_)) return false;
 
   // 不在 listen 里刷 RF：开场后场应保持；再发 RFConfiguration 会和 InList 抢 ACK
 
   uint8_t buf[16];
   uint8_t len = 0;
   uint32_t tPoll = millis();
-  uint8_t ret = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, buf, &len, 250);
-  nextPollMs_ = millis() + 300;
+  // 蓝牙跟踪期把超时压短：无卡时尽快让出 loop 给 Inquiry/BLE
+  uint16_t to = (pollGapMs_ >= 800) ? 80 : 250;
+  uint8_t ret = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, buf, &len, to);
+  uint32_t gap = pollGapMs_ ? pollGapMs_ : 350;
+  nextPollMs_ = millis() + gap;
   uint32_t cost = millis() - tPoll;
 
   // 轮询超时/无卡都可能时钟拉伸；总线低必须先松手再收
@@ -470,7 +538,8 @@ bool NfcReader::isAuthorized(const String& uid) const {
 }
 
 String NfcReader::debugLine() const {
-  return "nfc=" + String(ok_ ? "ok" : "fail") +
-         " fail=" + String(failStreak_) +
+  const char* st = ok_ ? "ok" : (deferred_ ? "defer" : "wait");
+  return "nfc=" + String(st) + " fail=" + String(failStreak_) +
+         " retry=" + String(autoRetryCount_) +
          " auth=" + (authUid_.length() ? authUid_ : String("-"));
 }

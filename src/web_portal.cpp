@@ -182,15 +182,33 @@ String WebPortal::pageHtml() const {
             "<div class=\"tip\">BLE 模式只用已配对手机的 IRK+RSSI 判断进出，"
             "不再按名称/MAC 特征过滤。名称扫描已移除；经典车机仍用上方 MAC 扫描。</div></div>");
 
+  html += F("<div class=\"card\">"
+            "<div class=\"row\"><span class=\"k\">NFC</span><span class=\"v\">");
+  if (nfc_) {
+    if (nfc_->ok())
+      html += F("ok</span></div>");
+    else if (nfc_->deferred())
+      html += F("defer · 可网页强制初始化</span></div>");
+    else
+      html += F("wait · 自动初始化中</span></div>");
+  } else {
+    html += F("-</span></div>");
+  }
+  html += F("<form method=\"GET\" action=\"/nfcinit\">"
+            "<button type=\"submit\" class=\"sec\">重新初始化 NFC</button></form>"
+            "<div class=\"tip\">上电约 5 秒后会自动初始化；失败则约每 10 分钟慢速重试。"
+            "刷卡无效时可在此强制 nfcinit。</div></div>");
+
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
             "<span class=\"v\">WiFi 与蓝牙共用 2.4G</span></div>"
             "<form method=\"GET\" action=\"/wifi/off\">"
             "<button type=\"submit\" style=\"background:#c0392b\">关闭 WiFi（释放给蓝牙）</button>"
             "</form>"
-            "<div class=\"tip\">设置完成后点这里：热点断开，后台 Inquiry 不再被压制。"
-            "下次要改配置：串口发 <code>wifi on</code>，"
-            "或<strong>在程序运行时</strong>长按 BOOT 约 3 秒"
-            "（LED 闪两下表示已开热点；不要在上电时按 BOOT，会进下载模式）。</div></div>");
+            "<div class=\"tip\"><strong>热点打开期间蓝牙会让射频</strong>："
+            "启动约 45 秒 Inquiry/BLE 全停（方便手机关联），之后热点仍开则 Inquiry 保持慢速，"
+            "且<strong>不跑阻塞式 BLE 扫描</strong>——网页才能稳定打开。"
+            "测车来车走自动门时请点关闭 WiFi（或网页已关后断电重开前先把 WIFI_DEBUG_BOOT_ON 设 0）。"
+            "本次关掉后：串口 <code>wifi on</code> 或运行中长按 BOOT 3 秒可立即恢复热点。</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">自动开</span>"
             "<span class=\"v ok\">仅蓝牙渐近</span></div>"
@@ -237,12 +255,50 @@ String WebPortal::pageHtml() const {
 }
 
 void WebPortal::setupRoutes() {
+  // 手机连上「无互联网」热点后会探测这些 URL；不答 204 会被系统判为无法上网，
+  // 用户即使已关联也可能打不开本地页。全部指回配置页。
+  auto sendCaptive = []() {
+    if (!gPortal) {
+      server.send(200, "text/html", "garage-door");
+      return;
+    }
+    String html =
+        F("<!DOCTYPE html><html><head><meta charset=utf-8>"
+          "<meta http-equiv=refresh content=\"0;url=http://192.168.4.1/\">"
+          "<title>GarageDoor</title></head><body>"
+          "<p>正在打开车库门配置页… <a href=http://192.168.4.1/>192.168.4.1</a></p>"
+          "</body></html>");
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/html", html);
+  };
+
+  server.on("/generate_204", HTTP_GET, sendCaptive);
+  server.on("/gen_204", HTTP_GET, sendCaptive);
+  server.on("/hotspot-detect.html", HTTP_GET, sendCaptive);
+  server.on("/library/test/success.html", HTTP_GET, sendCaptive);
+  server.on("/ncsi.txt", HTTP_GET, sendCaptive);
+  server.on("/connecttest.txt", HTTP_GET, sendCaptive);
+  server.on("/success.txt", HTTP_GET, sendCaptive);
+  server.on("/canonical.html", HTTP_GET, sendCaptive);
+  server.on("/ping", HTTP_GET, []() {
+    Serial.printf("[WEB] GET /ping from %s\n",
+                  server.client().remoteIP().toString().c_str());
+    server.send(200, "text/plain", "pong " + String((unsigned)millis()));
+  });
+
   server.on("/", HTTP_GET, []() {
     if (!gPortal) {
       server.send(500, "text/plain", "no portal");
       return;
     }
-    server.send(200, "text/html; charset=utf-8", gPortal->pageHtml());
+    uint32_t t0 = millis();
+    Serial.printf("[WEB] GET / from %s\n",
+                  server.client().remoteIP().toString().c_str());
+    String html = gPortal->pageHtml();
+    server.send(200, "text/html; charset=utf-8", html);
+    Serial.printf("[WEB] GET / bytes=%u gen=%ums clients=%d\n",
+                  (unsigned)html.length(), (unsigned)(millis() - t0),
+                  WiFi.softAPgetStationNum());
   });
 
   server.on("/save", HTTP_GET, []() {
@@ -386,6 +442,26 @@ void WebPortal::setupRoutes() {
                      "#f2c94c"));
   });
 
+  server.on("/nfcinit", HTTP_GET, []() {
+    if (!gPortal || !gPortal->nfc_) {
+      server.send(500, "text/html; charset=utf-8",
+                  F("<meta charset=utf-8><p>NFC 模块未接入</p><p><a href=/>返回</a></p>"));
+      return;
+    }
+    Serial.println("[WEB] /nfcinit forceInit...");
+    bool ok = gPortal->nfc_->forceInit();
+    String body =
+        F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
+          "content='width=device-width,initial-scale=1'>"
+          "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
+          "padding:24px;text-align:center'><h2>NFC 初始化");
+    body += ok ? F("成功</h2><p style='color:#3dd68c'>读头已就绪，可刷卡测试</p>")
+               : F("失败</h2><p style='color:#e74c3c'>检查 I2C 接线/供电；"
+                   "串口可看 SCL 电平。可稍后再试。</p>");
+    body += F("<p><a style='color:#2f80ed' href='/'>返回设置</a></p></body>");
+    server.send(200, "text/html; charset=utf-8", body);
+  });
+
   server.on("/status", HTTP_GET, []() {
     String j = "{";
     if (gPortal && gPortal->door_) {
@@ -412,10 +488,10 @@ void WebPortal::setupRoutes() {
           "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
           "padding:24px;text-align:center'>"
           "<h2>正在关闭 WiFi…</h2>"
-          "<p style='color:#3dd68c'>已写入配置：下次开机默认无网，蓝牙 Inquiry 独占射频。</p>"
-          "<p style='color:#8b9aab'>约 2 秒后本页面断开。</p>"
-          "<p>重新打开方式：USB 串口 <code>wifi on</code>，"
-          "或长按 BOOT 约 3 秒后上电。</p></body>");
+          "<p style='color:#3dd68c'>本次运行热点将关闭，蓝牙 Inquiry 独占射频。</p>"
+          "<p style='color:#f2c94c'>调试模式：重新上电会自动再开热点。"
+          "若要本次立即恢复：串口 <code>wifi on</code>，或运行中长按 BOOT 约 3 秒。</p>"
+          "<p style='color:#8b9aab'>约 2 秒后本页面断开。</p></body>");
     server.send(200, "text/html; charset=utf-8", body);
     delay(400);
     if (gPortal) gPortal->stopAp();
@@ -469,16 +545,24 @@ void WebPortal::setupRoutes() {
     server.send(200, "application/json", j);
   });
 
-  server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
+  server.onNotFound([]() {
+    String uri = server.uri();
+    Serial.printf("[WEB] 404 %s from %s\n", uri.c_str(),
+                  server.client().remoteIP().toString().c_str());
+    // 任意域名（手机连 AP 后乱跳）都导到配置页
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "redirect http://192.168.4.1/");
+  });
 }
 
 void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
-                      BleScanTool* ble, bool enableAp) {
+                      BleScanTool* ble, NfcReader* nfc, bool enableAp) {
   gPortal = this;
   store_ = store;
   bt_ = bt;
   door_ = door;
   ble_ = ble;
+  nfc_ = nfc;
 
   // 加载跟踪模式
   if (store_) {
@@ -512,54 +596,143 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
 
 bool WebPortal::startAp() {
   WiFi.persistent(false);
-  WiFi.mode(WIFI_OFF);
-  delay(50);
+  // 不要先 WIFI_OFF：部分模组 OFF→AP 后 Beacon 异常（SSID 时有时无/扫不到）
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
-  delay(200);
-  bool ok = WiFi.softAP(apSsid_.c_str(), AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_CONN);
-  delay(100);
-  apActive_ = ok;
-  if (ok && !serverStarted_) {
-    server.begin();
-    server.enableDelay(false);
-    serverStarted_ = true;
-    Serial.println("[WEB] HTTP routes ready");
+  delay(300);
+
+  IPAddress ip(192, 168, 4, 1), gw(192, 168, 4, 1), sn(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(ip, gw, sn)) {
+    Serial.println("[WEB] softAPConfig FAIL");
   }
-  if (bt_) bt_->setInquiryPaused(false);
-  Serial.printf("[WEB] SoftAP %s pass=%s -> %s ip=%s\n", apSsid_.c_str(),
-                AP_PASSWORD, ok ? "OK" : "FAIL",
-                WiFi.softAPIP().toString().c_str());
-  return ok;
+  // 固定 2.4G 信道 6（避开部分拥挤的 1），ssid_hidden=0, max_conn=4
+  bool ok = WiFi.softAP(apSsid_.c_str(), AP_PASSWORD, 6, 0, 4);
+  delay(500);
+  IPAddress got = WiFi.softAPIP();
+  if (ok && got == IPAddress(0, 0, 0, 0)) {
+    Serial.println("[WEB] softAPIP=0 → 重配 + 重试 softAP");
+    WiFi.softAPConfig(ip, gw, sn);
+    ok = WiFi.softAP(apSsid_.c_str(), AP_PASSWORD, 6, 0, 4);
+    delay(500);
+    got = WiFi.softAPIP();
+  }
+  apActive_ = ok && (got != IPAddress(0, 0, 0, 0));
+  if (apActive_) {
+    server.begin();
+    server.enableDelay(true);
+    serverStarted_ = true;
+    // 强制门户 DNS：* → 192.168.4.1，手机系统探测/连网检测才会落到本机 HTTP
+    dns_.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsOn_ = dns_.start(53, "*", ip);
+    Serial.printf("[WEB] HTTP :80 listening, AP IP=%s dns53=%d\n",
+                  got.toString().c_str(), (int)dnsOn_);
+  } else {
+    Serial.printf("[WEB] SoftAP bring-up FAIL ok=%d ip=%s\n", (int)ok,
+                  got.toString().c_str());
+  }
+#if WIFI_AP_YIELD_BT
+  if (apActive_ && bt_) {
+    apQuietUntilMs_ = millis() + WIFI_AP_BOOT_QUIET_MS;
+    bt_->setInquiryPaused(true);
+    bt_->setInquirySlow(true);
+    bt_->cancelActiveInquiry();
+  }
+#endif
+  Serial.printf("[WEB] SoftAP %s pass=%s -> %s ip=%s mode=%d sta=%d apmac=%s\n",
+                apSsid_.c_str(), AP_PASSWORD, apActive_ ? "OK" : "FAIL",
+                WiFi.softAPIP().toString().c_str(), (int)WiFi.getMode(),
+                WiFi.softAPgetStationNum(), WiFi.softAPmacAddress().c_str());
+  Serial.println("[WEB] 手机请连接 2.4G 热点: " + apSsid_ + " / " + AP_PASSWORD +
+                 "  然后浏览器打开 http://192.168.4.1/");
+  return apActive_;
 }
 
 void WebPortal::stopAp() {
+  if (dnsOn_) {
+    dns_.stop();
+    dnsOn_ = false;
+  }
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   apActive_ = false;
-  if (bt_) bt_->setInquiryPaused(false);
+  apQuietUntilMs_ = 0;
+  if (bt_) {
+    bt_->setInquiryPaused(false);
+    bt_->setInquirySlow(false);  // 关热点后恢复完整扫描，测自动门
+  }
+}
+
+bool WebPortal::rfQuietActive() const {
+  return apActive_ && apQuietUntilMs_ != 0 &&
+         !millisReached(millis(), apQuietUntilMs_);
 }
 
 void WebPortal::loop() {
   if (!apActive_) return;
 
+  if (dnsOn_) dns_.processNextRequest();
+  server.handleClient();
+  server.handleClient();
+  yield();
   server.handleClient();
 
-  // 配对/扫描后 SoftAP 可能被顶掉：不关 WiFi，只补一次 softAP
+  static uint32_t lastDiag = 0;
+  if (millis() - lastDiag >= 3000) {
+    lastDiag = millis();
+    Serial.printf("[WEB] ap=%s ip=%s stations=%d heap=%u bt_delayed=%d\n",
+                  apSsid_.c_str(), WiFi.softAPIP().toString().c_str(),
+                  WiFi.softAPgetStationNum(), (unsigned)ESP.getFreeHeap(),
+                  gBleBond.hasIrk() ? 1 : 0);
+  }
+
+  // AP IP 丢失或为 0：整段重启 SoftAP + HTTP（只补 softAP 不够）
   static uint32_t lastReassert = 0;
   if (millis() - lastReassert >= 5000) {
     lastReassert = millis();
     IPAddress ip = WiFi.softAPIP();
     if (ip == IPAddress(0, 0, 0, 0)) {
-      Serial.println("[WEB] SoftAP IP=0.0.0.0，尝试重新 softAP");
+      Serial.println("[WEB] SoftAP IP=0 → 重启 AP+HTTP");
+      WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_AP);
-      WiFi.softAP(apSsid_.c_str(), AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_CONN);
+      WiFi.setSleep(false);
+      delay(50);
+      IPAddress a(192, 168, 4, 1), g(192, 168, 4, 1), s(255, 255, 255, 0);
+      WiFi.softAPConfig(a, g, s);
+      WiFi.softAP(apSsid_.c_str(), AP_PASSWORD);
+      delay(200);
+      server.begin();
       Serial.printf("[WEB] softAP retry -> %s\n",
                     WiFi.softAPIP().toString().c_str());
     }
   }
 
-  // 有客户端连热点：经典 Inquiry 改慢速（不完全停），并立刻 cancel 当前 inquiry
+#if WIFI_AP_YIELD_BT
+  if (bt_) {
+    if (rfQuietActive()) {
+      // 关联关键期：Inquiry 全停，避免 Beacon/关联帧被挤掉
+      bt_->setInquiryPaused(true);
+      bt_->setInquirySlow(true);
+      bt_->cancelActiveInquiry();
+    } else {
+      if (apQuietUntilMs_ != 0) {
+        apQuietUntilMs_ = 0;
+        bt_->setInquiryPaused(false);
+        Serial.println("[WEB] RF 静默窗口结束；热点仍开 → Inquiry 保持慢速");
+      }
+      // 只要热点开着就慢速：关联完成前 stationNum 常为 0，不能恢复全速
+      bt_->setInquirySlow(true);
+    }
+
+    int clients = WiFi.softAPgetStationNum();
+    static int lastC = -1;
+    if (clients != lastC) {
+      lastC = clients;
+      Serial.printf("[WEB] softAP clients=%d quiet=%d\n", clients,
+                    (int)rfQuietActive());
+      if (clients > 0) bt_->cancelActiveInquiry();
+    }
+  }
+#else
   if (bt_) {
     int clients = WiFi.softAPgetStationNum();
     static int lastC = -1;
@@ -574,6 +747,7 @@ void WebPortal::loop() {
       }
     }
   }
+#endif
 }
 
 void WebPortal::setTrackMode(int mode) {
