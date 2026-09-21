@@ -132,6 +132,9 @@
 #define BLE_MISS_FOR_LOST     2       // 连续 N 次未匹配算「丢」（原 3）
 #define BLE_TRACK_INTERVAL_MS 4000    // 跟踪扫描间隔（原 6000，反应更快）
 #define BLE_TRACK_SCAN_MS     1500    // 单次扫描时长
+// 离场关门：进入「强→弱/离开」后，最长等这么久就关（观察期可再调）
+// 另：无→有立刻开门；误开问题后续再收紧
+#define LEAVING_CLOSE_MS      10000
 
 // ===== 经典蓝牙（与 BLE 共用开/关状态机阈值）=====
 // 开/关逻辑与 BLE 相同：无→有开；首见≥RSSI_SUDDEN_STRONG 不开；强→弱→无关
@@ -158,6 +161,9 @@
 #define AUTO_MIN_OPEN_HOLD_MS 20000   // 20 秒（原 60s，离场关门偏晚）
 // 上电宽限：此时间内禁止自动关（防第二块板启动即连发 close）
 #define AUTO_BOOT_GRACE_MS 15000
+// 手动 NFC/串口/网页 开关后，只短时屏蔽自动「开」（防手动关完立刻被无→有顶开）
+// 离场自动关不受此限制；真车场景：刷卡开完 10 秒就可能开走
+#define MANUAL_SUPPRESS_MS 5000
 
 // 串口调试
 #define SerialBaud 115200

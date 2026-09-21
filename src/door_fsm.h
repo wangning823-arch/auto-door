@@ -28,7 +28,7 @@ class DoorFsm {
 
   void setRfEmit(RfEmitFn fn) { rfEmit_ = fn; }
 
-  // 外部触发：NFC / TRIG(米家) / 串口
+  // 外部触发：NFC / TRIG(米家) / 串口 — 每次都立刻发 RF，不受自动门冷却影响
   void requestManualToggle(OpenSource src);
   void requestManualOpen(OpenSource src);
   void requestManualClose(OpenSource src);
@@ -60,6 +60,12 @@ class DoorFsm {
   DoorState doorState_ = DoorState::UNKNOWN;
   OpenSource openSource_ = OpenSource::NONE;
   DoorAction pending_ = DoorAction::NONE;
+
+  // 手动指令以「上次发出的开/关码」翻转，避免 doorState 误判导致连发开码
+  enum class LastCmd : uint8_t { NONE = 0, OPEN, CLOSE };
+  LastCmd lastCmd_ = LastCmd::NONE;
+  // 仅屏蔽自动「开」：手动关后不被无→有顶开；手动开后仍允许离场自动关
+  uint32_t suppressAutoOpenUntil_ = 0;
 
   uint32_t doorOpenTs_ = 0;
   uint32_t lastAutoOpenTs_ = 0;

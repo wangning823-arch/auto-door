@@ -25,7 +25,7 @@ static void forceIdlePullups(int sda, int scl) {
     gpio_set_pull_mode((gpio_num_t)scl, GPIO_PULLUP_ONLY);
 }
 
-#define NFC_COOLDOWN_MS 1500
+#define NFC_COOLDOWN_MS 250   // 同一张卡防连读；刷开后再刷关无需长等待
 #define NFC_POLL_MIN_MS 350
 #define NFC_RECOVER_GAP_MS 15000
 #define NFC_INIT_DELAY_MS 8000
