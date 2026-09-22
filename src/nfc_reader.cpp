@@ -347,6 +347,7 @@ bool NfcReader::begin(int sda, int scl) {
   lastAutoRetryMs_ = 0;
   autoRetryCount_ = 0;
   listen_ = false;  // hwInit 成功后自动 listen
+  bootPostpones_ = 0;
   nextPollMs_ = millis() + 200;
   lastRecoverMs_ = millis() - NFC_RECOVER_GAP_MS;
   forceIdlePullups(sda_, scl_);
@@ -361,15 +362,32 @@ void NfcReader::postponeBootInit(uint32_t delayMs) {
   if ((int32_t)(at - bootInitAt_) > 0) bootInitAt_ = at;
 }
 
+// 关热点后立刻重试：否则上次 hwInit 失败会卡在 10 分钟自动重试里
+void NfcReader::kickRecover() {
+  if (ok_) return;
+  bootInitAt_ = millis();
+  lastAutoRetryMs_ = millis() - NFC_AUTO_RETRY_GAP_MS;
+  lastRecoverMs_ = millis() - NFC_RECOVER_GAP_MS;
+  nextPollMs_ = millis();
+  // 未成功过：强制重走上电 init 路径
+  if (!bootInitDone_) {
+    deferred_ = false;
+  }
+  Serial.printf("[NFC] kickRecover defer=%d bootDone=%d\n", (int)deferred_,
+                (int)bootInitDone_);
+}
+
 void NfcReader::maybeRecover() {
   uint32_t now = millis();
   if (ok_) return;
 
   // 1) 上电自动 init（一次性；成功即恢复刷卡）
   if (!bootInitDone_) {
-    // 手机正连热点看网页时：推迟 I2C 初始化，避免 pageHtml/HTTP 被阻塞
-    if (WiFi.softAPgetStationNum() > 0) {
-      bootInitAt_ = now + 2000;
+    // 热点有人：最多推迟 3 次×1.5s（给 HTTP 稳一下），之后必须 init
+    // 否则「连热点配 Wi‑Fi」会把上电 init 无限延后 → NFC 永远起不来
+    if (WiFi.softAPgetStationNum() > 0 && bootPostpones_ < 3) {
+      bootPostpones_++;
+      bootInitAt_ = now + 1500;
       return;
     }
     if (!millisReached(now, bootInitAt_)) return;
@@ -388,13 +406,16 @@ void NfcReader::maybeRecover() {
   }
 
   // 2) deferred：慢速有限次重试，避免 Error263 风暴；超限后仅串口/网页 forceInit
+  //    OTA/STA 开着时上电首次 init 更容易被 WiFi 时序带失败 → 前几次改 30s 快重试
   if (deferred_) {
     if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX) return;
-    if (!millisReached(now, lastAutoRetryMs_ + NFC_AUTO_RETRY_GAP_MS)) return;
+    uint32_t gap = (autoRetryCount_ <= 3) ? 30000UL : NFC_AUTO_RETRY_GAP_MS;
+    if (!millisReached(now, lastAutoRetryMs_ + gap)) return;
     lastAutoRetryMs_ = now;
     autoRetryCount_++;
-    Serial.printf("[NFC] 自动重试 %u/%u t=%ums fail=%u\n", autoRetryCount_,
-                  (unsigned)NFC_AUTO_RETRY_MAX, (unsigned)now, failStreak_);
+    Serial.printf("[NFC] 自动重试 %u/%u gap=%ums t=%ums fail=%u\n",
+                  autoRetryCount_, (unsigned)NFC_AUTO_RETRY_MAX, (unsigned)gap,
+                  (unsigned)now, failStreak_);
     if (hwInit()) {
       autoRetryCount_ = 0;
       Serial.println("[NFC] 自动重试成功");

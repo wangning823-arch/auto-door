@@ -2,6 +2,7 @@
 #include "config.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include "ble_bond.h"
 
 static WebServer server(80);
@@ -23,6 +24,19 @@ static bool validMac(const String& m) {
 }
 
 IPAddress WebPortal::apIp() const { return WiFi.softAPIP(); }
+
+bool WebPortal::staConfigured() const {
+  return staWanted_;
+}
+
+bool WebPortal::staConnected() const {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+String WebPortal::staIp() const {
+  if (!staConnected()) return String("-");
+  return WiFi.localIP().toString();
+}
 
 String WebPortal::pageHtml() const {
   String mac = store_ ? store_->loadMac(CAR_BT_MAC) : String(CAR_BT_MAC);
@@ -79,12 +93,26 @@ String WebPortal::pageHtml() const {
             ".ok{color:#3dd68c;}.warn{color:#f2c94c;}"
             ".tip{font-size:.75rem;color:#6b7c8f;margin-top:8px;line-height:1.4;}"
             "</style></head><body><div class=\"wrap\">");
-  html += F("<h1>车库门智能控制器</h1><div class=\"sub\">P0 · 无网可用 · 渐变蓝牙判定</div>");
+  html += F("<h1>车库门智能控制器</h1><div class=\"sub\">P0 · 无网可用 · 渐变蓝牙判定 · v"
+            FW_VERSION "</div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">热点</span><span class=\"v\">");
   html += apSsid_;
   html += F("</span></div><div class=\"row\"><span class=\"k\">IP</span><span class=\"v\">");
   html += WiFi.softAPIP().toString();
+  html += F("</span></div><div class=\"row\"><span class=\"k\">家庭Wi‑Fi</span><span class=\"v ");
+  if (staConnected())
+    html += F("ok\">");
+  else if (staWanted_)
+    html += F("warn\">");
+  else
+    html += F("\">");
+  if (!staWanted_)
+    html += F("未配置（OTA 需要）");
+  else if (staConnected())
+    html += staIp() + F(" · OTA: ") + host_ + F(".local");
+  else
+    html += F("连接中/失败");
   html += F("</span></div><div class=\"row\"><span class=\"k\">门状态</span><span class=\"v\">");
   html += door;
   html += F("</span></div><div class=\"row\"><span class=\"k\">车机RSSI</span><span class=\"v\">");
@@ -92,6 +120,27 @@ String WebPortal::pageHtml() const {
   html += F("</span></div><div class=\"row\"><span class=\"k\">信号趋势</span><span class=\"v\">");
   html += trend;
   html += F("</span></div></div>");
+
+  // 家庭 Wi‑Fi（STA）：保存后可从书桌 espota 烧录，不必再拔 USB
+  {
+    String staSsid = store_ ? store_->loadStaSsid() : String();
+    html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">家庭 Wi‑Fi（无线烧录）</span><span class=\"v\">");
+    html += staSsid.length() ? staSsid : String("未设置");
+    html += F("</span></div>"
+              "<form method=\"GET\" action=\"/wifista\">"
+              "<label>SSID</label>"
+              "<input type=\"text\" name=\"s\" value=\"");
+    html += staSsid;
+    html += F("\" placeholder=\"车库路由名称\" maxlength=\"32\" autocapitalize=\"off\">"
+              "<label style=\"margin-top:8px\">密码</label>"
+              "<input type=\"password\" name=\"p\" value=\"\" placeholder=\"密码（留空=不改）\" maxlength=\"64\">"
+              "<button type=\"submit\">保存并连接</button></form>"
+              "<form method=\"GET\" action=\"/wifista/clear\">"
+              "<button type=\"submit\" class=\"sec\">清除家庭 Wi‑Fi</button></form>"
+              "<div class=\"tip\">保存后设备会以 STA 接入该路由；连上后可用 "
+              "<code>upload_port=</code> 里的主机名做 espota，不必去车库插 USB。"
+              "热点仍可同时开（APSTA）做配置。测自动门仍建议网页「关闭 WiFi」。</div></div>");
+  }
 
   // 跟踪模式选择
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">跟踪模式</span><span class=\"v\">");
@@ -478,6 +527,40 @@ void WebPortal::setupRoutes() {
     server.send(200, "application/json", j);
   });
 
+  // 桌面 OTA 客户端：在线 / 版本 / 能否升级
+  server.on("/ota", HTTP_GET, []() {
+    if (!gPortal) {
+      server.send(500, "application/json", "{\"ok\":0}");
+      return;
+    }
+    bool sta = gPortal->staConnected();
+    bool ota = gPortal->otaReady();
+    String j;
+    j.reserve(256);
+    j += "{\"ok\":1,\"fw\":\"" FW_VERSION "\",\"host\":\"";
+    j += gPortal->host_;
+    j += "\"";
+    j += ",\"ip\":\"";
+    j += sta ? gPortal->staIp() : String();
+    j += "\"";
+    j += ",\"ap_ip\":\"";
+    j += WiFi.softAPIP().toString();
+    j += "\"";
+    j += ",\"sta\":";
+    j += sta ? 1 : 0;
+    j += ",\"ota\":";
+    j += ota ? 1 : 0;
+    j += ",\"can_update\":";
+    j += (sta && ota) ? 1 : 0;
+    j += ",\"build\":\"" __DATE__ " " __TIME__ "\"";
+    j += ",\"uptime_ms\":";
+    j += String((unsigned long)millis());
+    j += ",\"heap\":";
+    j += String((unsigned)ESP.getFreeHeap());
+    j += "}";
+    server.send(200, "application/json", j);
+  });
+
   server.on("/wifi/off", HTTP_GET, []() {
     if (gPortal && gPortal->store_) {
       gPortal->store_->saveWifiEnabled(false);
@@ -494,8 +577,59 @@ void WebPortal::setupRoutes() {
           "<p style='color:#8b9aab'>约 2 秒后本页面断开。</p></body>");
     server.send(200, "text/html; charset=utf-8", body);
     delay(400);
-    if (gPortal) gPortal->stopAp();
-    Serial.println("[WEB] WiFi SoftAP stopped by user (persisted wifi_on=0)");
+    if (gPortal) {
+      gPortal->stopAp();
+      gPortal->stopSta();  // 热点+STA 全关，射频让给蓝牙；下次上电已配 STA 会自动连回
+    }
+    Serial.println("[WEB] WiFi SoftAP+STA stopped by user (persisted wifi_on=0)");
+  });
+
+  server.on("/wifista", HTTP_GET, []() {
+    if (!gPortal || !gPortal->store_) {
+      server.send(500, "text/plain", "no store");
+      return;
+    }
+    String ssid = server.arg("s");
+    ssid.trim();
+    String pass = server.arg("p");
+    if (ssid.length() == 0) {
+      server.send(400, "text/html; charset=utf-8",
+                  F("<meta charset=utf-8><p>SSID 不能为空</p><p><a href=/>返回</a></p>"));
+      return;
+    }
+    // 密码留空且已有保存 → 不覆盖（防误清）
+    String oldPass = gPortal->store_->loadStaPass();
+    if (pass.length() == 0 && gPortal->store_->loadStaSsid().length() > 0 &&
+        gPortal->store_->loadStaSsid() == ssid) {
+      pass = oldPass;
+    }
+    bool ok = gPortal->store_->saveSta(ssid, pass);
+    Serial.println("[WEB] STA save ssid=" + ssid + " ok=" + String(ok ? 1 : 0) +
+                   " pass_len=" + String(pass.length()));
+    gPortal->startStaFromStore();
+    String body =
+        F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
+          "content='width=device-width,initial-scale=1'>"
+          "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
+          "padding:24px;text-align:center'>"
+          "<h2>家庭 Wi‑Fi 已保存</h2><p>SSID：<code>");
+    body += ssid;
+    body += F("</code></p><p style='color:#f2c94c'>正在连接… 约几秒后刷新首页看状态。"
+              "连上后无线烧录主机名：</p><p><code>");
+    body += gPortal->host_;
+    body += F(".local</code></p>"
+              "<p><a style='color:#2f80ed' href='/'>返回设置</a></p></body>");
+    server.send(200, "text/html; charset=utf-8", body);
+  });
+
+  server.on("/wifista/clear", HTTP_GET, []() {
+    if (gPortal && gPortal->store_) {
+      gPortal->store_->clearSta();
+    }
+    if (gPortal) gPortal->stopSta();
+    Serial.println("[WEB] STA cleared");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "ok");
   });
 
   server.on("/wifi/on", HTTP_GET, []() {
@@ -503,6 +637,7 @@ void WebPortal::setupRoutes() {
       gPortal->store_->saveWifiEnabled(true);
     }
     bool ok = gPortal ? gPortal->startAp() : false;
+    if (gPortal && ok) gPortal->startStaFromStore();
     String body =
         F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
           "content='width=device-width,initial-scale=1'>"
@@ -579,6 +714,16 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
   char suffix[8];
   snprintf(suffix, sizeof(suffix), "%04X", (uint16_t)(chipid & 0xFFFF));
   apSsid_ = String(AP_SSID_PREFIX) + suffix;
+  // mDNS/OTA：小写 hostname，避免和 SoftAP SSID 混淆
+  {
+    String hs(suffix);
+    hs.toLowerCase();
+    host_ = String("garage-") + hs;
+  }
+
+  if (store_) {
+    staWanted_ = store_->loadStaSsid().length() > 0;
+  }
 
   setupRoutes();
   serverStarted_ = false;
@@ -591,13 +736,120 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
     Serial.println("[WEB] SoftAP disabled by config (BT-only mode, no HTTP)");
     apActive_ = false;
     if (bt_) bt_->setInquiryPaused(false);
+    // 仍允许纯 STA（无线烧录），不需要 SoftAP
+    if (staWanted_) {
+      WiFi.persistent(false);
+      WiFi.mode(WIFI_STA);
+      WiFi.setAutoReconnect(true);
+      startStaFromStore();
+      if (!serverStarted_) {
+        server.begin();
+        server.enableDelay(true);
+        serverStarted_ = true;
+      }
+    }
+    return;
+  }
+
+  if (staWanted_) startStaFromStore();
+}
+
+void WebPortal::startStaFromStore() {
+  if (!store_) return;
+  String ssid = store_->loadStaSsid();
+  String pass = store_->loadStaPass();
+  ssid.trim();
+  if (ssid.length() == 0) {
+    stopSta();
+    return;
+  }
+  staWanted_ = true;
+
+  // SoftAP 已开 → APSTA；否则纯 STA
+  WiFi.persistent(false);
+  if (apActive_) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+
+  // mDNS：OTA 用 garage-XXXX.local
+  if (!mdnsOn_) {
+    if (MDNS.begin(host_.c_str())) {
+      MDNS.addService("http", "tcp", 80);
+      mdnsOn_ = true;
+      Serial.println("[WEB] mDNS http://" + host_ + ".local");
+    } else {
+      Serial.println("[WEB] mDNS begin FAIL " + host_);
+    }
+  }
+
+  Serial.println("[WEB] STA begin ssid=" + ssid + " hostname=" + host_ + ".local");
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  staTrying_ = true;
+  staNextRetryMs_ = millis() + 15000;
+}
+
+void WebPortal::stopSta() {
+  staWanted_ = false;
+  staTrying_ = false;
+  WiFi.disconnect(false, false);
+  if (mdnsOn_) {
+    MDNS.end();
+    mdnsOn_ = false;
+  }
+  if (apActive_) {
+    WiFi.mode(WIFI_AP);
+  } else {
+    WiFi.mode(WIFI_OFF);
+  }
+  Serial.println("[WEB] STA stopped");
+}
+
+void WebPortal::loopSta() {
+  if (!staWanted_) return;
+
+  wl_status_t st = WiFi.status();
+  if (st == WL_CONNECTED) {
+    if (staTrying_ || millis() - staLastLogMs_ > 30000) {
+      staLastLogMs_ = millis();
+      if (staTrying_) {
+        staTrying_ = false;
+        Serial.println("[WEB] STA connected ip=" + WiFi.localIP().toString() +
+                       " host=" + host_ + ".local");
+      }
+    }
+    return;
+  }
+
+  // 未连上：节流重连（WiFi.begin 会有点重，勿每 loop 调）
+  uint32_t now = millis();
+  if (!millisBefore(now, staNextRetryMs_)) {
+    if (apActive_ && WiFi.getMode() != WIFI_AP_STA) {
+      WiFi.mode(WIFI_AP_STA);
+    }
+    String ssid = store_ ? store_->loadStaSsid() : String();
+    String pass = store_ ? store_->loadStaPass() : String();
+    if (ssid.length()) {
+      Serial.printf("[WEB] STA retry ssid=%s st=%d\n", ssid.c_str(), (int)st);
+      WiFi.begin(ssid.c_str(), pass.c_str());
+      staTrying_ = true;
+      staNextRetryMs_ = now + 20000;
+    }
   }
 }
 
 bool WebPortal::startAp() {
   WiFi.persistent(false);
   // 不要先 WIFI_OFF：部分模组 OFF→AP 后 Beacon 异常（SSID 时有时无/扫不到）
-  WiFi.mode(WIFI_AP);
+  // 已配家庭 Wi‑Fi 则 APSTA，保住 STA/OTA
+  if (staWanted_) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_AP);
+  }
   WiFi.setSleep(false);
   delay(300);
 
@@ -653,13 +905,22 @@ void WebPortal::stopAp() {
     dnsOn_ = false;
   }
   WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
+  // 关热点：若已配家庭 Wi‑Fi 则保留纯 STA（OTA 仍可用）；测自动门可再 wifi sta off
+  if (staWanted_) {
+    WiFi.mode(WIFI_STA);
+  } else {
+    WiFi.mode(WIFI_OFF);
+  }
   apActive_ = false;
   apQuietUntilMs_ = 0;
   if (bt_) {
     bt_->setInquiryPaused(false);
     bt_->setInquirySlow(false);  // 关热点后恢复完整扫描，测自动门
   }
+  // 热点期可能推迟/失败过 NFC：关 AP 后立刻允许重新 hwInit
+  if (nfc_) nfc_->kickRecover();
+  Serial.println("[WEB] SoftAP off; STA=" + String(staWanted_ ? "keep" : "none") +
+                 " sta_ip=" + staIp());
 }
 
 bool WebPortal::rfQuietActive() const {
@@ -668,7 +929,18 @@ bool WebPortal::rfQuietActive() const {
 }
 
 void WebPortal::loop() {
-  if (!apActive_) return;
+  loopSta();
+
+  // 纯 STA（无热点）也要跑 HTTP + OTA 可达的 server
+  if (apActive_ || (staWanted_ && staConnected())) {
+    if (serverStarted_) {
+      server.handleClient();
+    }
+  }
+  if (!apActive_) {
+    // 纯 STA 路径：不做 SoftAP 特有维护
+    return;
+  }
 
   if (dnsOn_) dns_.processNextRequest();
   server.handleClient();
@@ -679,10 +951,12 @@ void WebPortal::loop() {
   static uint32_t lastDiag = 0;
   if (millis() - lastDiag >= 3000) {
     lastDiag = millis();
-    Serial.printf("[WEB] ap=%s ip=%s stations=%d heap=%u bt_delayed=%d\n",
-                  apSsid_.c_str(), WiFi.softAPIP().toString().c_str(),
-                  WiFi.softAPgetStationNum(), (unsigned)ESP.getFreeHeap(),
-                  gBleBond.hasIrk() ? 1 : 0);
+    if (Serial.availableForWrite() > 128) {
+      Serial.printf("[WEB] ap=%s ip=%s sta=%s stations=%d heap=%u bt_delayed=%d\n",
+                    apSsid_.c_str(), WiFi.softAPIP().toString().c_str(),
+                    staIp().c_str(), WiFi.softAPgetStationNum(),
+                    (unsigned)ESP.getFreeHeap(), gBleBond.hasIrk() ? 1 : 0);
+    }
   }
 
   // AP IP 丢失或为 0：整段重启 SoftAP + HTTP（只补 softAP 不够）
@@ -729,7 +1003,11 @@ void WebPortal::loop() {
       lastC = clients;
       Serial.printf("[WEB] softAP clients=%d quiet=%d\n", clients,
                     (int)rfQuietActive());
-      if (clients > 0) bt_->cancelActiveInquiry();
+      if (clients > 0) {
+        bt_->cancelActiveInquiry();
+      } else if (nfc_ && !nfc_->ok()) {
+        nfc_->kickRecover();  // 手机离开热点后立刻补 NFC init
+      }
     }
   }
 #else

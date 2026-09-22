@@ -3,6 +3,9 @@
 // ===== 车库门控制器 P0 配置 =====
 // 引脚按 ESP32 DevKit / WROOM32 常见接法，可按实际改
 
+// 固件版本：由 tools/bump_version.py 编译前生成（0.2.源码时间戳）
+#include "fw_version.h"
+
 // 继电器（干接点脉冲，模拟墙控/遥控按键）
 // 继电器控制脚：默认 G21（右列，避开紧挨的 GND）
 #ifndef PIN_RELAY
@@ -135,6 +138,15 @@
 // 离场关门：进入「强→弱/离开」后，最长等这么久就关（观察期可再调）
 // 另：无→有立刻开门；误开问题后续再收紧
 #define LEAVING_CLOSE_MS      10000
+// ===== 关门：至少 3 个有效 RSSI 且单调变弱才「离开合格」=====
+// 例：-60,-70,-80 可关；-60,-80,-60 视为跳动，否决关门
+#define RSSI_TREND_MIN_N      3     // 最少样本
+#define RSSI_TREND_DROP_DB    15    // 首末至少弱这么多 dB
+#define RSSI_TREND_TOL_DB     3     // 相邻允许的小反弹（多径）
+// 连续无信号这么久才算「真无」，之后再出现才允许无→有开（抖动 miss 不算无）
+#define RSSI_TRUE_SILENT_MS   20000
+// 真开走且一直扫不到：无信号满这时长兜底发关码
+#define RSSI_LEAVE_SILENT_MS  35000
 
 // ===== 经典蓝牙（与 BLE 共用开/关状态机阈值）=====
 // 开/关逻辑与 BLE 相同：无→有开；首见≥RSSI_SUDDEN_STRONG 不开；强→弱→无关

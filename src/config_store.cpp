@@ -37,6 +37,34 @@ bool ConfigStore::saveWifiEnabled(bool on) {
   return prefs.putBool("wifi_on", on);
 }
 
+String ConfigStore::loadStaSsid() {
+  if (!ready_) return String();
+  String s = prefs.getString("sta_ssid", "");
+  s.trim();
+  return s;
+}
+
+String ConfigStore::loadStaPass() {
+  if (!ready_) return String();
+  return prefs.getString("sta_pass", "");
+}
+
+bool ConfigStore::saveSta(const String& ssid, const String& pass) {
+  if (!ready_) return false;
+  String s = ssid;
+  s.trim();
+  if (s.length() == 0) return clearSta();
+  if (prefs.putString("sta_ssid", s) == 0) return false;
+  prefs.putString("sta_pass", pass);
+  return true;
+}
+
+bool ConfigStore::clearSta() {
+  if (!ready_) return false;
+  prefs.remove("sta_pass");
+  return prefs.remove("sta_ssid") || true;
+}
+
 String ConfigStore::loadBleFilter() {
   if (!ready_) return String();
   return prefs.getString("ble_filter", "");

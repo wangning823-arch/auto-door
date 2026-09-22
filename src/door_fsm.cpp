@@ -59,8 +59,9 @@ void DoorFsm::pulseRelay() {
 
 void DoorFsm::emitOpen() {
   if (rfEmit_ && rfEmit_(true)) {
-    Serial.println("[FSM] RF TX open/up");
     lastAnyActionTs_ = millis();
+    if (Serial.availableForWrite() > 32)
+      Serial.println("[FSM] RF TX open/up");
     return;
   }
   pulseRelay();
@@ -68,8 +69,9 @@ void DoorFsm::emitOpen() {
 
 void DoorFsm::emitClose() {
   if (rfEmit_ && rfEmit_(false)) {
-    Serial.println("[FSM] RF TX close/down");
     lastAnyActionTs_ = millis();
+    if (Serial.availableForWrite() > 32)
+      Serial.println("[FSM] RF TX close/down");
     return;
   }
   pulseRelay();
@@ -80,28 +82,25 @@ bool DoorFsm::canAutoOpenNow() const {
   // 手动操作后：只挡自动开（防手动关完又被顶开），不挡离场自动关
   if (suppressAutoOpenUntil_ && !millisReached(millis(), suppressAutoOpenUntil_))
     return false;
-  uint32_t now = millis();
-  if (lastAutoOpenTs_ && (now - lastAutoOpenTs_) < AUTO_COOLDOWN_OPEN_MS) return false;
+  // 不因「门已开/上次开过很久」拒绝：进场一律可再发开码（门已开再开一次无害）
   return true;
 }
 
 bool DoorFsm::canAutoCloseNow() const {
   if (holdOpen_) return false;
-  // software CLOSED = 本机已发过关码；不读门磁
-  if (doorState_ == DoorState::CLOSED) return false;
-  uint32_t now = millis();
-  if (lastAutoCloseTs_ && (now - lastAutoCloseTs_) < AUTO_COOLDOWN_CLOSE_MS) return false;
-  if (lastAutoOpenTs_ && (now - lastAutoOpenTs_) < AUTO_MIN_OPEN_HOLD_MS) return false;
+  // 不看 doorState、不看开后 hold、不看关冷却：
+  // 离场判定成立就发关码（门其实关着再关一次也无妨）
   return true;
 }
 
 bool DoorFsm::tryAutoOpen(const char* why) {
   if (!canAutoOpenNow()) {
-    Serial.printf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d door=%d cool_open=%lu cool_close=%lu hold_ms=%lu\n",
-                  why ? why : "?", holdOpen_ ? 1 : 0, (int)doorState_,
-                  (unsigned long)(lastAutoOpenTs_ ? (millis() - lastAutoOpenTs_) : 0),
-                  (unsigned long)(lastAutoCloseTs_ ? (millis() - lastAutoCloseTs_) : 0),
-                  (unsigned long)(lastAutoOpenTs_ ? (millis() - lastAutoOpenTs_) : 0));
+    Serial.printf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d suppress=%d\n",
+                  why ? why : "?", holdOpen_ ? 1 : 0,
+                  suppressAutoOpenUntil_ &&
+                          !millisReached(millis(), suppressAutoOpenUntil_)
+                      ? 1
+                      : 0);
     return false;
   }
   Serial.printf("[FSM] AUTO OPEN (%s)\n", why ? why : "");
@@ -118,10 +117,8 @@ bool DoorFsm::tryAutoOpen(const char* why) {
 
 bool DoorFsm::tryAutoClose(const char* why) {
   if (!canAutoCloseNow()) {
-    Serial.printf("[FSM] AUTO CLOSE 拒绝 (%s) hold=%d door=%d cool=%lu since_open=%lu\n",
-                  why ? why : "?", holdOpen_ ? 1 : 0, (int)doorState_,
-                  (unsigned long)(lastAutoCloseTs_ ? (millis() - lastAutoCloseTs_) : 0),
-                  (unsigned long)(lastAutoOpenTs_ ? (millis() - lastAutoOpenTs_) : 0));
+    Serial.printf("[FSM] AUTO CLOSE 拒绝 (%s) hold=%d\n", why ? why : "?",
+                  holdOpen_ ? 1 : 0);
     return false;
   }
   Serial.printf("[FSM] AUTO CLOSE (%s)\n", why ? why : "");
@@ -149,7 +146,7 @@ void DoorFsm::requestManualToggle(OpenSource src) {
 }
 
 void DoorFsm::requestManualOpen(OpenSource src) {
-  Serial.println("[FSM] MANUAL OPEN → RF open 立即发射");
+  // 先发射再打日志：Serial 缓冲满时 println 会卡住 loop，RF 就发不出去
   pending_ = DoorAction::PULSE_OPEN;
   emitOpen();
   doorState_ = DoorState::OPEN;
@@ -160,12 +157,10 @@ void DoorFsm::requestManualOpen(OpenSource src) {
   lastAnyActionTs_ = millis();
   // 只挡后续自动开，不挡离场自动关
   suppressAutoOpenUntil_ = millis() + MANUAL_SUPPRESS_MS;
-  Serial.printf("[FSM] suppress auto-open %ums（离场自动关仍可用）\n",
-                (unsigned)MANUAL_SUPPRESS_MS);
+  Serial.println("[FSM] MANUAL OPEN done");
 }
 
 void DoorFsm::requestManualClose(OpenSource src) {
-  Serial.println("[FSM] MANUAL CLOSE → RF close 立即发射");
   pending_ = DoorAction::PULSE_CLOSE;
   emitClose();
   doorState_ = DoorState::CLOSED;
@@ -175,7 +170,7 @@ void DoorFsm::requestManualClose(OpenSource src) {
   pending_ = DoorAction::NONE;
   lastAnyActionTs_ = millis();
   suppressAutoOpenUntil_ = millis() + MANUAL_SUPPRESS_MS;
-  Serial.printf("[FSM] suppress auto-open %ums\n", (unsigned)MANUAL_SUPPRESS_MS);
+  Serial.println("[FSM] MANUAL CLOSE done");
 }
 
 void DoorFsm::loop(BleTracker& bt) {

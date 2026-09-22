@@ -13,6 +13,12 @@ class ConfigStore {
   bool loadWifiEnabled(bool defaultOn = true);
   bool saveWifiEnabled(bool on);
 
+  // 家庭/车库路由器 STA（OTA 无线烧录）；空 SSID=未配置
+  String loadStaSsid();
+  String loadStaPass();
+  bool saveSta(const String& ssid, const String& pass);
+  bool clearSta();
+
   // BLE 特征过滤：如 MiCarCDB8 或 MAC 前缀；空=未设置
   String loadBleFilter();
   bool saveBleFilter(const String& f);

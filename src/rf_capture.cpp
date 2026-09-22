@@ -565,8 +565,7 @@ void RfCapture::exportKeyCsv(int idx) const {
 bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
   if (txPin_ < 0 || !p || n < 5) return false;
   if (repeats == 0) repeats = 1;
-  Serial.printf("[RF] 发射 TX=GPIO%d x%u 帧, %u 脉冲\n", txPin_, repeats, n);
-
+  // 日志放到发射之后：TX 缓冲满时 println 会阻塞，等于永远不发 RF
   pinMode(txPin_, OUTPUT);
   digitalWrite(txPin_, LOW);
   delayMicroseconds(100);
@@ -575,20 +574,26 @@ bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
     for (uint16_t i = 0; i < n; i++) {
       // OOK：偶数段为高（载波开），奇数为低；帧内长间隔当低电平保持
       bool high = (i % 2) == 0;
-      digitalWrite(txPin_, high ? HIGH : LOW);
       uint16_t d = p[i];
+      // 关中断再 delay：WiFi/BT ISR 会拉长 delayMicroseconds，门机解不了码
+      noInterrupts();
+      digitalWrite(txPin_, high ? HIGH : LOW);
       if (d >= RF_INTER_FRAME_MIN_US) {
         digitalWrite(txPin_, LOW);
         delayMicroseconds(d);
       } else {
         delayMicroseconds(d);
       }
+      interrupts();
     }
     digitalWrite(txPin_, LOW);
     if (r + 1 < repeats) delayMicroseconds(RF_FRAME_GAP_US);
   }
   digitalWrite(txPin_, LOW);
-  Serial.println("[RF] 发射完成");
+  if (Serial.availableForWrite() > 32) {
+    Serial.printf("[RF] 发射完成 TX=GPIO%d x%u 帧, %u 脉冲\n", txPin_,
+                  repeats, n);
+  }
   return true;
 }
 

@@ -31,6 +31,8 @@ class NfcReader {
   uint8_t autoRetryCount() const { return autoRetryCount_; }
   // SoftAP 配置中推迟自动 init，避免 I2C 长操作卡住 HTTP
   void postponeBootInit(uint32_t delayMs);
+  // 关热点 / 立刻允许下一轮 hwInit（清 10 分钟慢速重试等待）
+  void kickRecover();
 
  private:
   bool hwInit();
@@ -44,6 +46,7 @@ class NfcReader {
   // 上电自动 init：避免断电重启后 NFC 永久失效（原先 deferred 永不自动初始化）
   bool bootInitDone_ = false;
   uint32_t bootInitAt_ = 0;
+  uint8_t bootPostpones_ = 0;  // 热点有人时最多再推迟 3 次×1.5s，之后必须 init
   uint32_t lastAutoRetryMs_ = 0;
   uint8_t autoRetryCount_ = 0;
   uint32_t listenUntilMs_ = 0;

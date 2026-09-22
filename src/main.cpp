@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <ArduinoOTA.h>
 #include "config.h"
 #include "ble_tracker.h"
 #include "door_fsm.h"
@@ -25,6 +26,75 @@ static RfCapture gRf;
 static NfcReader gNfc;
 static char gMac[24] = CAR_BT_MAC;
 static bool gBtStackInited = false;
+static bool gOtaBegun = false;
+// OTA 写 flash 期间禁止碰 I2C/NFC（否则易把 PN532/总线拖死，升级后刷卡失效）
+static volatile bool gOtaActive = false;
+static volatile uint32_t gOtaActiveAtMs = 0;
+
+static void otaDisarm(const char* why) {
+  if (!gOtaActive) return;
+  gOtaActive = false;
+  Serial.printf("[OTA] disarm (%s)\n", why ? why : "?");
+  if (gNfc.ok()) gNfc.setListen(true);
+  else gNfc.kickRecover();
+}
+
+// STA 连上后启动 ArduinoOTA：传输期间暂停 Inquiry+NFC，结束后恢复
+static void serviceOta() {
+  if (!gWeb.staConnected()) {
+    // STA 掉线可能打断 OTA：必须清 gOtaActive，否则刷卡路径被永久跳过
+    otaDisarm("sta lost");
+    if (gOtaBegun) {
+      ArduinoOTA.end();
+      gOtaBegun = false;
+      gWeb.setOtaReady(false);
+      Serial.println("[OTA] STA lost, OTA stopped");
+    }
+    return;
+  }
+  // 兜底：onStart 后若既无 onEnd/onError（网络半死），超时自动解除
+  if (gOtaActive && (millis() - gOtaActiveAtMs) > 180000UL) {
+    otaDisarm("timeout 180s");
+  }
+  if (!gOtaBegun) {
+    ArduinoOTA.setHostname(gWeb.staHostname().c_str());
+    ArduinoOTA.onStart([]() {
+      Serial.println("[OTA] START " + String(gWeb.staHostname()) + ".local");
+      gOtaActive = true;
+      gOtaActiveAtMs = millis();
+      gNfc.setListen(false);
+      if (gBtStackInited) {
+        gBt.setInquiryPaused(true);
+        gBt.cancelActiveInquiry();
+      }
+    });
+    ArduinoOTA.onEnd([]() {
+      Serial.println("[OTA] END (reboot)");
+      gOtaActive = false;
+      if (gBtStackInited) gBt.setInquiryPaused(false);
+      if (gNfc.ok()) gNfc.setListen(true);
+    });
+    ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+      static int lastPct = -1;
+      int pct = t ? (int)(100u * p / t) : 0;
+      if (pct != lastPct && (pct % 10 == 0 || pct == 100)) {
+        lastPct = pct;
+        Serial.printf("[OTA] %d%%\n", pct);
+      }
+    });
+    ArduinoOTA.onError([](ota_error_t e) {
+      Serial.printf("[OTA] error %u\n", (unsigned)e);
+      otaDisarm("error");
+      if (gBtStackInited) gBt.setInquiryPaused(false);
+    });
+    ArduinoOTA.begin();
+    gOtaBegun = true;
+    gWeb.setOtaReady(true);
+    Serial.println("[OTA] ready host=" + gWeb.staHostname() +
+                   ".local ip=" + gWeb.staIp() + " fw=" FW_VERSION);
+  }
+  ArduinoOTA.handle();
+}
 
 // 经典 BT + BLE 配对栈：SoftAP 调试时推迟，优先让网页先出来
 static void initBtStacks() {
@@ -65,6 +135,14 @@ static bool rfSaveKeyCb(int idx, const char* csv) {
 
 static bool rfEmitDoor(bool open) {
   int idx = open ? RF_KEY_OPEN : RF_KEY_CLOSE;
+  // 槽位被清/损坏时回退默认码再发，避免「码没了却只能打继电器」
+  if (!gRf.keyValid(idx)) {
+    const char* csv = open ? RF_DEFAULT_OPEN_CSV : RF_DEFAULT_CLOSE_CSV;
+    if (gRf.setKeyFromCsv(idx, csv)) {
+      if (Serial.availableForWrite() > 32)
+        Serial.printf("[RF] key%d invalid → reload default\n", idx);
+    }
+  }
   if (!gRf.keyValid(idx)) return false;
   return gRf.playKey(idx);
 }
@@ -91,11 +169,98 @@ static bool autoOpenThenArm(const char* why) {
   return ok;
 }
 
-// 门仍开着就尝试自动关；成功 true
+// 离场/信号消失：一律发关码，不看软件门态（门已关再关一次也无害）
 static bool tryCloseIfOpen(const char* why) {
-  if (gDoor.doorState() == DoorState::CLOSED) return true;
   gCloseArmed = true;
   return autoCloseGuarded(why);
+}
+
+// ===== 真无 + 离场 RSSI 趋势（开/关门共用）=====
+// 开：仅「连续真无」之后再出现（含很弱）才开；短 miss 回来不算无→有
+// 关：≥RSSI_TREND_MIN_N 个有效 RSSI 单调变弱且首末够弱；反弹否决；或长时间真无兜底
+struct RssiTrendWin {
+  int8_t buf[6];
+  uint8_t n = 0;
+  uint8_t head = 0;
+  void clear() {
+    n = 0;
+    head = 0;
+  }
+  void push(int r) {
+    if (r > 0 || r < -127) return;
+    buf[head] = (int8_t)r;
+    head = (uint8_t)((head + 1) % 6);
+    if (n < 6) n++;
+  }
+  bool gradualLeave() const {
+    if (n < RSSI_TREND_MIN_N) return false;
+    int s[6];
+    uint8_t start = (uint8_t)((head - n + 12) % 6);
+    for (uint8_t i = 0; i < n; i++) s[i] = buf[(start + i) % 6];
+    const uint8_t k = RSSI_TREND_MIN_N;
+    const int* p = s + (n - k);
+    for (uint8_t i = 0; i + 1 < k; i++) {
+      // 只允许小幅上翘；像 -60,-80,-60 会在第二步被否决
+      if (p[i + 1] > p[i] + RSSI_TREND_TOL_DB) return false;
+    }
+    if (p[0] - p[k - 1] < RSSI_TREND_DROP_DB) return false;
+    return true;
+  }
+  void dump() const {
+    Serial.print("[FSM] rssi trend:");
+    for (uint8_t i = 0; i < n; i++) {
+      uint8_t idx = (uint8_t)((head - n + i + 12) % 6);
+      Serial.printf(" %d", (int)buf[idx]);
+    }
+    Serial.println();
+  }
+};
+
+static RssiTrendWin gRssiTrend;
+static bool gTrueNo = true;      // 上电视为「无」，首次有信号即可开
+static bool gEverHadSignal = false;
+static bool gLeaveQual = false;  // 离开趋势合格（可关）
+static uint32_t gNoSigSince = 0; // 0=当前有信号
+
+static void observeSignal(bool hasSignal, int rssi) {
+  const uint32_t now = millis();
+  if (hasSignal) {
+    gNoSigSince = 0;
+    gEverHadSignal = true;
+    gRssiTrend.push(rssi);
+    if (gRssiTrend.gradualLeave()) {
+      if (!gLeaveQual) {
+        Serial.printf("[FSM] 离场趋势合格 rssi=%d（≥%d 点单调变弱）\n", rssi,
+                      (int)RSSI_TREND_MIN_N);
+        gRssiTrend.dump();
+      }
+      gLeaveQual = true;
+    }
+    if (rssi >= RSSI_STRONG) {
+      if (gLeaveQual) {
+        gLeaveQual = false;
+        gRssiTrend.clear();
+        Serial.println("[FSM] 回到强信号 → 清除离场趋势");
+      }
+    }
+    // 注意：不在这里清 gTrueNo，否则 observeSignal 后再判「真无→有」会永远为 false
+  } else {
+    if (gNoSigSince == 0) gNoSigSince = now;
+    if (millisReached(now, gNoSigSince + RSSI_TRUE_SILENT_MS) && !gTrueNo) {
+      gTrueNo = true;
+      Serial.println("[FSM] 真无确认（连续无信号满，之后有信号才再开）");
+    }
+  }
+}
+
+// 是否该发关码：趋势合格后信号没了/变很远；或有史以来真无满离开静默
+static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
+  if (gLeaveQual && (!hasSignal || isFar)) return true;
+  if (gEverHadSignal && gTrueNo && gNoSigSince != 0 &&
+      millisReached(millis(), gNoSigSince + RSSI_LEAVE_SILENT_MS)) {
+    return true;
+  }
+  return false;
 }
 
 static int rfKeyIndexFromArg(const String& s) {
@@ -171,9 +336,12 @@ static void serviceBootLongPress() {
       if (!gWeb.apActive()) {
         gWeb.startAp();
       }
+      gWeb.startStaFromStore();
       Serial.println("[BOOT] force SoftAP ON -> " + gWeb.apSsid() +
                      " pass=" + AP_PASSWORD);
       Serial.println("[BOOT] 手机连热点后打开 http://192.168.4.1/");
+      Serial.println("[BOOT] STA ip=" + gWeb.staIp() + " ota=" +
+                     gWeb.staHostname() + ".local");
     }
   } else {
     if (gForceApArmed && !gForceApHandled && (now - gBootHoldStartMs) >= 1500 &&
@@ -221,20 +389,25 @@ static void handleSerial() {
                        (gWeb.apActive() ? " active" : " off") + " pass=" +
                        AP_PASSWORD);
         if (gWeb.apActive()) {
-          Serial.println("[CMD] ip=" + WiFi.softAPIP().toString());
+          Serial.println("[CMD] ap_ip=" + WiFi.softAPIP().toString());
         }
+        Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
+                       " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
+                       ".local ota=" + String(gOtaBegun ? "on" : "off"));
       } else if (line == "wifi off") {
         gCfg.saveWifiEnabled(false);
-        gWeb.stopAp();
+        gWeb.stopAp();   // 内部已 kickRecover
+        gWeb.stopSta();
         gBt.setInquiryPaused(false);
-        Serial.println("[CMD] WiFi OFF + saved (BT inquiry free)");
+        Serial.println("[CMD] WiFi AP+STA OFF + saved (BT inquiry free)");
         // 关热点后若尚未 init BT，立刻起栈，便于测自动门
         if (!gBtStackInited) initBtStacks();
       } else if (line == "wifi on") {
         gCfg.saveWifiEnabled(true);
         if (gWeb.startAp()) {
+          gWeb.startStaFromStore();
           Serial.println("[CMD] WiFi ON " + gWeb.apSsid() + " " +
-                         WiFi.softAPIP().toString());
+                         WiFi.softAPIP().toString() + " sta=" + gWeb.staIp());
         } else {
           Serial.println("[CMD] WiFi ON failed");
         }
@@ -243,6 +416,7 @@ static void handleSerial() {
         gWeb.stopAp();
         delay(200);
         bool ok2 = gWeb.startAp();
+        if (ok2) gWeb.startStaFromStore();
         Serial.printf("[CMD] wifi restart -> %s ip=%s sta=%d\n",
                       ok2 ? "OK" : "FAIL",
                       WiFi.softAPIP().toString().c_str(),
@@ -254,6 +428,10 @@ static void handleSerial() {
                       WiFi.softAPgetStationNum(),
                       WiFi.softAPmacAddress().c_str(),
                       (unsigned)ESP.getFreeHeap(), (int)gBtStackInited);
+        Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
+                       " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
+                       ".local ota=" + String(gOtaBegun ? "on" : "off") +
+                       " rssi=" + String(gWeb.staConnected() ? WiFi.RSSI() : 0));
       } else if (line == "relay high" || line == "relay low" || line == "relay pulse") {
         int pin = gDoor.relayPin();
         if (line == "relay high") {
@@ -745,7 +923,8 @@ void setup() {
     initBtStacks();
   }
 
-  Serial.println("[BOOT] ready. wifi=" + String(wifiOn ? 1 : 0) +
+  Serial.println("[BOOT] ready. fw=" FW_VERSION " wifi=" +
+                 String(wifiOn ? 1 : 0) +
                  " bt_inited=" + String(gBtStackInited ? 1 : 0));
   Serial.printf("[BOOT] ready t=%ums SDA16=%d SCL17=%d\n", (unsigned)millis(),
                 digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
@@ -757,6 +936,10 @@ void setup() {
 #if WIFI_DEBUG_BOOT_ON
     Serial.println("[BOOT] WiFi=调试模式：重新上电会自动再开热点");
 #endif
+    if (gWeb.staConfigured()) {
+      Serial.println("[BOOT] 已配家庭 Wi‑Fi，将连 STA：主机 " + gWeb.staHostname() +
+                     ".local（OTA）");
+    }
   } else {
     Serial.println("[BOOT] SoftAP off. 运行中长按 BOOT 3 秒（LED 闪两下）可强制开热点");
     Serial.println("[BOOT] 或串口发 wifi on");
@@ -807,6 +990,7 @@ void loop() {
   }
 
   gWeb.loop();
+  serviceOta();
   gDoor.loop(gBt);
   serviceBootLongPress();
   handleSerial();
@@ -821,79 +1005,81 @@ void loop() {
   // ===== NFC 与 WiFi/蓝牙的共存策略 =====
   // 射频层：NFC=13.56MHz，BT=2.4GHz，互不干扰。
   // 软件层：PN532 poll/hwInit 会阻塞 loop，会拖慢网页和 Inquiry → 按场景调度。
-  //  · SoftAP 有客户端：暂停刷卡轮询，保证网页（可接受的二选一）
+  //  · SoftAP 有客户端：只拉长 NFC 间隔，不整段停（否则手机连网页时刷卡失效）
+  //  · OTA 写 flash：完全不碰 NFC/I2C
   //  · 无网/热点无人：NFC + 蓝牙必须同时工作；NFC 降频，且不在 Inquiry 忙时做 hwInit
+  //  · 上电 hwInit 优先：即使热点有人也要把 NFC 起起来（配 Wi‑Fi 时才能用）
   {
     const bool apOn = gWeb.apActive();
     const bool apClient = apOn && WiFi.softAPgetStationNum() > 0;
+    // 未就绪时必须能跑 poll/maybeRecover，即使热点有人（否则上电 init 永不发生）
+    const bool nfcNeedInit = !gNfc.ok();
     const bool btTrack =
         gBtStackInited && (gBt.autoTrack() || gBleScan.trackOn());
     const bool btBusy = gBtStackInited && gBt.inquiryBusy();
     const bool bleBusy = gBtStackInited && gBleScan.busy();
 
-    static bool nfcPausedForWeb = false;
-    if (apClient != nfcPausedForWeb) {
-      nfcPausedForWeb = apClient;
-      if (apClient) {
-        gNfc.setListen(false);
-        Serial.println("[NFC] 暂停轮询（热点有客户端，网页优先；断开后恢复）");
-      } else if (gNfc.ok()) {
-        gNfc.setListen(true);
-        Serial.println("[NFC] 恢复轮询");
-      }
-    }
-
-    // 跟踪中：加大 NFC 间隔并缩短单次 I2C 超时，给蓝牙留 loop
-    if (btTrack) {
-      gNfc.setPollGapMs(1200);
-    } else if (apOn) {
-      gNfc.setPollGapMs(500);
+    // OTA 写 flash：完全不碰 NFC/I2C
+    if (gOtaActive) {
+      // fall through — 不 poll、不 init
     } else {
-      gNfc.setPollGapMs(350);
-    }
+      static bool nfcWasQuiet = false;
+      // 热点有人：不再整段停 NFC（升级 OTA 后手机常连网页 → 刷卡会“死”）。
+      // 只拉长间隔让出 loop；真正要停的是 OTA 传输期。
+      if (apClient != nfcWasQuiet) {
+        nfcWasQuiet = apClient;
+        if (!apClient && !gNfc.ok()) {
+          gNfc.kickRecover();  // 客户端断开后立刻补一次 init
+        }
+      }
 
-    // 热点开着但无人连：允许刷卡；关热点后也允许
-    if (!apClient && gNfc.ok() && !gNfc.listen()) {
-      gNfc.setListen(true);
-    }
+      // 跟踪中加大间隔；热点有人时再慢一点，给网页留带宽
+      if (btTrack) {
+        gNfc.setPollGapMs(1200);
+      } else if (apClient) {
+        gNfc.setPollGapMs(800);
+      } else if (apOn) {
+        gNfc.setPollGapMs(500);
+      } else {
+        gNfc.setPollGapMs(350);
+      }
 
-    // NFC 未就绪时：仅在 BT Inquiry/BLE 不忙时才走 recover/hwInit
-    if (!gNfc.ok()) {
-      if (!apClient && !btBusy && !bleBusy) {
+      // 已就绪但 listen 被关掉（OTA 失败/手动）→ 恢复
+      if (gNfc.ok() && !gNfc.listen() && !gOtaActive) {
+        gNfc.setListen(true);
+      }
+
+      // 未就绪：即使热点有人 / Inquiry 忙也允许 init
+      if (nfcNeedInit) {
         String uid0;
         gNfc.poll(uid0);  // 内部 maybeRecover / 上电自动 init
-      }
-    } else {
-      String uid;
-      if (gNfc.poll(uid)) {
-        Serial.println("[NFC] card: " + uid);
-        if (gNfc.isAuthorized(uid)) {
-          Serial.println("[NFC] authorized → 立即发开/关 RF");
-          gDoor.requestManualToggle(OpenSource::NFC);
-        } else if (gNfc.authUid().length() == 0) {
-          Serial.println("[NFC] 未注册卡，串口执行: nfcsave " + uid);
-        } else {
-          Serial.println("[NFC] 未授权卡");
+      } else {
+        String uid;
+        if (gNfc.poll(uid)) {
+          const bool auth = gNfc.isAuthorized(uid);
+          // 先开/关门，再打日志：串口 TX 满时 println 会阻塞，不能挡 RF
+          if (auth) {
+            gDoor.requestManualToggle(OpenSource::NFC);
+            Serial.println("[NFC] card: " + uid + " authorized → RF");
+          } else if (gNfc.authUid().length() == 0) {
+            Serial.println("[NFC] card: " + uid + " 未注册卡，串口: nfcsave " + uid);
+          } else {
+            Serial.println("[NFC] card: " + uid + " 未授权卡");
+          }
         }
       }
     }
   }
 
   // ===== 跟踪模式分发 =====
-  int trackMode = gWeb.trackMode();  // 实时从 WebPortal 读取（网页可改）
+  int trackMode = gWeb.trackMode();
   if (trackMode == TRACK_MODE_BLE) {
-    // BLE：无→有且<-80立刻开；无→有且≥-80不开（库内开关蓝牙突变）；离场≤-90关
     enum class BlePhase : uint8_t {
       WAIT_SIGNAL, APPEARING, STRONG, LEAVING,
     };
     static BlePhase phase = BlePhase::WAIT_SIGNAL;
-    static uint8_t leaveFarStreak = 0;
-    static uint32_t leaveEnterMs = 0;
-    static uint32_t waitSilentSinceMs = 0;
 
-    // SoftAP 调试期 / 有客户端：阻塞式 BLE 扫描会让热点时有时无、网页半截
     const bool wifiClient = WiFi.softAPgetStationNum() > 0;
-    // 热点打开：不跑阻塞 BLE 扫描（网页优先）；静默关门仍用上次 RSSI 评估
     const bool apYield = gWeb.wifiRfPriority() || gWeb.rfQuietActive();
     if (gBtStackInited && gBleScan.trackOn() && !wifiClient) {
       const uint32_t prevScanEnd = gBleScan.lastScanEndMs();
@@ -909,106 +1095,74 @@ void loop() {
       bool isStrong = hasSignal && r >= RSSI_STRONG;
       bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
 
-      // 门开 + 信号消失满 LEAVING_CLOSE_MS：修「车开远一直不关」
-      bool waitSilentDue = false;
-      if (hasSignal) {
-        waitSilentSinceMs = 0;
-      } else if (gDoor.doorState() != DoorState::CLOSED) {
-        if (waitSilentSinceMs == 0) waitSilentSinceMs = millis();
-        waitSilentDue = (millis() - waitSilentSinceMs) >= LEAVING_CLOSE_MS;
-      }
-      bool leaveTimeoutDue =
-          phase == BlePhase::LEAVING && leaveEnterMs != 0 &&
-          (millis() - leaveEnterMs) >= LEAVING_CLOSE_MS;
+      if (scanJustFinished) observeSignal(hasSignal, hasSignal ? r : 0);
 
-      if (scanJustFinished || waitSilentDue || leaveTimeoutDue) {
-        const char* phaseName =
-            phase == BlePhase::WAIT_SIGNAL ? "WAIT" :
-            phase == BlePhase::APPEARING  ? "APPEAR" :
-            phase == BlePhase::STRONG     ? "STRONG" : "LEAVE";
-
-        Serial.printf("[BLE] rssi=%d seen=%d strong=%d far=%d lost=%d phase=%s%s\n",
-                      r, (int)hasSignal, (int)isStrong, (int)isFar, (int)lost,
-                      phaseName, waitSilentDue ? " [silent]" : "");
+      if (scanJustFinished) {
+        Serial.printf(
+            "[BLE] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d\n",
+            r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
+            (int)gLeaveQual, (int)phase);
 
         switch (phase) {
           case BlePhase::WAIT_SIGNAL:
-            leaveFarStreak = 0;
-            leaveEnterMs = 0;
-            if (gDoor.doorState() != DoorState::CLOSED && !hasSignal && waitSilentDue) {
-              Serial.println("[FSM] WAIT 无信号超时 → 关门（车已离开）");
-              if (tryCloseIfOpen("WAIT无信号")) waitSilentSinceMs = 0;
+            if (hasSignal && gTrueNo) {
+              Serial.printf("[FSM] 真无→有 rssi=%d，发开码\n", r);
+              gTrueNo = false;
+              autoOpenThenArm("真无→有");
+              phase = BlePhase::APPEARING;
               break;
             }
-            if (hasSignal) {
-              Serial.printf("[FSM] 无→有 rssi=%d，自动开（宽松观察）\n", r);
-              autoOpenThenArm("无→有");
-              phase = BlePhase::APPEARING;
+            if (shouldCloseBySignal(hasSignal, isFar)) {
+              Serial.println("[FSM] WAIT 离场条件 → 发关码");
+              tryCloseIfOpen("WAIT离场");
+              break;
             }
             break;
 
           case BlePhase::APPEARING:
-            leaveFarStreak = 0;
-            leaveEnterMs = 0;
             if (isStrong) {
-              autoOpenThenArm("无→有→强");
+              autoOpenThenArm("有→强");
               phase = BlePhase::STRONG;
-            } else if (!hasSignal || lost) {
-              Serial.println("[FSM] 弱信号消失，尝试关门");
-              if (tryCloseIfOpen("有→无(未进库)")) {
-                phase = BlePhase::WAIT_SIGNAL;
-                waitSilentSinceMs = 0;
-              } else {
-                phase = BlePhase::LEAVING;
-                leaveEnterMs = millis();
-              }
+              break;
             }
+            if (shouldCloseBySignal(hasSignal, isFar)) {
+              Serial.println("[FSM] APPEAR 离场条件 → 发关码");
+              tryCloseIfOpen("APPEAR离场");
+              phase = BlePhase::WAIT_SIGNAL;
+              break;
+            }
+            if (!hasSignal) phase = BlePhase::WAIT_SIGNAL;
             break;
 
           case BlePhase::STRONG:
-            leaveFarStreak = 0;
+            if (shouldCloseBySignal(hasSignal, isFar)) {
+              Serial.println("[FSM] STRONG 离场条件 → 发关码");
+              tryCloseIfOpen("STRONG离场");
+              phase = BlePhase::WAIT_SIGNAL;
+              break;
+            }
             if (!isStrong && hasSignal) {
               phase = BlePhase::LEAVING;
-              leaveEnterMs = millis();
-              Serial.println("[FSM] 强→弱，判定离开 → 尝试关");
-              if (tryCloseIfOpen("强→弱离开")) {
-                phase = BlePhase::WAIT_SIGNAL;
-                leaveEnterMs = 0;
-                waitSilentSinceMs = 0;
-              }
-            } else if (!hasSignal || lost) {
-              Serial.println("[FSM] 强信号直接消失，尝试关门");
-              if (tryCloseIfOpen("强→无")) {
-                phase = BlePhase::WAIT_SIGNAL;
-                leaveEnterMs = 0;
-                waitSilentSinceMs = 0;
-              } else {
-                phase = BlePhase::LEAVING;
-                leaveEnterMs = millis();
-              }
+            } else if (!hasSignal) {
+              phase = BlePhase::WAIT_SIGNAL;
             }
             break;
 
           case BlePhase::LEAVING:
             if (isStrong) {
               phase = BlePhase::STRONG;
-              leaveEnterMs = 0;
-              waitSilentSinceMs = 0;
-              Serial.println("[FSM] 弱→强（回到门口），取消离开");
+              gLeaveQual = false;
+              gRssiTrend.clear();
+              Serial.println("[FSM] 弱→强，取消离开");
               break;
             }
-            // 关不掉就留在 LEAVING 重试，禁止回 WAIT 后再也不关
-            if (leaveTimeoutDue || waitSilentDue || lost || isFar) {
-              Serial.println("[FSM] LEAVING → 关门重试");
-              if (tryCloseIfOpen("离开/无信号重试")) {
-                phase = BlePhase::WAIT_SIGNAL;
-                leaveEnterMs = 0;
-                waitSilentSinceMs = 0;
-                leaveFarStreak = 0;
-              } else if (leaveEnterMs) {
-                leaveEnterMs = millis();
-              }
+            if (shouldCloseBySignal(hasSignal, isFar)) {
+              Serial.println("[FSM] LEAVING 离场条件 → 发关码");
+              tryCloseIfOpen("LEAVING离场");
+              phase = BlePhase::WAIT_SIGNAL;
+              break;
             }
+            if (hasSignal) phase = BlePhase::STRONG;
             break;
         }
       }
@@ -1023,7 +1177,6 @@ void loop() {
       }
     }
   } else {
-    // Classic：与 BLE 同一套；仅在 seen/rssi 边沿评估，避免每 loop 空转
     enum class ClPhase : uint8_t {
       WAIT_SIGNAL, APPEARING, STRONG, LEAVING,
     };
@@ -1032,9 +1185,6 @@ void loop() {
     static bool clPrevSeen = false;
     static int clPrevRssi = -999;
     static bool clInited = false;
-    static uint8_t clFarStreak = 0;
-    static uint32_t clLeaveEnterMs = 0;
-    static uint32_t clWaitSilentSinceMs = 0;
 
     if (gBtStackInited && gBt.autoTrack() && gBt.hasTarget()) {
       int r = gBt.lastRssi();
@@ -1044,121 +1194,86 @@ void loop() {
       bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
       bool lost = !seen;
 
-      bool clWaitSilentDue = false;
-      if (hasSignal) {
-        clWaitSilentSinceMs = 0;
-      } else if (gDoor.doorState() != DoorState::CLOSED) {
-        if (clWaitSilentSinceMs == 0) clWaitSilentSinceMs = millis();
-        clWaitSilentDue = (millis() - clWaitSilentSinceMs) >= LEAVING_CLOSE_MS;
+      if (!clInited || seen != clPrevSeen || (seen && abs(r - clPrevRssi) >= 3) ||
+          (!seen && clPrevSeen)) {
+        observeSignal(hasSignal, hasSignal ? r : 0);
       }
-      bool clLeaveTimeoutDue =
-          clPhase == ClPhase::LEAVING && clLeaveEnterMs != 0 &&
-          (millis() - clLeaveEnterMs) >= LEAVING_CLOSE_MS;
+      if (!seen) observeSignal(false, 0);
 
-      // 远信号连续计数：即使 rssi 变化 <5dB 也要评估（防漏掉 -90 边沿）
-      bool farEdge = (isFar != (clPrevRssi > -999 && clPrevRssi <= RSSI_FAR_CLOSE &&
-                                 clPrevRssi >= RSSI_APPEAR_MIN));
-      bool edge = !clInited || (seen != clPrevSeen) ||
-                  (seen && abs(r - clPrevRssi) >= 5) || farEdge ||
-                  (clPhase == ClPhase::LEAVING && seen) || clLeaveTimeoutDue ||
-                  clWaitSilentDue;
-      if (!edge) {
-        // 无边沿只打周期日志
-      } else {
-        clInited = true;
-        clPrevSeen = seen;
-        clPrevRssi = r;
+      const bool closeDue = shouldCloseBySignal(hasSignal, isFar);
 
-        if (millis() - lastClLogMs >= 2000 || clWaitSilentDue) {
-          lastClLogMs = millis();
-          const char* phaseName =
-              clPhase == ClPhase::WAIT_SIGNAL ? "WAIT" :
-              clPhase == ClPhase::APPEARING   ? "APPEAR" :
-              clPhase == ClPhase::STRONG      ? "STRONG" : "LEAVE";
-          Serial.printf("[CLASSIC] rssi=%d seen=%d strong=%d far=%d lost=%d phase=%s%s\n",
-                        r, (int)hasSignal, (int)isStrong, (int)isFar, (int)lost,
-                        phaseName, clWaitSilentDue ? " [silent]" : "");
-        }
+      clInited = true;
+      clPrevSeen = seen;
+      clPrevRssi = r;
 
-        switch (clPhase) {
-          case ClPhase::WAIT_SIGNAL:
-            clFarStreak = 0;
-            clLeaveEnterMs = 0;
-            if (gDoor.doorState() != DoorState::CLOSED && !hasSignal && clWaitSilentDue) {
-              Serial.println("[FSM] C WAIT 无信号超时 → 关门（车已离开）");
-              if (tryCloseIfOpen("经典WAIT无信号")) clWaitSilentSinceMs = 0;
-              break;
-            }
-            if (hasSignal) {
-              Serial.printf("[FSM] C 无→有 rssi=%d，自动开（宽松观察）\n", r);
-              autoOpenThenArm("经典无→有");
-              clPhase = ClPhase::APPEARING;
-            }
+      if (millis() - lastClLogMs >= 2000) {
+        lastClLogMs = millis();
+        Serial.printf(
+            "[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d\n",
+            r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
+            (int)gLeaveQual, (int)clPhase);
+      }
+
+      switch (clPhase) {
+        case ClPhase::WAIT_SIGNAL:
+          if (hasSignal && gTrueNo) {
+            Serial.printf("[FSM] C 真无→有 rssi=%d，发开码\n", r);
+            gTrueNo = false;
+            autoOpenThenArm("经典真无→有");
+            clPhase = ClPhase::APPEARING;
             break;
+          }
+          if (closeDue) {
+            Serial.println("[FSM] C WAIT 离场条件 → 发关码");
+            tryCloseIfOpen("经典WAIT离场");
+          }
+          break;
 
-          case ClPhase::APPEARING:
-            clFarStreak = 0;
-            clLeaveEnterMs = 0;
-            if (isStrong) {
-              autoOpenThenArm("经典无→有→强");
-              clPhase = ClPhase::STRONG;
-            } else if (lost) {
-              Serial.println("[FSM] C 弱信号消失，尝试关门");
-              if (tryCloseIfOpen("经典有→无(未进库)")) {
-                clPhase = ClPhase::WAIT_SIGNAL;
-                clWaitSilentSinceMs = 0;
-              } else {
-                clPhase = ClPhase::LEAVING;
-                clLeaveEnterMs = millis();
-              }
-            }
+        case ClPhase::APPEARING:
+          if (isStrong) {
+            autoOpenThenArm("经典有→强");
+            clPhase = ClPhase::STRONG;
             break;
+          }
+          if (closeDue) {
+            Serial.println("[FSM] C APPEAR 离场条件 → 发关码");
+            tryCloseIfOpen("经典APPEAR离场");
+            clPhase = ClPhase::WAIT_SIGNAL;
+            break;
+          }
+          if (lost) clPhase = ClPhase::WAIT_SIGNAL;
+          break;
 
-          case ClPhase::STRONG:
-            clFarStreak = 0;
-            if (!isStrong && hasSignal) {
-              clPhase = ClPhase::LEAVING;
-              clLeaveEnterMs = millis();
-              Serial.println("[FSM] C 强→弱，判定离开 → 尝试关");
-              if (tryCloseIfOpen("经典强→弱离开")) {
-                clPhase = ClPhase::WAIT_SIGNAL;
-                clLeaveEnterMs = 0;
-                clWaitSilentSinceMs = 0;
-              }
-            } else if (lost) {
-              Serial.println("[FSM] C 强信号消失，尝试关门");
-              if (tryCloseIfOpen("经典强→无")) {
-                clPhase = ClPhase::WAIT_SIGNAL;
-                clLeaveEnterMs = 0;
-                clWaitSilentSinceMs = 0;
-              } else {
-                clPhase = ClPhase::LEAVING;
-                clLeaveEnterMs = millis();
-              }
-            }
+        case ClPhase::STRONG:
+          if (closeDue) {
+            Serial.println("[FSM] C STRONG 离场条件 → 发关码");
+            tryCloseIfOpen("经典STRONG离场");
+            clPhase = ClPhase::WAIT_SIGNAL;
             break;
+          }
+          if (!isStrong && hasSignal) {
+            clPhase = ClPhase::LEAVING;
+          } else if (lost) {
+            clPhase = ClPhase::WAIT_SIGNAL;
+          }
+          break;
 
-          case ClPhase::LEAVING:
-            if (isStrong) {
-              clPhase = ClPhase::STRONG;
-              clLeaveEnterMs = 0;
-              clWaitSilentSinceMs = 0;
-              Serial.println("[FSM] C 弱→强，取消离开");
-              break;
-            }
-            if (clLeaveTimeoutDue || clWaitSilentDue || lost || isFar) {
-              Serial.println("[FSM] C LEAVING → 关门重试");
-              if (tryCloseIfOpen("经典离开/无信号重试")) {
-                clPhase = ClPhase::WAIT_SIGNAL;
-                clLeaveEnterMs = 0;
-                clWaitSilentSinceMs = 0;
-                clFarStreak = 0;
-              } else if (clLeaveEnterMs) {
-                clLeaveEnterMs = millis();
-              }
-            }
+        case ClPhase::LEAVING:
+          if (isStrong) {
+            clPhase = ClPhase::STRONG;
+            gLeaveQual = false;
+            gRssiTrend.clear();
+            Serial.println("[FSM] C 弱→强，取消离开");
             break;
-        }
+          }
+          if (closeDue) {
+            Serial.println("[FSM] C LEAVING 离场条件 → 发关码");
+            tryCloseIfOpen("经典LEAVING离场");
+            clPhase = ClPhase::WAIT_SIGNAL;
+            break;
+          }
+          if (hasSignal) clPhase = ClPhase::STRONG;
+          break;
       }
     }
   }
@@ -1166,9 +1281,12 @@ void loop() {
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 8000) {
     lastLog = millis();
-    Serial.println("[LOG] " + gDoor.debugLine() + " | " + gBt.debugLine() +
-                   " | ble_rssi=" + String(gBleScan.matchRssi()) +
-                   " bond=" + String(gBleBond.hasIrk() ? "Y" : "N") + " | " +
-                   gNfc.debugLine());
+    // 串口缓冲不空闲就跳过周期日志，避免 TX 满时 println 拖死 loop
+    if (Serial.availableForWrite() > 128) {
+      Serial.println("[LOG] " + gDoor.debugLine() + " | " + gBt.debugLine() +
+                     " | ble_rssi=" + String(gBleScan.matchRssi()) +
+                     " bond=" + String(gBleBond.hasIrk() ? "Y" : "N") + " | " +
+                     gNfc.debugLine());
+    }
   }
 }

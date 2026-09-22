@@ -49,6 +49,37 @@ cd D:\mimo\车库门自动化\garage_door_firmware
 & $env:MIMO_PYTHON -m platformio device monitor -b 115200 -p COM3
 ```
 
+## 在线升级（桌面 OTA 客户端）
+
+**前置**：网页「家庭 Wi‑Fi」已填 2.4G SSID/密码，首页显示 `OTA: garage-xxxx.local`；设备与电脑同一局域网。
+
+1. 先用 USB 烧一次带 `/ota` 与 `FW_VERSION` 的新固件（之后才能读版本号）
+2. 双击 `tools\OTA升级.vbs`（或 `OTA升级.bat`）
+3. 填 `xxxx`（或完整主机名 / STA IP）→ **检测在线**
+4. 看状态：在线、固件版本、OTA 服务、能否更新
+5. **先编译**（或选已有 `firmware.bin`）→ **开始更新**
+6. 进度走完后客户端会轮询设备恢复；成功则显示新版本号
+
+| 字段 | 说明 |
+|---|---|
+| 固件版本 | 来自 `config.h` 的 `FW_VERSION`（改版本再编译，升级后才好区分） |
+| 编译时间 | 设备内嵌的 `__DATE__ __TIME__` |
+| 能否更新 | STA 已连 + ArduinoOTA 已 begin（或 TCP 3232 通） |
+| 接口 | 新固件 `GET /ota` JSON；旧固件回退探测首页 |
+
+命令行等价：
+
+```powershell
+# 改 platformio.ini 里 upload_port，或：
+& $env:MIMO_PYTHON -m platformio run -e esp32dev_ota -t upload --upload-port garage-xxxx.local
+```
+
+版本号由 `tools/bump_version.py` 在**每次编译前**自动写入 `src/fw_version.h`：
+
+- 格式：`0.2.YYYYMMDDHHmm`（例：`0.2.202609221831`）
+- 时间 = `src/` 下源码最新 mtime → **改过代码再编译才会升号**
+- 不要手改 `fw_version.h` / 也不要再在 `config.h` 写死 `FW_VERSION`
+
 ## 配置方式
 
 1. 连热点 `GarageDoor-xxxx` / 密码 `12345678`
