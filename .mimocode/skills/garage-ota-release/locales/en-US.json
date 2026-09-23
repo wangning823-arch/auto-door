@@ -1,0 +1,4 @@
+{
+  "displayName": "Garage OTA Release",
+  "brief": "Publish firmware to the VPS, trigger online OTA, and debug via remote logs"
+}
