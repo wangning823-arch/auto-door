@@ -17,8 +17,8 @@ ui_password
 *.key
 id_*
 
-# 固件工程是独立 git 仓库，不在父仓库重复跟踪
-garage_door_firmware/
+# 固件构建产物（源码本身在 monorepo 里跟踪）
+garage_door_firmware/.pio/
 
 # 3D 外壳本地素材
 外壳安装3D/

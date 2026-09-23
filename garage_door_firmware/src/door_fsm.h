@@ -1,0 +1,75 @@
+#pragma once
+#include <Arduino.h>
+#include "ble_tracker.h"
+#include "config.h"
+
+enum class DoorState : uint8_t { UNKNOWN = 0, CLOSED, OPEN };
+enum class OpenSource : uint8_t {
+  NONE = 0,
+  AUTO,
+  NFC,
+  MIAO,
+  REMOTE,
+  UNKNOWN_SRC,
+};
+
+enum class DoorAction : uint8_t { NONE = 0, PULSE_OPEN, PULSE_CLOSE };
+
+class DoorFsm {
+ public:
+  // RF 发射回调：open=true 发「开/上」键，false 发「关/下」键；返回是否已发
+  using RfEmitFn = bool (*)(bool open);
+
+  void begin();
+  void loop(BleTracker& bt);
+
+  DoorState doorState() const { return doorState_; }
+  OpenSource openSource() const { return openSource_; }
+
+  void setRfEmit(RfEmitFn fn) { rfEmit_ = fn; }
+
+  // 外部触发：NFC / TRIG(米家) / 串口 — 每次都立刻发 RF，不受自动门冷却影响
+  void requestManualToggle(OpenSource src);
+  void requestManualOpen(OpenSource src);
+  void requestManualClose(OpenSource src);
+  void setHoldOpen(bool hold) { holdOpen_ = hold; }
+
+  // 自动开/关：开/关为不同 RF 码，不依赖门磁，只按软件状态+冷却发码
+  bool tryAutoOpen(const char* why);
+  bool tryAutoClose(const char* why);
+  bool canAutoOpenNow() const;
+  bool canAutoCloseNow() const;
+  uint32_t lastAutoOpenTs() const { return lastAutoOpenTs_; }
+  uint32_t lastAutoCloseTs() const { return lastAutoCloseTs_; }
+
+  // 运行时改继电器脚（串口 pin 21/26/13/...）
+  void setRelayPin(int pin);
+  int relayPin() const { return relayPin_; }
+
+  DoorAction consumeAction();
+  String debugLine() const;
+
+ private:
+  void pulseRelay();
+  void emitOpen();
+  void emitClose();
+
+  int relayPin_ = PIN_RELAY;
+  RfEmitFn rfEmit_ = nullptr;
+
+  DoorState doorState_ = DoorState::UNKNOWN;
+  OpenSource openSource_ = OpenSource::NONE;
+  DoorAction pending_ = DoorAction::NONE;
+
+  // 手动指令以「上次发出的开/关码」翻转，避免 doorState 误判导致连发开码
+  enum class LastCmd : uint8_t { NONE = 0, OPEN, CLOSE };
+  LastCmd lastCmd_ = LastCmd::NONE;
+  // 仅屏蔽自动「开」：手动关后不被无→有顶开；手动开后仍允许离场自动关
+  uint32_t suppressAutoOpenUntil_ = 0;
+
+  uint32_t doorOpenTs_ = 0;
+  uint32_t lastAutoOpenTs_ = 0;
+  uint32_t lastAutoCloseTs_ = 0;
+  uint32_t lastAnyActionTs_ = 0;
+  bool holdOpen_ = false;
+};
