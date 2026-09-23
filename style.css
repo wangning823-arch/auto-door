@@ -1,0 +1,134 @@
+:root {
+  --bg: #0f1419;
+  --card: #1a2332;
+  --ink: #e7ecf1;
+  --muted: #8b9aab;
+  --line: #2e3d52;
+  --open: #1f9d55;
+  --open-press: #177a42;
+  --close: #c45c26;
+  --close-press: #9a471b;
+  --primary: #2f80ed;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  min-height: 100%;
+}
+
+.wrap {
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 24px 16px calc(32px + env(safe-area-inset-bottom));
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 1.35rem;
+  font-weight: 650;
+}
+
+.sub {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  min-height: 1.2em;
+}
+
+.card {
+  background: var(--card);
+  border-radius: 14px;
+  padding: 18px 16px 20px;
+  margin-bottom: 14px;
+}
+
+.hidden { display: none !important; }
+
+label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+input[type="password"] {
+  width: 100%;
+  padding: 14px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 1.05rem;
+  margin-bottom: 12px;
+}
+
+.btn {
+  width: 100%;
+  border: 0;
+  border-radius: 12px;
+  padding: 16px;
+  font-size: 1.15rem;
+  font-weight: 650;
+  color: #fff;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.btn:active { transform: scale(0.98); }
+
+.btn.primary {
+  background: var(--primary);
+  margin-bottom: 8px;
+}
+
+.btn.sec {
+  background: #2a3548;
+  color: #c5d0dc;
+  margin-top: 12px;
+  font-size: 0.95rem;
+  padding: 12px;
+}
+
+.btns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.btn.open {
+  background: var(--open);
+  min-height: 120px;
+  font-size: 1.4rem;
+}
+
+.btn.open:active { background: var(--open-press); }
+
+.btn.close {
+  background: var(--close);
+  min-height: 120px;
+  font-size: 1.4rem;
+}
+
+.btn.close:active { background: var(--close-press); }
+
+.btn:disabled {
+  opacity: 0.5;
+  transform: none;
+}
+
+.tip {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.tip.ok { color: #3dd68c; }
+.tip.err { color: #f07178; }

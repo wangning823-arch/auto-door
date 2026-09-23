@@ -1,0 +1,24 @@
+# 本地调试/运行产物，不入库
+__pycache__/
+*.pyc
+*.err
+*.log
+ble_logs/
+drive_test*
+firmware_backup/
+.pio/
+*.bin
+.DS_Store
+Thumbs.db
+
+# 密码/密钥（VPS 上用 ui_password 文件，勿提交）
+ui_password
+*.pem
+*.key
+id_*
+
+# 固件工程是独立 git 仓库，不在父仓库重复跟踪
+garage_door_firmware/
+
+# 3D 外壳本地素材
+外壳安装3D/
