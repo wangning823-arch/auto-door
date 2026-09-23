@@ -24,6 +24,30 @@
 #define PIN_TRIG_IN 25
 #endif
 
+// ===== 远程令：VPS 轮询（蓝牙空隙才访问 WiFi）=====
+// 改成你的 VPS：仅 443 对外 → https://door.wzx.homes/dev/poll
+#ifndef REMOTE_POLL_URL
+#define REMOTE_POLL_URL "https://door.wzx.homes/dev/poll"
+#endif
+// HTTPS MVP：跳过证书校验（后续可换成 CA）；0 则要求证书有效
+#ifndef REMOTE_HTTP_INSECURE
+#define REMOTE_HTTP_INSECURE 1
+#endif
+// TLS 握手需要时间；过短会导致连不上 nginx
+#ifndef REMOTE_POLL_TIMEOUT_MS
+#define REMOTE_POLL_TIMEOUT_MS 5000
+#endif
+// 轮询周期须明显小于服务端 TTL（8s），留出蓝牙空隙
+#ifndef REMOTE_POLL_INTERVAL_MS
+#define REMOTE_POLL_INTERVAL_MS 3000
+#endif
+#ifndef REMOTE_CMD_ENABLE_DEFAULT
+#define REMOTE_CMD_ENABLE_DEFAULT 0
+#endif
+#ifndef REMOTE_BT_GAP_MIN_MS
+#define REMOTE_BT_GAP_MIN_MS 100
+#endif
+
 // 学习/配对实体键（上拉，按下=低）
 #ifndef PIN_LEARN_BTN
 #define PIN_LEARN_BTN 0
@@ -42,6 +66,20 @@
 // 433MHz 发射模块 DATA（学习回放用）
 #ifndef PIN_RF_TX
 #define PIN_RF_TX 26
+#endif
+
+// ===== RF 发射安全（防整夜发射堵死门机遥控）=====
+// rfauto 仅允许短时联调；到时自动 OFF 并写回 NVS
+#ifndef RF_AUTO_MAX_MS
+#define RF_AUTO_MAX_MS 120000UL  // 2 分钟
+#endif
+// 空闲时 TX 被拉高超过此时长 → 视为卡死，强制拉低
+#ifndef RF_TX_STUCK_MS
+#define RF_TX_STUCK_MS 80UL
+#endif
+// 上电不从 NVS 恢复 rfauto（旧固件曾因工具自动 rfauto on 整夜发射）
+#ifndef RF_AUTO_RESTORE_ON_BOOT
+#define RF_AUTO_RESTORE_ON_BOOT 0
 #endif
 
 // ===== 固定码多键学习回放（315/433 遥控）=====

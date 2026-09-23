@@ -12,6 +12,7 @@
 #include "nfc_reader.h"
 #include "default_rf_keys.h"
 #include "ble_bond.h"
+#include "remote_cmd.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -131,6 +132,21 @@ static void serviceBtStackInit() {
 
 static bool rfSaveKeyCb(int idx, const char* csv) {
   return gCfg.saveRfKey(idx, csv);
+}
+
+// 远程令 → 与 TRIG 相同出口（MIAO 手动 toggle）
+static void onRemoteCmd(const char* cmd) {
+  if (!cmd) return;
+  if (strcmp(cmd, "open") == 0) {
+    // MVP：语音「打开车库」→ 与 TRIG 一致用 toggle，避免 doorState 误判卡死
+    gDoor.requestManualToggle(OpenSource::MIAO);
+    Serial.println("[REMOTE] open -> MIAO toggle");
+  } else if (strcmp(cmd, "close") == 0) {
+    gDoor.requestManualClose(OpenSource::MIAO);
+    Serial.println("[REMOTE] close -> MIAO close");
+  } else if (strcmp(cmd, "toggle") == 0) {
+    gDoor.requestManualToggle(OpenSource::MIAO);
+  }
 }
 
 static bool rfEmitDoor(bool open) {
@@ -285,25 +301,72 @@ static void rfPrintKeys() {
 
 // rfauto：周期自动发开门码。
 // 注意：rfcap 开头不再强制发射——否则会和「按真实遥控」抢窗口、也容易 1s 内收尾。
+// 安全：短时联调用；超时自动 OFF。整夜 rfauto 会把 315/433 接收机堵死，
+// 表现为原遥控/刷卡都开不了门，拔掉 ESP32 才恢复。
 static bool gRfAutoTx = false;
 static uint32_t gRfAutoNextMs = 0;
+static uint32_t gRfAutoOnSinceMs = 0;
 static const uint32_t RF_AUTO_INTERVAL_MS = 5000;
+
+static void rfAutoTxForceOff(const char* why) {
+  if (!gRfAutoTx && gCfg.loadRfAuto(false)) {
+    gCfg.saveRfAuto(false);
+  }
+  gRfAutoTx = false;
+  gRfAutoOnSinceMs = 0;
+  Serial.printf("[RF] rfauto OFF (%s)\n", why ? why : "?");
+}
 
 static void rfAutoTxFire(const char* why) {
   if (!gRfAutoTx) return;
   if (!gRf.keyValid(RF_KEY_OPEN)) {
     Serial.println("[RF] AUTO TX 失败：key0 未学习");
+    rfAutoTxForceOff("key0 invalid");
     return;
   }
   gRfAutoNextMs = millis() + RF_AUTO_INTERVAL_MS;
-  Serial.printf("[RF] AUTO TX open (%s) GPIO26...\n", why);
+  Serial.printf("[RF] AUTO TX open (%s) GPIO%d...\n", why, PIN_RF_TX);
   gRf.playKey(RF_KEY_OPEN);
 }
 
 static void rfAutoTxService() {
   if (!gRfAutoTx) return;
+  // 联调窗口超时：自动关并落盘，防止无人值守整夜发码
+  if (gRfAutoOnSinceMs != 0 &&
+      (millis() - gRfAutoOnSinceMs) >= RF_AUTO_MAX_MS) {
+    rfAutoTxForceOff("session timeout");
+    return;
+  }
   if (!millisReached(millis(), gRfAutoNextMs)) return;
   rfAutoTxFire("interval");
+}
+
+// TX 卡死看门狗：非发射窗口内 DATA 仍为高 → 强制拉低（防载波堵死门机）
+static void serviceRfTxSafety() {
+  static uint32_t highSinceMs = 0;
+  static uint32_t lastLogMs = 0;
+  if (gRf.txBusy()) {
+    highSinceMs = 0;
+    return;
+  }
+  if (digitalRead(PIN_RF_TX) == HIGH) {
+    if (highSinceMs == 0) {
+      highSinceMs = millis();
+      return;
+    }
+    if ((millis() - highSinceMs) >= RF_TX_STUCK_MS) {
+      gRf.forceTxLow();
+      uint32_t now = millis();
+      if (now - lastLogMs > 2000) {
+        lastLogMs = now;
+        Serial.printf("[RF][SAFE] TX=GPIO%d 空闲期持续高电平 → 已拉低（防堵门机）\n",
+                      PIN_RF_TX);
+      }
+      highSinceMs = 0;
+    }
+  } else {
+    highSinceMs = 0;
+  }
 }
 
 // 运行中长按 BOOT(GPIO0) 3s：强制开 SoftAP
@@ -421,6 +484,10 @@ static void handleSerial() {
                       ok2 ? "OK" : "FAIL",
                       WiFi.softAPIP().toString().c_str(),
                       WiFi.softAPgetStationNum());
+      } else if (line == "remote on") {
+        remoteCmdSetEnabled(true);
+      } else if (line == "remote off") {
+        remoteCmdSetEnabled(false);
       } else if (line == "wifi status") {
         Serial.printf("[CMD] mode=%d ap=%s ip=%s sta=%d apmac=%s heap=%u bt=%d\n",
                       (int)WiFi.getMode(), gWeb.apSsid().c_str(),
@@ -586,15 +653,16 @@ static void handleSerial() {
         rest.trim();
         rest.toLowerCase();
         if (rest == "off" || rest == "0") {
-          gRfAutoTx = false;
-          gCfg.saveRfAuto(false);
+          rfAutoTxForceOff("serial");
           Serial.println("[RF] rfauto OFF（已保存）");
         } else {
           gRfAutoTx = true;
           gRfAutoNextMs = millis();
+          gRfAutoOnSinceMs = millis();
           gCfg.saveRfAuto(true);
-          Serial.printf("[RF] rfauto ON：每 %ums 发 key0(open)，已写入 NVS\n",
-                        (unsigned)RF_AUTO_INTERVAL_MS);
+          Serial.printf(
+              "[RF] rfauto ON：每 %ums 发 key0，最长 %ums 后自动 OFF（防堵门机）\n",
+              (unsigned)RF_AUTO_INTERVAL_MS, (unsigned)RF_AUTO_MAX_MS);
           rfAutoTxFire("rfauto-on");
         }
       } else if (line.startsWith("rfbench")) {
@@ -791,7 +859,7 @@ static void handleSerial() {
         Serial.println("[NFC] 已清除授权卡");
       } else if (line == "help") {
         Serial.println(
-            "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
+            "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off (max 2min) | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
             "rfexport | rfclear | rfdefaults | i2cscan | i2cscan2 | buspull | busfree | sclhold | sclrelease | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off | blebond | blepair [sec] | bleunpair");
       } else if (line == "rfdefaults") {
         // 强制写入实车验证的开/关码（修第二块板开码不对）
@@ -831,7 +899,17 @@ void setup() {
                 (unsigned)millis());
 
   gDoor.begin();
+  // 尽早钳位 RF TX，避免上电到 gRf.begin 之间脚位浮空乱发
+  pinMode(PIN_RF_TX, OUTPUT);
+  digitalWrite(PIN_RF_TX, LOW);
+  remoteCmdSetHandler(onRemoteCmd);
   gCfg.begin();
+  remoteCmdBegin(&gCfg);
+  if (gCfg.loadRemote(false)) {
+    remoteCmdSetEnabled(true);
+  } else {
+    Serial.println("[REMOTE] NVS off — 串口 remote on 开启并保存");
+  }
   gRf.begin(PIN_RF_DATA, PIN_RF_TX);
   gRf.setIdleHook(rfAutoTxService);
   gDoor.setRfEmit(rfEmitDoor);
@@ -869,14 +947,19 @@ void setup() {
     }
   }
 
-  // 上电恢复 rfauto（防止 RF.bat 连串口复位后丢掉周期发射）
-  gRfAutoTx = gCfg.loadRfAuto(false);
-  if (gRfAutoTx) {
-    gRfAutoNextMs = millis() + 1000;
-    Serial.println("[BOOT] rfauto=ON（NVS），每 5s 自动发 key0");
+  // 上电：默认不恢复 rfauto。旧工具会自动 rfauto on 并写 NVS，
+  // 整夜每 5s 发码会堵死门机接收（原遥控/刷卡全失效，拔电才恢复）。
+  gRfAutoTx = false;
+  gRfAutoOnSinceMs = 0;
+  if (gCfg.loadRfAuto(false)) {
+    gCfg.saveRfAuto(false);
+    Serial.println(
+        "[BOOT][WARN] 发现 NVS rfauto=ON → 已强制 OFF 并清除"
+        "（避免整夜发射干扰门机；联调请手动 rfauto on，2 分钟自动关）");
   } else {
-    Serial.println("[BOOT] rfauto=OFF，串口: rfauto on 可开启并保存");
+    Serial.println("[BOOT] rfauto=OFF，串口: rfauto on 可开启（限时）");
   }
+  gRf.forceTxLow();
 
   // SoftAP/HTTP 必须先起；NFC 绝不能挡启动
   String saved = gCfg.loadMac(CAR_BT_MAC);
@@ -995,11 +1078,19 @@ void loop() {
   serviceBootLongPress();
   handleSerial();
   rfAutoTxService();
+  serviceRfTxSafety();
   // 先跑蓝牙调度，再跑 NFC：避免 I2C 抢在 Inquiry/BLE 之前占满 loop
   serviceBtStackInit();
   if (gBtStackInited) {
     gBt.loop();
     gBleBond.service();
+  }
+
+  // 远程令：蓝牙忙（Inquiry/BLE 扫描）绝不发 HTTP；STA 已连才轮询
+  {
+    const bool btBusy =
+        gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
+    remoteCmdService(btBusy, gWeb.staConnected());
   }
 
   // ===== NFC 与 WiFi/蓝牙的共存策略 =====

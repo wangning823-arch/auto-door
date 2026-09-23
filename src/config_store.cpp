@@ -132,6 +132,16 @@ bool ConfigStore::saveRfAuto(bool on) {
   return prefs.putBool("rf_auto", on);
 }
 
+bool ConfigStore::loadRemote(bool defaultOn) {
+  if (!ready_) return defaultOn;
+  return prefs.getBool("remote_on", defaultOn);
+}
+
+bool ConfigStore::saveRemote(bool on) {
+  if (!ready_) return false;
+  return prefs.putBool("remote_on", on);
+}
+
 bool ConfigStore::loadAutoTrack(bool defaultOn) {
   if (!ready_) return defaultOn;
   return prefs.getBool("auto_trk", defaultOn);

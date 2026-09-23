@@ -370,13 +370,13 @@ class RfCaptureApp:
         if first:
             self.status.set(self.status.get().replace("（等待固件 ready…）", "") + " 就绪")
             self.log(f"[*] 固件就绪（{why}），点「开始抓包」持续听，点「停止抓包」结束")
-            # 复位后 rfauto 可能丢；就绪后自动打开（固件也会从 NVS 恢复）
+            # 安全：绝不自动 rfauto on —— 整夜每 5s 发码会堵死门机遥控
             try:
-                self.ser.write(b"rfauto on\n")
+                self.ser.write(b"rfauto off\n")
                 self.ser.flush()
-                self.log("[*] 已自动发送 rfauto on（每 5s 发开门码）")
+                self.log("[*] 已确保 rfauto off（需要测发射时再手动点/发 rfauto on，2 分钟自动关）")
             except Exception as e:
-                self.log(f"[WARN] 自动 rfauto on 失败: {e}")
+                self.log(f"[WARN] 发送 rfauto off 失败: {e}")
 
     def _on_boot_ready(self):
         self._probe_ready()

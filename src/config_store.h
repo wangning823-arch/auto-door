@@ -41,6 +41,10 @@ class ConfigStore {
   bool loadRfAuto(bool defaultOn = false);
   bool saveRfAuto(bool on);
 
+  // 远程令 VPS 轮询开关（默认关；remote on/off 写入）
+  bool loadRemote(bool defaultOn = false);
+  bool saveRemote(bool on);
+
   // 经典蓝牙周期 Inquiry（默认：经典模式=开，BLE模式=关）
   bool loadAutoTrack(bool defaultOn);
   bool saveAutoTrack(bool on);

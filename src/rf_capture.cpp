@@ -65,7 +65,15 @@ void RfCapture::begin(int rxPin, int txPin) {
   pinMode(rxPin_, INPUT);
   pinMode(txPin_, OUTPUT);
   digitalWrite(txPin_, LOW);
+  txBusy_ = false;
   for (int i = 0; i < RF_KEY_COUNT; i++) keyLen_[i] = 0;
+}
+
+void RfCapture::forceTxLow() {
+  if (txPin_ < 0) return;
+  if (txBusy_) return;  // 合法发射中不打断
+  pinMode(txPin_, OUTPUT);
+  digitalWrite(txPin_, LOW);
 }
 
 // warmupMs：学习时先丢弃模块预热噪声；learnMode：最短监听结束前不许提前收尾
@@ -569,6 +577,7 @@ bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
   pinMode(txPin_, OUTPUT);
   digitalWrite(txPin_, LOW);
   delayMicroseconds(100);
+  txBusy_ = true;
 
   for (uint8_t r = 0; r < repeats; r++) {
     for (uint16_t i = 0; i < n; i++) {
@@ -590,6 +599,7 @@ bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
     if (r + 1 < repeats) delayMicroseconds(RF_FRAME_GAP_US);
   }
   digitalWrite(txPin_, LOW);
+  txBusy_ = false;
   if (Serial.availableForWrite() > 32) {
     Serial.printf("[RF] 发射完成 TX=GPIO%d x%u 帧, %u 脉冲\n", txPin_,
                   repeats, n);
@@ -606,6 +616,7 @@ bool RfCapture::carrierLoopback(uint32_t carrierMs) {
                 txPin_, rxPin_, carrierMs);
   pinMode(txPin_, OUTPUT);
   digitalWrite(txPin_, LOW);
+  txBusy_ = true;
 
   rfIdx = 0;
   rfCapturing = true;
@@ -625,6 +636,7 @@ bool RfCapture::carrierLoopback(uint32_t carrierMs) {
   digitalWrite(txPin_, HIGH);
   delay(carrierMs);
   digitalWrite(txPin_, LOW);
+  txBusy_ = false;
 
   uint32_t waitStart = millis();
   while (rfCapturing && (millis() - waitStart) < 600) {
@@ -669,9 +681,11 @@ void RfCapture::carrierTest(uint32_t ms) {
   pinMode(txPin_, OUTPUT);
   Serial.printf("[RF] carrier: GPIO%d HIGH %ums（万用表测 DATA 应≈3.3V）\n",
                 txPin_, ms);
+  txBusy_ = true;
   digitalWrite(txPin_, HIGH);
   delay(ms);
   digitalWrite(txPin_, LOW);
+  txBusy_ = false;
   Serial.println("[RF] carrier done, GPIO low");
 }
 

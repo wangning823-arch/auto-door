@@ -100,12 +100,24 @@ cd D:\mimo\车库门自动化\garage_door_firmware
 
 原因：ESP32 单射频；手机**关联完成前** `softAPgetStationNum()` 常为 0，旧逻辑只在「已有客户端」时降级蓝牙，导致热点「时有时无、连上打不开网页」。测自动门仍应关掉 SoftAP。
 
+## RF 发射安全（防堵门机）
+
+| 机制 | 行为 |
+|---|---|
+| 上电不恢复 `rfauto` | NVS 若为 ON → **强制 OFF 并清除** |
+| `rfauto` 会话超时 | `RF_AUTO_MAX_MS`（默认 120s）到时自动 OFF |
+| TX 卡死看门狗 | 空闲期 DATA 持续高电平 `RF_TX_STUCK_MS` → 强制拉低 |
+| 抓包工具 | 就绪后发 `rfauto off`，**不再**自动 `rfauto on` |
+
+现象复盘：抓包工具自动 `rfauto on` 写 NVS → 上电恢复 → 整夜每 5s 发 315 开码 → 门机接收被堵 → 原遥控只能贴很近、刷卡也失效；拔掉 ESP32 即恢复。
+
 ## 串口命令
 
 ```
 status          查看状态
 open / close    手动开关
-rfauto on|off   周期自动发开码（默认应 OFF）
+rfauto on|off   周期自动发开码（默认 OFF；最长 2 分钟自动关）
+                ⚠ 整夜开着会用 315/433 堵死门机接收：原遥控/刷卡全失效，拔 ESP32 才恢复
 rflearn 0-3     学习按键（0开 1关 2暂停 3锁）
 rfplay 0-3      回放按键
 rfset 0 <csv>   手动灌码
@@ -122,7 +134,18 @@ bleunpair       清除已授权手机
 blepin xxx      设置/清空配对密码（网页开窗时校验；空参数=清除）
 autotrack on/off 经典蓝牙自动跟踪
 wifi on/off     WiFi 开关
+remote on/off   VPS 轮询远程开（蓝牙空隙才访问 WiFi）
 ```
+
+### 远程令 MVP（小爱 → VPS → ESP32）
+
+- 服务端：线上 `https://door.wzx.homes`（VPS 上 `garage-gate` + nginx 反代 `127.0.0.1:18080`）
+- **MCP**：`https://door.wzx.homes/mcp`（Streamable HTTP POST + 旧 SSE GET）；工具 `open_garage` / `close_garage` / `garage_status`
+- 本地调试服务端：`../vps/garage_gate.py`（Python3 标准库，零依赖）
+- 固件轮询：`src/remote_cmd.*`；**默认关**，串口 `remote on` 打开
+- `config.h` 已默认 `REMOTE_POLL_URL=https://door.wzx.homes/dev/poll`（HTTPS，MVP `REMOTE_HTTP_INSECURE=1`）
+- 蓝牙优先：Inquiry / BLE 扫描进行中**绝不**发 HTTP；STA 已连才轮询
+- 冒烟：`curl -X POST https://door.wzx.homes/xiaoai/open` 后设备应打出 `[REMOTE] cmd=open`
 
 ## 调试工具
 

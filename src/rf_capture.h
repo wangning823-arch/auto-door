@@ -63,12 +63,18 @@ class RfCapture {
   // RX 预热后，TX 持续高电平 carrierMs，同步抓包看能否收到
   bool carrierLoopback(uint32_t carrierMs = 800);
 
+  // 安全：强制 TX 拉低（开机/卡死恢复）
+  void forceTxLow();
+  // 是否正在合法发射（play/carrier 期间为 true）
+  bool txBusy() const { return txBusy_; }
+
   int rxPin() const { return rxPin_; }
   int txPin() const { return txPin_; }
 
  private:
   int rxPin_ = -1;
   int txPin_ = -1;
+  volatile bool txBusy_ = false;
 
   uint16_t pulses_[RF_CAPTURE_MAX_PULSES];
   uint16_t count_ = 0;
