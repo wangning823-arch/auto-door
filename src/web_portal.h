@@ -20,6 +20,8 @@ class WebPortal {
   bool apActive() const { return apActive_; }
   bool startAp();
   void stopAp();
+  // HTTP 里只打标记；真正 stopAp 放到 loop，避免在回调里改 WiFi 导致复位
+  void requestStopAp() { stopApPending_ = true; }
 
   // 家庭路由 STA（网页保存后 / 上电自动连；用于 espota 无线烧录）
   void startStaFromStore();
@@ -56,6 +58,7 @@ class WebPortal {
   String apSsid_;
   String host_;  // mDNS / OTA 主机名（小写，无连字符歧义：garage-xxxx）
   bool apActive_ = false;
+  bool stopApPending_ = false;
   bool serverStarted_ = false;
   int trackMode_ = TRACK_MODE_DEFAULT;
   uint32_t apQuietUntilMs_ = 0;

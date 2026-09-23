@@ -119,7 +119,11 @@ String WebPortal::pageHtml() const {
   html += rssi;
   html += F("</span></div><div class=\"row\"><span class=\"k\">信号趋势</span><span class=\"v\">");
   html += trend;
-  html += F("</span></div></div>");
+  html += F("</span></div>"
+            "<a href=\"/rssi\" style=\"display:block;margin-top:10px;text-align:center;"
+            "padding:12px;border-radius:10px;background:#2f80ed;color:#fff;"
+            "text-decoration:none;font-weight:600\">RSSI curve over time</a>"
+            "</div>");
 
   // 家庭 Wi‑Fi（STA）：保存后可从书桌 espota 烧录，不必再拔 USB
   {
@@ -251,13 +255,11 @@ String WebPortal::pageHtml() const {
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
             "<span class=\"v\">WiFi 与蓝牙共用 2.4G</span></div>"
             "<form method=\"GET\" action=\"/wifi/off\">"
-            "<button type=\"submit\" style=\"background:#c0392b\">关闭 WiFi（释放给蓝牙）</button>"
+            "<button type=\"submit\" style=\"background:#c0392b\">关热点（保留家庭 Wi‑Fi 看网页）</button>"
             "</form>"
-            "<div class=\"tip\"><strong>热点打开期间蓝牙会让射频</strong>："
-            "启动约 45 秒 Inquiry/BLE 全停（方便手机关联），之后热点仍开则 Inquiry 保持慢速，"
-            "且<strong>不跑阻塞式 BLE 扫描</strong>——网页才能稳定打开。"
-            "测车来车走自动门时请点关闭 WiFi（或网页已关后断电重开前先把 WIFI_DEBUG_BOOT_ON 设 0）。"
-            "本次关掉后：串口 <code>wifi on</code> 或运行中长按 BOOT 3 秒可立即恢复热点。</div></div>");
+            "<div class=\"tip\"><strong>热点开着时不起蓝牙栈</strong>（防网页/复位问题）。"
+            "点上方关热点后：STA 网页仍可用；约 1.5 秒后自动起经典蓝牙，"
+            "再点「扫描」。自动门同样在关热点后才跑。</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">自动开</span>"
             "<span class=\"v ok\">仅蓝牙渐近</span></div>"
@@ -333,6 +335,87 @@ void WebPortal::setupRoutes() {
     Serial.printf("[WEB] GET /ping from %s\n",
                   server.client().remoteIP().toString().c_str());
     server.send(200, "text/plain", "pong " + String((unsigned)millis()));
+  });
+
+  server.on("/rssi/data", HTTP_GET, []() {
+    if (!gPortal || !gPortal->bt_) {
+      server.send(200, "application/json", "{\"n\":0,\"t\":[],\"r\":[]}");
+      return;
+    }
+    static uint32_t tBuf[BleTracker::TS_N];
+    static int16_t rBuf[BleTracker::TS_N];
+    int n = gPortal->bt_->tsExport(tBuf, rBuf, BleTracker::TS_N);
+    String j;
+    j.reserve((size_t)n * 10 + 80);
+    j += "{\"n\":";
+    j += String(n);
+    j += ",\"t\":[";
+    for (int i = 0; i < n; i++) {
+      if (i) j += ",";
+      j += String(tBuf[i]);
+    }
+    j += "],\"r\":[";
+    for (int i = 0; i < n; i++) {
+      if (i) j += ",";
+      j += String(rBuf[i]);
+    }
+    j += "],\"cur\":";
+    j += String(gPortal->bt_->lastRssi());
+    j += ",\"auto\":";
+    j += gPortal->bt_->autoTrack() ? 1 : 0;
+    j += ",\"target\":";
+    j += gPortal->bt_->hasTarget() ? 1 : 0;
+    j += "}";
+    server.send(200, "application/json", j);
+  });
+
+  server.on("/rssi", HTTP_GET, []() {
+    String h;
+    h.reserve(3200);
+    h += F(
+        "<!DOCTYPE html><html><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>RSSI</title><style>"
+        "body{font-family:system-ui;background:#0f1419;color:#e7ecf1;margin:0;padding:12px}"
+        "a{color:#2f80ed}h1{font-size:18px;margin:0 0 8px}"
+        "#bar{font-size:13px;color:#8b9aab;margin-bottom:8px}"
+        "canvas{width:100%;height:280px;background:#151c26;border-radius:10px;"
+        "border:1px solid #2e3d52}"
+        ".row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}"
+        "button,a.btn{padding:10px 14px;border-radius:8px;border:0;"
+        "background:#2f80ed;color:#fff;font-size:14px;text-decoration:none}"
+        ".sec{background:#2e3d52}</style></head><body>"
+        "<h1>RSSI over time</h1><div id=bar>loading...</div>"
+        "<canvas id=c width=640 height=280></canvas><div class=row>"
+        "<button onclick='tick()'>Refresh</button>"
+        "<a class=btn href=/>Back</a></div><script>"
+        "function draw(d){var c=document.getElementById('c'),x=c.getContext('2d');"
+        "var W=c.width,H=c.height;x.clearRect(0,0,W,H);"
+        "x.strokeStyle='#2e3d52';x.lineWidth=1;"
+        "for(var y=0;y<=4;y++){var py=20+y*(H-40)/4;x.beginPath();"
+        "x.moveTo(40,py);x.lineTo(W-8,py);x.stroke();"
+        "x.fillStyle='#8b9aab';x.font='11px sans-serif';"
+        "x.fillText(String(-40-y*20),4,py+4);}"
+        "var n=d.n||0;document.getElementById('bar').textContent="
+        "'n='+n+' cur='+(d.cur!=null?d.cur:'-')+' auto='+(d.auto||0)"
+        "+' target='+(d.target||0)+(n?' span='+d.t[n-1]+'s':'');"
+        "if(n<2)return;"
+        "var t0=d.t[0],t1=d.t[n-1];if(t1<=t0)t1=t0+1;"
+        "function X(t){return 40+(t-t0)*(W-50)/(t1-t0);}"
+        "function Y(r){if(r<=-127)return H-10;"
+        "var rr=Math.max(-120,Math.min(-40,r));"
+        "return 20+((-40-rr)/80)*(H-40);}"
+        "x.strokeStyle='#3dd68c';x.lineWidth=2;x.beginPath();"
+        "var pen=false;for(var i=0;i<n;i++){"
+        "if(d.r[i]<=-127){pen=false;continue;}"
+        "var px=X(d.t[i]),py=Y(d.r[i]);"
+        "if(!pen){x.moveTo(px,py);pen=true;}else x.lineTo(px,py);}"
+        "x.stroke();}"
+        "function tick(){fetch('/rssi/data').then(function(r){return r.json();})"
+        ".then(draw).catch(function(){"
+        "document.getElementById('bar').textContent='fetch error';});}"
+        "tick();setInterval(tick,2000);</script></body></html>");
+    server.send(200, "text/html; charset=utf-8", h);
   });
 
   server.on("/", HTTP_GET, []() {
@@ -522,6 +605,14 @@ void WebPortal::setupRoutes() {
       j += ",\"auto\":" + String(gPortal->bt_->autoTrack() ? 1 : 0);
       j += ",\"trend\":" + String((int)gPortal->bt_->trend());
       j += ",\"zone\":" + String((int)gPortal->bt_->zone());
+      j += ",\"target\":" + String(gPortal->bt_->hasTarget() ? 1 : 0);
+      j += ",\"inquiry\":" + String(gPortal->bt_->inquiryBusy() ? 1 : 0);
+    }
+    j += ",\"ap\":" + String(gPortal && gPortal->apActive() ? 1 : 0);
+    j += ",\"ap_clients\":" + String(WiFi.softAPgetStationNum());
+    j += ",\"sta\":" + String(gPortal && gPortal->staConnected() ? 1 : 0);
+    if (gPortal && gPortal->staConnected()) {
+      j += ",\"sta_ip\":\"" + gPortal->staIp() + "\"";
     }
     j += "}";
     server.send(200, "application/json", j);
@@ -562,26 +653,24 @@ void WebPortal::setupRoutes() {
   });
 
   server.on("/wifi/off", HTTP_GET, []() {
-    if (gPortal && gPortal->store_) {
-      gPortal->store_->saveWifiEnabled(false);
-    }
+    // 只打标记：禁止在 HTTP 回调里 delay/stopAp（会复位）
     String body =
         F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
           "content='width=device-width,initial-scale=1'>"
           "<body style='font-family:system-ui;background:#0f1419;color:#e7ecf1;"
           "padding:24px;text-align:center'>"
-          "<h2>正在关闭 WiFi…</h2>"
-          "<p style='color:#3dd68c'>本次运行热点将关闭，蓝牙 Inquiry 独占射频。</p>"
-          "<p style='color:#f2c94c'>调试模式：重新上电会自动再开热点。"
-          "若要本次立即恢复：串口 <code>wifi on</code>，或运行中长按 BOOT 约 3 秒。</p>"
-          "<p style='color:#8b9aab'>约 2 秒后本页面断开。</p></body>");
+          "<h2>Closing hotspot...</h2>"
+          "<p style='color:#3dd68c'>After AP is off, open web via STA IP, "
+          "e.g. http://192.168.199.170/</p>"
+          "<p style='color:#f2c94c'>BT stack starts ~1.5s after AP is stable off. "
+          "Wait a few more seconds before scan.</p>"
+          "<p style='color:#8b9aab'>This page may disconnect in 1s.</p></body>");
     server.send(200, "text/html; charset=utf-8", body);
-    delay(400);
     if (gPortal) {
-      gPortal->stopAp();
-      gPortal->stopSta();  // 热点+STA 全关，射频让给蓝牙；下次上电已配 STA 会自动连回
+      if (gPortal->store_) gPortal->store_->saveWifiEnabled(false);
+      gPortal->requestStopAp();  // loop 里再真正关
     }
-    Serial.println("[WEB] WiFi SoftAP+STA stopped by user (persisted wifi_on=0)");
+    Serial.println("[WEB] SoftAP off requested (deferred to loop)");
   });
 
   server.on("/wifista", HTTP_GET, []() {
@@ -654,7 +743,17 @@ void WebPortal::setupRoutes() {
 
   server.on("/scan/start", HTTP_GET, []() {
     if (!gPortal || !gPortal->bt_) {
-      server.send(500, "application/json", "{\"error\":\"no bt\"}");
+      server.send(500, "application/json", "{\"error\":\"no_bt_ptr\"}");
+      return;
+    }
+    if (gPortal->apActive()) {
+      server.send(200, "application/json",
+                  "{\"error\":\"turn_off_ap_first\",\"msg\":\"先关热点再扫描\"}");
+      return;
+    }
+    if (!gPortal->bt_->ready()) {
+      server.send(200, "application/json",
+                  "{\"error\":\"bt_not_ready\",\"msg\":\"热点关稳约2秒后再扫\"}");
       return;
     }
     gPortal->bt_->startDiscovery(10000);
@@ -929,6 +1028,14 @@ bool WebPortal::rfQuietActive() const {
 }
 
 void WebPortal::loop() {
+  // 延迟执行关热点：与 HTTP 回调解耦，避免复位
+  if (stopApPending_) {
+    stopApPending_ = false;
+    Serial.println("[WEB] deferred stopAp begin");
+    stopAp();  // 保留 STA + server
+    Serial.println("[WEB] deferred stopAp done (STA kept)");
+  }
+
   loopSta();
 
   // 纯 STA（无热点）也要跑 HTTP + OTA 可达的 server

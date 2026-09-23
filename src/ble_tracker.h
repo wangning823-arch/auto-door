@@ -31,6 +31,8 @@ class BleTracker {
  public:
   bool begin(const char* macStr);
   void loop();
+  // 是否已真正 init（网页扫描前判断，避免未起栈就 Inquiry）
+  bool ready() const { return ready_; }
 
   // WiFi 优先：有手机连热点时降低后台 Inquiry 频率，不完全停
   void setInquiryPaused(bool paused);
@@ -66,6 +68,13 @@ class BleTracker {
 
   String debugLine() const;
 
+  // RSSI 时间序列（网页曲线）：环形缓存，约 180 点
+  static constexpr int TS_N = 180;
+  void recordTs(int16_t rssi);  // <=-127 表示无信号
+  void clearTs();
+  int tsCount() const { return tsCount_; }
+  int tsExport(uint32_t* tSec, int16_t* rssi, int maxN) const;
+
  private:
   void pushSample(bool visible, int rssi);
   void computeSlope();
@@ -79,6 +88,11 @@ class BleTracker {
   int8_t hist_[WIN] = {0};
   uint8_t histCount_ = 0;
   uint8_t histHead_ = 0;
+
+  uint32_t tsMs_[TS_N];
+  int16_t tsRssi_[TS_N];
+  uint16_t tsHead_ = 0;
+  uint16_t tsCount_ = 0;
 
   int lastRssi_ = -127;
   float slope_ = 0;
@@ -102,4 +116,5 @@ class BleTracker {
   bool inquirySlow_ = false;
   bool autoTrack_ = false;
   uint8_t missCount_ = 0;
+  bool ready_ = false;
 };

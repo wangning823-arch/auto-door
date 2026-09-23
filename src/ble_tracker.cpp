@@ -131,6 +131,7 @@ bool BleTracker::begin(const char* macStr) {
   if (!gBtReady) {
     if (!SerialBT.begin("GarageDoor")) {
       Serial.println("[BT] SerialBT.begin FAILED");
+      ready_ = false;
       return false;
     }
     // 默认不可被搜索/不可连：避免关配对后仍被手机搜到 GarageDoor
@@ -139,6 +140,7 @@ bool BleTracker::begin(const char* macStr) {
     gBtReady = true;
     Serial.println("[BT] Classic ready, NON_DISCOVERABLE (仅按需 inquiry)");
   }
+  ready_ = true;
 
   Serial.printf("[BT] target MAC %s -> %s\n", macStr, targetSet_ ? "OK" : "INVALID");
   nextInquiryMs_ = millis() + 1000;
@@ -232,6 +234,7 @@ void BleTracker::onClassicDevice(const String& mac, int rssi, const String& name
     lastRssi_ = rssi;
     missCount_ = 0;  // 扫到了，清零漏扫
     pushSample(true, rssi);
+    recordTs((int16_t)rssi);
     computeSlope();
     classifyTrend(true, rssi);
     updateZone();
@@ -264,6 +267,7 @@ void BleTracker::onInquiryDone() {
     if (missCount_ < 255) missCount_++;
     if (missCount_ >= 3) {
       pushSample(false, -127);
+      recordTs(-127);
       computeSlope();
       classifyTrend(false, lastRssi_);
       updateZone();
@@ -282,6 +286,33 @@ void BleTracker::pushSample(bool visible, int rssi) {
   hist_[histHead_] = visible ? (int8_t)constrain(rssi, -127, 0) : (int8_t)-127;
   histHead_ = (histHead_ + 1) % WIN;
   if (histCount_ < WIN) histCount_++;
+}
+
+void BleTracker::recordTs(int16_t rssi) {
+  tsMs_[tsHead_] = millis();
+  tsRssi_[tsHead_] = rssi;
+  tsHead_ = (uint16_t)((tsHead_ + 1) % TS_N);
+  if (tsCount_ < TS_N) tsCount_++;
+}
+
+void BleTracker::clearTs() {
+  tsHead_ = 0;
+  tsCount_ = 0;
+}
+
+int BleTracker::tsExport(uint32_t* tSec, int16_t* rssi, int maxN) const {
+  if (!tSec || !rssi || maxN <= 0 || tsCount_ == 0) return 0;
+  int n = tsCount_;
+  if (n > maxN) n = maxN;
+  int start = (tsHead_ - n + TS_N * 2) % TS_N;
+  uint32_t base = tsMs_[start];
+  for (int i = 0; i < n; i++) {
+    int idx = (start + i) % TS_N;
+    uint32_t ms = tsMs_[idx];
+    tSec[i] = (ms >= base) ? ((ms - base) / 1000u) : 0;
+    rssi[i] = tsRssi_[idx];
+  }
+  return n;
 }
 
 void BleTracker::computeSlope() {

@@ -182,9 +182,40 @@
 #define RSSI_TREND_DROP_DB    15    // 首末至少弱这么多 dB
 #define RSSI_TREND_TOL_DB     3     // 相邻允许的小反弹（多径）
 // 连续无信号这么久才算「真无」，之后再出现才允许无→有开（抖动 miss 不算无）
+// 注意：仅用于开门门槛；不再用于「无信号 35s 兜底关门」（车熄火会突然消失）
 #define RSSI_TRUE_SILENT_MS   20000
-// 真开走且一直扫不到：无信号满这时长兜底发关码
-#define RSSI_LEAVE_SILENT_MS  35000
+// （已废弃作自动关）曾用于无渐离信号消失 35s 后强关 → 车库内熄火误关
+// #define RSSI_LEAVE_SILENT_MS  35000
+
+// ===== NFC 读卡（与蓝牙共存）=====
+// 跟踪期不再把 poll 间隔拉到 1200ms：改「蓝牙忙时不 poll + 空窗 350ms 密扫」
+#ifndef NFC_POLL_GAP_BT_TRACK_MS
+#define NFC_POLL_GAP_BT_TRACK_MS 350
+#endif
+// readPassiveTargetID 等待：过短（80ms）贴卡易漏；固定给足窗口
+#ifndef NFC_READ_TIMEOUT_MS
+#define NFC_READ_TIMEOUT_MS 200
+#endif
+// 慢 ACK 后立刻重试的间隔（卡可能还贴着）
+#ifndef NFC_SLOW_RETRY_MS
+#define NFC_SLOW_RETRY_MS 80
+#endif
+// 连续慢 ACK 次数 → 总线 resync
+#ifndef NFC_SLOW_STREAK_RESYNC
+#define NFC_SLOW_STREAK_RESYNC 3
+#endif
+// 连续无卡 N 次才刷新 RF 场（过勤会打出慢 ACK 死循环）
+#ifndef NFC_FIELD_REFRESH_POLLS
+#define NFC_FIELD_REFRESH_POLLS 30
+#endif
+// （保留宏兼容；场刷新不再按短时间触发）
+#ifndef NFC_FIELD_REFRESH_MS
+#define NFC_FIELD_REFRESH_MS 30000
+#endif
+// 自动关码最小间隔：防 leaveQual 卡住后每 4s 连发关码堵死门机
+#ifndef AUTO_CLOSE_MIN_INTERVAL_MS
+#define AUTO_CLOSE_MIN_INTERVAL_MS 20000
+#endif
 
 // ===== 经典蓝牙（与 BLE 共用开/关状态机阈值）=====
 // 开/关逻辑与 BLE 相同：无→有开；首见≥RSSI_SUDDEN_STRONG 不开；强→弱→无关

@@ -185,7 +185,7 @@ bool NfcReader::recoverBusAndResync() {
     return false;
   }
   {
-    bool retriesOk = nfc.setPassiveActivationRetries(0x01);
+    bool retriesOk = nfc.setPassiveActivationRetries(0x04);
     if (!retriesOk) {
       failRelease("resync retries", sda_, scl_, &failStreak_);
       ok_ = false;
@@ -286,7 +286,7 @@ bool NfcReader::hwInit() {
 
   // begin() 内已 SAMConfig；用库函数设重试（响应长度与官方例程一致）
   {
-    bool ack = nfc.setPassiveActivationRetries(0x01);
+    bool ack = nfc.setPassiveActivationRetries(0x04);
     Serial.printf("[NFC] setRetries ack=%d SCL=%d\n", (int)ack,
                   digitalRead(scl_));
     if (!ack || !busIdle(sda_, scl_)) {
@@ -332,6 +332,9 @@ bool NfcReader::hwInit() {
   lastOkMs_ = millis();
   nextPollMs_ = millis() + 200;
   lastFieldMs_ = millis();
+  emptyPolls_ = 0;
+  slowAckStreak_ = 0;
+  lastPollSlow_ = false;
   Serial.printf("[NFC] PN532 ready 0x%08X\n", ver);
   return true;
 }
@@ -496,47 +499,80 @@ bool NfcReader::poll(String& uid) {
   }
   if (!millisReached(now, nextPollMs_)) return false;
 
-  // 不在 listen 里刷 RF：开场后场应保持；再发 RFConfiguration 会和 InList 抢 ACK
+  // 上一次慢 ACK：先丢残留 RDY，再发 InList（避免交替 1.3s 脏 ACK）
+  if (lastPollSlow_) {
+    pn532Drain();
+    lastPollSlow_ = false;
+  }
+
+  // 仅「连续空轮询够多」才刷 RF 场；绝不能 empty=1 就刷
+  // （场 on+rewire 后立刻 InList 会打出 1.2s 慢 ACK，形成死循环）
+  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS) {
+    Serial.printf("[NFC] 空轮询 %u → 刷新 RF field\n", (unsigned)emptyPolls_);
+    pn532RfFieldOn(sda_, scl_);
+    emptyPolls_ = 0;
+    lastFieldMs_ = now;
+    nextPollMs_ = millis() + 200;  // rewire 后多等一会再 InList
+    return false;
+  }
 
   uint8_t buf[16];
   uint8_t len = 0;
   uint32_t tPoll = millis();
-  // 蓝牙跟踪期把超时压短：无卡时尽快让出 loop 给 Inquiry/BLE
-  uint16_t to = (pollGapMs_ >= 800) ? 80 : 250;
+  // 固定足够贴卡窗口：不再随 pollGap 缩到 80ms（跟踪期曾导致漏刷）
+  uint16_t to = NFC_READ_TIMEOUT_MS;
   uint8_t ret = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, buf, &len, to);
-  uint32_t gap = pollGapMs_ ? pollGapMs_ : 350;
+  uint32_t gap = pollGapMs_ ? pollGapMs_ : NFC_POLL_GAP_BT_TRACK_MS;
   nextPollMs_ = millis() + gap;
   uint32_t cost = millis() - tPoll;
 
-  // 轮询超时/无卡都可能时钟拉伸；总线低必须先松手再收
   if (!busIdle(sda_, scl_)) {
     Serial.println("[NFC] poll bus LOW → release + resync");
     releaseBus(sda_, scl_);
     recoverBusAndResync();
+    lastPollSlow_ = true;
+    slowAckStreak_ = 0;
+    emptyPolls_ = 0;
     return false;
   }
 
   if (!ret || len < 4) {
-    // ACK 超时（>800ms）说明总线/芯片脏：rewire 一次，别等 1.3s 死循环
+    // 慢 ACK：rewire + drain，并 80ms 内立刻再试一次（卡可能还贴着）
     if (cost > 800) {
-      Serial.printf("[NFC] poll ACK 慢 %ums → rewire\n", (unsigned)cost);
+      Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
+                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
       nfcRewire(sda_, scl_);
       pn532Drain();
-      nextPollMs_ = millis() + 400;
+      lastPollSlow_ = true;
+      if (slowAckStreak_ < 255) slowAckStreak_++;
+      if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
+        Serial.println("[NFC] 连续慢 ACK → resync");
+        recoverBusAndResync();
+        slowAckStreak_ = 0;
+      }
+      nextPollMs_ = millis() + NFC_SLOW_RETRY_MS;
       return false;
     }
+    // 正常无卡：不要例行 drain（会刷 Error 263 并可能打乱总线）
+    lastPollSlow_ = false;
+    slowAckStreak_ = 0;
+    if (emptyPolls_ < 100000) emptyPolls_++;
     static uint32_t lastQuietLog = 0;
     if (listen_ && millis() - lastQuietLog > 5000) {
       lastQuietLog = millis();
-      Serial.printf("[NFC] poll 无卡 ret=%d len=%u cost=%ums SCL=%d\n",
+      Serial.printf("[NFC] poll 无卡 ret=%d len=%u cost=%ums SCL=%d empty=%u\n",
                     (int)ret, (unsigned)len, (unsigned)cost,
-                    digitalRead(scl_));
+                    digitalRead(scl_), (unsigned)emptyPolls_);
     }
     return false;
   }
 
   failStreak_ = 0;
   lastOkMs_ = now;
+  lastPollSlow_ = false;
+  slowAckStreak_ = 0;
+  emptyPolls_ = 0;
+  lastFieldMs_ = now;
 
   uid = "";
   for (uint8_t i = 0; i < len; i++) {

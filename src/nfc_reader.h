@@ -60,4 +60,7 @@ class NfcReader {
   uint32_t nextPollMs_ = 0;
   uint32_t lastResyncMs_ = 0;
   uint32_t lastFieldMs_ = 0;
+  uint8_t slowAckStreak_ = 0;
+  bool lastPollSlow_ = false;
+  uint16_t emptyPolls_ = 0;
 };

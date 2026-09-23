@@ -124,9 +124,31 @@ static void initBtStacks() {
 
 static void serviceBtStackInit() {
   if (gBtStackInited) return;
-  // 热点打开期间一律不初始化 BT/BLE：
-  // Bluedroid 起栈会拖垮 SoftAP 的 DHCP/HTTP（SSID 能连、网页永远打不开）
-  if (gWeb.apActive()) return;
+
+  static bool sawApOn = false;
+  static uint32_t apOffAtMs = 0;
+
+  // SoftAP 开着：记下来，绝不起栈（避免与关热点/网页抢时序复位）
+  if (gWeb.apActive()) {
+    sawApOn = true;
+    apOffAtMs = 0;
+    return;
+  }
+
+  // 上电就没有热点（WIFI_DEBUG=0）：稍等 Web/NFC 起来再起栈
+  if (!sawApOn) {
+    if (millis() < 2500) return;
+    initBtStacks();
+    return;
+  }
+
+  // 从有热点 → 关掉：等 1.5s，WiFi mode 稳后再 Bluedroid init
+  if (apOffAtMs == 0) {
+    apOffAtMs = millis();
+    Serial.println("[BT] SoftAP off → 等 1500ms 再 init stacks");
+    return;
+  }
+  if ((millis() - apOffAtMs) < 1500) return;
   initBtStacks();
 }
 
@@ -134,18 +156,20 @@ static bool rfSaveKeyCb(int idx, const char* csv) {
   return gCfg.saveRfKey(idx, csv);
 }
 
-// 远程令 → 与 TRIG 相同出口（MIAO 手动 toggle）
+// 远程令：按语义开/关，禁止把 open 做成 toggle
+// （否则门已开时再喊「打开车库」会按上次 OPEN 翻成关）
 static void onRemoteCmd(const char* cmd) {
   if (!cmd) return;
   if (strcmp(cmd, "open") == 0) {
-    // MVP：语音「打开车库」→ 与 TRIG 一致用 toggle，避免 doorState 误判卡死
-    gDoor.requestManualToggle(OpenSource::MIAO);
-    Serial.println("[REMOTE] open -> MIAO toggle");
+    gDoor.requestManualOpen(OpenSource::MIAO);
+    Serial.println("[REMOTE] open -> MIAO open");
   } else if (strcmp(cmd, "close") == 0) {
     gDoor.requestManualClose(OpenSource::MIAO);
     Serial.println("[REMOTE] close -> MIAO close");
   } else if (strcmp(cmd, "toggle") == 0) {
+    // 仅显式 toggle（如单按钮场景）才翻转
     gDoor.requestManualToggle(OpenSource::MIAO);
+    Serial.println("[REMOTE] toggle -> MIAO toggle");
   }
 }
 
@@ -165,6 +189,17 @@ static bool rfEmitDoor(bool open) {
 
 // 本机是否已「进库/开过门」——只有成立后才允许自动关，避免上电/库内唤醒闪断连发 close
 static bool gCloseArmed = false;
+// 开门后是否再次见过强信号（真正进库）；门外未进库不得凭渐离关
+static bool gStrongAfterOpen = false;
+static uint32_t gLastAutoCloseMs = 0;
+static bool gLeaveQual = false;
+
+static void clearLeaveQual(const char* why) {
+  if (gLeaveQual) {
+    gLeaveQual = false;
+    if (why) Serial.printf("[FSM] 清除离场资格 (%s)\n", why);
+  }
+}
 
 static bool autoCloseGuarded(const char* why) {
   if (millis() < AUTO_BOOT_GRACE_MS) {
@@ -181,14 +216,32 @@ static bool autoCloseGuarded(const char* why) {
 
 static bool autoOpenThenArm(const char* why) {
   bool ok = gDoor.tryAutoOpen(why);
-  if (ok) gCloseArmed = true;
+  if (ok) {
+    gCloseArmed = true;
+    gStrongAfterOpen = false;  // 必须再进库变强才允许离场关
+    clearLeaveQual("开门重置");
+  }
   return ok;
 }
 
-// 离场/信号消失：一律发关码，不看软件门态（门已关再关一次也无害）
+// 离场/信号消失：发关码。成功或已关后必须清离场资格 + 限频，
+// 否则 leaveQual 卡住会每 ~4s 连发关码，堵死门机让原遥控失效。
 static bool tryCloseIfOpen(const char* why) {
   gCloseArmed = true;
-  return autoCloseGuarded(why);
+  const uint32_t now = millis();
+  if (gLastAutoCloseMs != 0 &&
+      (now - gLastAutoCloseMs) < AUTO_CLOSE_MIN_INTERVAL_MS) {
+    // 限频窗口内不发，但仍允许下一次条件评估
+    return false;
+  }
+  bool ok = autoCloseGuarded(why);
+  if (ok) {
+    gLastAutoCloseMs = now;
+    clearLeaveQual("已发关码");
+    gStrongAfterOpen = false;
+    Serial.printf("[FSM] 自动关已发 (%s)，离场资格已清\n", why ? why : "?");
+  }
+  return ok;
 }
 
 // ===== 真无 + 离场 RSSI 趋势（开/关门共用）=====
@@ -235,47 +288,44 @@ struct RssiTrendWin {
 static RssiTrendWin gRssiTrend;
 static bool gTrueNo = true;      // 上电视为「无」，首次有信号即可开
 static bool gEverHadSignal = false;
-static bool gLeaveQual = false;  // 离开趋势合格（可关）
 static uint32_t gNoSigSince = 0; // 0=当前有信号
 
 static void observeSignal(bool hasSignal, int rssi) {
   const uint32_t now = millis();
+  gBt.recordTs(hasSignal ? (int16_t)rssi : (int16_t)-127);
   if (hasSignal) {
     gNoSigSince = 0;
     gEverHadSignal = true;
     gRssiTrend.push(rssi);
+    if (rssi >= RSSI_STRONG) {
+      gStrongAfterOpen = true;
+      clearLeaveQual("回到强信号");
+      return;  // 强信号不参与离场趋势
+    }
     if (gRssiTrend.gradualLeave()) {
       if (!gLeaveQual) {
-        Serial.printf("[FSM] 离场趋势合格 rssi=%d（≥%d 点单调变弱）\n", rssi,
-                      (int)RSSI_TREND_MIN_N);
+        Serial.printf("[FSM] 离场趋势合格 rssi=%d（≥%d 点单调变弱） strongAfter=%d\n",
+                      rssi, (int)RSSI_TREND_MIN_N, (int)gStrongAfterOpen);
         gRssiTrend.dump();
       }
       gLeaveQual = true;
     }
-    if (rssi >= RSSI_STRONG) {
-      if (gLeaveQual) {
-        gLeaveQual = false;
-        gRssiTrend.clear();
-        Serial.println("[FSM] 回到强信号 → 清除离场趋势");
-      }
-    }
-    // 注意：不在这里清 gTrueNo，否则 observeSignal 后再判「真无→有」会永远为 false
   } else {
     if (gNoSigSince == 0) gNoSigSince = now;
     if (millisReached(now, gNoSigSince + RSSI_TRUE_SILENT_MS) && !gTrueNo) {
       gTrueNo = true;
       Serial.println("[FSM] 真无确认（连续无信号满，之后有信号才再开）");
     }
+    if (!gStrongAfterOpen && gLeaveQual) {
+      clearLeaveQual("门外消失且未进库");
+    }
   }
 }
 
-// 是否该发关码：趋势合格后信号没了/变很远；或有史以来真无满离开静默
+// 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 信号消失/变很远
 static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
-  if (gLeaveQual && (!hasSignal || isFar)) return true;
-  if (gEverHadSignal && gTrueNo && gNoSigSince != 0 &&
-      millisReached(millis(), gNoSigSince + RSSI_LEAVE_SILENT_MS)) {
-    return true;
-  }
+  if (!gLeaveQual || !gStrongAfterOpen) return false;
+  if (!hasSignal || isFar) return true;
   return false;
 }
 
@@ -458,13 +508,17 @@ static void handleSerial() {
                        " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
                        ".local ota=" + String(gOtaBegun ? "on" : "off"));
       } else if (line == "wifi off") {
+        // 与网页一致：只关热点、保留 STA；BT 栈由 serviceBtStackInit 延时起
         gCfg.saveWifiEnabled(false);
-        gWeb.stopAp();   // 内部已 kickRecover
-        gWeb.stopSta();
+        gWeb.stopAp();
         gBt.setInquiryPaused(false);
-        Serial.println("[CMD] WiFi AP+STA OFF + saved (BT inquiry free)");
-        // 关热点后若尚未 init BT，立刻起栈，便于测自动门
-        if (!gBtStackInited) initBtStacks();
+        Serial.println("[CMD] SoftAP OFF (STA kept); BT stack will start in ~1.5s");
+      } else if (line == "wifi sta off") {
+        gWeb.stopSta();
+        Serial.println("[CMD] STA OFF (SoftAP unchanged)");
+      } else if (line == "wifi sta on") {
+        gWeb.startStaFromStore();
+        Serial.println("[CMD] STA ON " + gWeb.staIp());
       } else if (line == "wifi on") {
         gCfg.saveWifiEnabled(true);
         if (gWeb.startAp()) {
@@ -1086,69 +1140,54 @@ void loop() {
     gBleBond.service();
   }
 
-  // 远程令：蓝牙忙（Inquiry/BLE 扫描）绝不发 HTTP；STA 已连才轮询
-  {
-    const bool btBusy =
-        gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
-    remoteCmdService(btBusy, gWeb.staConnected());
-  }
+  // 远程令：蓝牙忙不发 HTTPS；放在 NFC 之后，避免 TLS 抢贴卡窗口
+  // （见下方 NFC 块之后调用 remoteCmdService）
 
   // ===== NFC 与 WiFi/蓝牙的共存策略 =====
   // 射频层：NFC=13.56MHz，BT=2.4GHz，互不干扰。
-  // 软件层：PN532 poll/hwInit 会阻塞 loop，会拖慢网页和 Inquiry → 按场景调度。
-  //  · SoftAP 有客户端：只拉长 NFC 间隔，不整段停（否则手机连网页时刷卡失效）
-  //  · OTA 写 flash：完全不碰 NFC/I2C
-  //  · 无网/热点无人：NFC + 蓝牙必须同时工作；NFC 降频，且不在 Inquiry 忙时做 hwInit
-  //  · 上电 hwInit 优先：即使热点有人也要把 NFC 起起来（配 Wi‑Fi 时才能用）
+  // 软件层：PN532 poll 会阻塞 loop → Inquiry/BLE 扫描中不 poll；
+  //         扫描空窗用 350ms 密扫（原先 btTrack 固定 1200ms 导致贴卡常漏）。
   {
     const bool apOn = gWeb.apActive();
     const bool apClient = apOn && WiFi.softAPgetStationNum() > 0;
-    // 未就绪时必须能跑 poll/maybeRecover，即使热点有人（否则上电 init 永不发生）
     const bool nfcNeedInit = !gNfc.ok();
-    const bool btTrack =
-        gBtStackInited && (gBt.autoTrack() || gBleScan.trackOn());
     const bool btBusy = gBtStackInited && gBt.inquiryBusy();
     const bool bleBusy = gBtStackInited && gBleScan.busy();
+    const bool btSensing = btBusy || bleBusy;
 
-    // OTA 写 flash：完全不碰 NFC/I2C
     if (gOtaActive) {
-      // fall through — 不 poll、不 init
+      // OTA 写 flash：完全不碰 NFC/I2C
     } else {
       static bool nfcWasQuiet = false;
-      // 热点有人：不再整段停 NFC（升级 OTA 后手机常连网页 → 刷卡会“死”）。
-      // 只拉长间隔让出 loop；真正要停的是 OTA 传输期。
       if (apClient != nfcWasQuiet) {
         nfcWasQuiet = apClient;
         if (!apClient && !gNfc.ok()) {
-          gNfc.kickRecover();  // 客户端断开后立刻补一次 init
+          gNfc.kickRecover();
         }
       }
 
-      // 跟踪中加大间隔；热点有人时再慢一点，给网页留带宽
-      if (btTrack) {
-        gNfc.setPollGapMs(1200);
-      } else if (apClient) {
+      // 空窗保持密扫；热点有人稍慢给网页；不再因 btTrack 拉到 1200
+      if (apClient) {
         gNfc.setPollGapMs(800);
       } else if (apOn) {
         gNfc.setPollGapMs(500);
       } else {
-        gNfc.setPollGapMs(350);
+        gNfc.setPollGapMs(NFC_POLL_GAP_BT_TRACK_MS);
       }
 
-      // 已就绪但 listen 被关掉（OTA 失败/手动）→ 恢复
-      if (gNfc.ok() && !gNfc.listen() && !gOtaActive) {
+      if (gNfc.ok() && !gNfc.listen()) {
         gNfc.setListen(true);
       }
 
-      // 未就绪：即使热点有人 / Inquiry 忙也允许 init
+      // 未就绪：允许 init（即使 BT 忙也最多慢一点，见内部节流）
       if (nfcNeedInit) {
         String uid0;
-        gNfc.poll(uid0);  // 内部 maybeRecover / 上电自动 init
-      } else {
+        gNfc.poll(uid0);
+      } else if (!btSensing) {
+        // 蓝牙空窗才读卡：不抢 Inquiry/BLE 扫描窗
         String uid;
         if (gNfc.poll(uid)) {
           const bool auth = gNfc.isAuthorized(uid);
-          // 先开/关门，再打日志：串口 TX 满时 println 会阻塞，不能挡 RF
           if (auth) {
             gDoor.requestManualToggle(OpenSource::NFC);
             Serial.println("[NFC] card: " + uid + " authorized → RF");
@@ -1159,7 +1198,15 @@ void loop() {
           }
         }
       }
+      // btSensing 且已 ready：本轮跳过 poll，把 loop 留给蓝牙
     }
+  }
+
+  // 远程令：蓝牙忙（Inquiry/BLE 扫描）绝不发 HTTP；STA 已连才轮询
+  {
+    const bool btBusy =
+        gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
+    remoteCmdService(btBusy, gWeb.staConnected());
   }
 
   // ===== 跟踪模式分发 =====
