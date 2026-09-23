@@ -272,6 +272,14 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
     path = REMOTE_HTTP_PATH;
     isHttps = (port == 443);
   }
+  // 带上固件版本：服务端落后时直接回 {"cmd":"update"}
+  {
+    String q = path;
+    q += (path.indexOf('?') >= 0) ? '&' : '?';
+    q += "fw=";
+    q += FW_VERSION;
+    path = q;
+  }
 
   if (isHttps) {
     code = httpsGet(host, port, path, &body);

@@ -198,6 +198,10 @@ static void onRemoteCmd(const char* cmd) {
     // 仅显式 toggle（如单按钮场景）才翻转
     gDoor.requestManualToggle(OpenSource::MIAO);
     Serial.println("[REMOTE] toggle -> MIAO toggle");
+  } else if (strcmp(cmd, "update") == 0) {
+    // 服务端发现新固件 / 手动触发 → 立刻查 OTA
+    logShipf("[REMOTE] update cmd -> ota check");
+    remoteOtaCheckNow();
   }
 }
 

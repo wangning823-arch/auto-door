@@ -12,7 +12,7 @@
 #define OTA_BIN_URL "http://door.wzx.homes/ota/firmware.bin"
 #endif
 #ifndef OTA_CHECK_INTERVAL_MS
-#define OTA_CHECK_INTERVAL_MS (2UL * 60UL * 60UL * 1000UL)  // 2h
+#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 兜底；开发靠 poll update 令
 #endif
 #ifndef OTA_HTTP_TIMEOUT_MS
 #define OTA_HTTP_TIMEOUT_MS 8000

@@ -59,7 +59,7 @@
 #define OTA_BIN_URL "http://door.wzx.homes/ota/firmware.bin"
 #endif
 #ifndef OTA_CHECK_INTERVAL_MS
-#define OTA_CHECK_INTERVAL_MS (2UL * 60UL * 60UL * 1000UL)
+#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 正式每天一次；开发用 poll 的 update 令
 #endif
 // 轮询周期须明显小于服务端 TTL（8s），留出蓝牙空隙
 #ifndef REMOTE_POLL_INTERVAL_MS
