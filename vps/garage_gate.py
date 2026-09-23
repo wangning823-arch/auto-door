@@ -69,9 +69,17 @@ _pending = None
 _pending_ts = 0.0
 MIN_SET_GAP = 2.0
 _last_set_ts = 0.0
+# 在线升级令：独立于 8s 开关门 TTL，粘到被认领或超 UPDATE_TTL_S
+_update_sticky = False
+_update_ts = 0.0
+_update_notify_ts = 0.0
 # 指令有效期：设备未在此时间内认领则作废（防「人走了门才开」）
 # ESP32 默认约 5s 轮询一次 → 留 ~2 拍余量；可按需改 5～15
 PENDING_TTL_S = 8.0
+# update 指令：粘性标记，直到设备认领；勿用 8s TTL（蓝牙忙时易过期）
+UPDATE_TTL_S = 600.0
+# 自动比对 fw 后下发 update 的最短间隔，避免每 3s 刷屏
+UPDATE_NOTIFY_GAP_S = 300.0
 
 LOG_LINES = []
 
@@ -179,7 +187,9 @@ def _expire_pending_locked(now):
 
 
 def set_pending(cmd):
-    global _pending, _pending_ts, _last_set_ts
+    global _pending, _pending_ts, _last_set_ts, _update_sticky, _update_ts
+    if cmd == "update":
+        return request_update("api")
     now = time.time()
     with _lock:
         stale = _expire_pending_locked(now)
@@ -193,17 +203,72 @@ def set_pending(cmd):
         return True, "ok"
 
 
-def take_pending():
-    global _pending
+def request_update(reason="api"):
+    """粘性 update 令：设备下一次 /dev/poll 认领后清除。"""
+    global _update_sticky, _update_ts, _update_notify_ts
+    now = time.time()
+    with _lock:
+        if _update_sticky:
+            return True, "already"
+        # 自动比对：同一版本落后时勿每 3s 重复下发
+        if reason == "auto" and (now - _update_notify_ts) < UPDATE_NOTIFY_GAP_S:
+            return False, "cooldown"
+        _update_sticky = True
+        _update_ts = now
+        if reason == "auto":
+            _update_notify_ts = now
+        _log("update requested (%s)" % reason)
+        return True, "ok"
+
+
+def _maybe_auto_update(device_fw):
+    """poll 带了 fw 且落后于 ota/version.json → 下发 update。
+    调用方须已持 _lock（take_pending）。
+    """
+    global _update_sticky, _update_ts, _update_notify_ts
+    if not device_fw:
+        return False
+    try:
+        remote = _ota_version_info().get("version") or ""
+    except Exception:
+        remote = ""
+    if not remote or device_fw == remote:
+        return False
+    now = time.time()
+    if _update_sticky:
+        return False
+    if (now - _update_notify_ts) < UPDATE_NOTIFY_GAP_S:
+        return False
+    _update_sticky = True
+    _update_ts = now
+    _update_notify_ts = now
+    _log("auto update fw=%s -> %s" % (device_fw, remote))
+    return True
+
+
+def take_pending(device_fw=None):
+    global _pending, _update_sticky, _update_ts
     now = time.time()
     with _lock:
         expired = _expire_pending_locked(now)
         if expired:
             _log("pending expired unclaimed: %s (ttl=%.0fs)" % (expired, PENDING_TTL_S))
-            return None
         cmd = _pending
         _pending = None
-        return cmd
+        if cmd:
+            return cmd
+        # update 粘性：过期后自动作废（设备长期不在线时勿一直挂着）
+        if _update_sticky:
+            if now - _update_ts > UPDATE_TTL_S:
+                _update_sticky = False
+                _log("update sticky expired")
+            else:
+                _update_sticky = False
+                return "update"
+        if device_fw and _maybe_auto_update(device_fw):
+            _update_sticky = False
+            return "update"
+        return None
 
 
 def peek_state():
@@ -222,6 +287,7 @@ def peek_state():
             "pending_age_s": age,
             "pending_ttl_s": PENDING_TTL_S,
             "pending_ttl_left_s": ttl_left,
+            "update_sticky": bool(_update_sticky),
         }
 
 
@@ -569,10 +635,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, st)
             return
 
+        if path in ("/xiaoai/update",) and method in ("GET", "POST"):
+            if method == "POST":
+                self._read_body()
+            ok, why = request_update("xiaoai")
+            st = peek_state()
+            st["result"] = "ok" if ok else why
+            self._send_json(200, st)
+            return
+
         if path in ("/dev/poll",) and method == "GET":
-            cmd = take_pending()
+            qs = self._query()
+            fw = (qs.get("fw") or [""])[0].strip()
+            cmd = take_pending(fw)
             if cmd:
-                _log("dev poll consumed cmd=%s" % cmd)
+                _log("dev poll consumed cmd=%s fw=%s" % (cmd, fw or "-"))
             self._send_json(200, {"cmd": cmd, "ts": int(time.time())})
             return
 
@@ -604,17 +681,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": 0, "error": "unauthorized"})
             return
 
-        if path in ("/api/open", "/api/close") and method == "POST":
+        if path in ("/api/open", "/api/close", "/api/update") and method == "POST":
             self._read_body()
             tok = self.headers.get("X-Garage-Token") or ""
             if not _check_ui_token(tok):
                 self._send_json(401, {"ok": 0, "error": "unauthorized"})
                 return
-            cmd = "open" if path.endswith("open") else "close"
-            ok, why = set_pending(cmd)
-            _log("ui %s -> pending=%s (%s)" % (cmd, ok, why))
-            msg = ("已请求开门" if cmd == "open" else "已请求关门") if ok else (
-                "指令去抖中，请稍后再试" if why == "debounce" else "失败")
+            if path.endswith("update"):
+                ok, why = request_update("api")
+                msg = "已请求检查更新" if ok else (
+                    "已在队列中" if why == "already" else "失败")
+            else:
+                cmd = "open" if path.endswith("open") else "close"
+                ok, why = set_pending(cmd)
+                _log("ui %s -> pending=%s (%s)" % (cmd, ok, why))
+                msg = ("已请求开门" if cmd == "open" else "已请求关门") if ok else (
+                    "指令去抖中，请稍后再试" if why == "debounce" else "失败")
             self._send_json(200 if ok else 429, {
                 "ok": 1 if ok else 0,
                 "message": msg,
