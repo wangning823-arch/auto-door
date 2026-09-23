@@ -95,7 +95,11 @@ static bool pn532Cmd(uint8_t* cmd, uint8_t cmdlen, uint16_t timeout) {
 // 丢掉 PN532 还没读走的响应：只认 ready 字节，禁止盲读 32 字节（会撞 Error 263）
 static void pn532Drain() {
   const uint8_t addr = PN532_I2C_ADDRESS;
+  // 保存真实超时再恢复：写死 200 会把 init 期的 1000 误改短，或把 50 固化
   uint16_t oldTo = 200;
+#if defined(ESP32)
+  oldTo = (uint16_t)Wire.getTimeOut();
+#endif
   Wire.setTimeOut(50);  // drain 要快失败，别拖 500ms
   for (int i = 0; i < 4; i++) {
     uint8_t rdy = 0;
@@ -113,7 +117,7 @@ static void pn532Drain() {
       seen++;
     }
   }
-  Wire.setTimeOut(oldTo);
+  Wire.setTimeOut(oldTo ? oldTo : 200);
 }
 
 // 重开 I2C：RF/长超时后外设状态脏，残留 RDY 会让下一条 ACK 等到 1.3s

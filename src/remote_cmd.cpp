@@ -17,8 +17,10 @@
 #ifndef REMOTE_POLL_INTERVAL_MS
 #define REMOTE_POLL_INTERVAL_MS 3000
 #endif
+// 连接/读超时（毫秒）。注意：WiFiClientSecure::setTimeout 参数是秒！
+// 必须走 connect(..., timeout_ms) 或 setHandshakeTimeout(秒)，不能 setTimeout(ms)。
 #ifndef REMOTE_POLL_TIMEOUT_MS
-#define REMOTE_POLL_TIMEOUT_MS 5000
+#define REMOTE_POLL_TIMEOUT_MS 2500
 #endif
 #ifndef REMOTE_BT_GAP_MIN_MS
 #define REMOTE_BT_GAP_MIN_MS 100
@@ -31,6 +33,14 @@
 #endif
 #ifndef REMOTE_HTTP_PATH
 #define REMOTE_HTTP_PATH "/dev/poll"
+#endif
+// 连续失败后拉长间隔（秒级退避），避免每 3s 打一次 TLS 拖死 Web/NFC
+#ifndef REMOTE_FAIL_BACKOFF_MS
+#define REMOTE_FAIL_BACKOFF_MS 20000
+#endif
+// mbedTLS 默认 16KB×2 缓冲：最大空闲块不足时必失败，直接跳过本轮
+#ifndef REMOTE_MIN_MAX_ALLOC
+#define REMOTE_MIN_MAX_ALLOC 42000
 #endif
 
 static RemoteCmdFn s_fn = nullptr;
@@ -84,17 +94,35 @@ static bool parseCmd(const String& body, char* out, size_t outLen) {
   return true;
 }
 
-// 手写 HTTPS GET：绕开 ESP32HTTPClient 被 nginx 判 400 的问题
+// 手写 HTTPS GET：绕开 ESP32 HTTPClient 被 nginx 判 400 的问题
 static int httpsGet(const String& host, uint16_t port, const String& path,
                     String* bodyOut) {
+  // 堆不够再连 TLS 只会 -32512，且浪费数秒
+  const uint32_t maxblk = ESP.getMaxAllocHeap();
+  if (maxblk < REMOTE_MIN_MAX_ALLOC) {
+    Serial.printf("[REMOTE] skip tls heap maxblk=%u < %u\n",
+                  (unsigned)maxblk, (unsigned)REMOTE_MIN_MAX_ALLOC);
+    return -10;
+  }
+
+  // 先 DNS（hostByName 有内部超时），失败不进 TLS
+  IPAddress addr;
+  if (!WiFi.hostByName(host.c_str(), addr)) {
+    Serial.println("[REMOTE] dns fail");
+    return -11;
+  }
+
   WiFiClientSecure client;
 #if REMOTE_HTTP_INSECURE
   client.setInsecure();
 #endif
-  client.setTimeout(REMOTE_POLL_TIMEOUT_MS);
-
-  if (!client.connect(host.c_str(), port)) {
-    Serial.println("[REMOTE] tls/connect fail");
+  // setHandshakeTimeout 参数=秒 → 内部×1000；默认库是 120s，会挂死 loop
+  client.setHandshakeTimeout(4);
+  // connect(ip, port, timeout_ms)：timeout 直接给 start_ssl_client（毫秒）
+  // 禁止 client.setTimeout(ms)：那是秒×1000，5000 会变成 5000 秒
+  if (!client.connect(addr, port, REMOTE_POLL_TIMEOUT_MS)) {
+    Serial.printf("[REMOTE] tls/connect fail heap=%u maxblk=%u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     return -1;
   }
 
@@ -170,12 +198,21 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
   const int code =
       httpsGet(REMOTE_HTTP_HOST, REMOTE_HTTP_PORT, REMOTE_HTTP_PATH, &body);
   s_lastPollMs = millis();
-  s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
+  // 失败退避：连挂时不要每 3s 再撞 TLS（会饿死 Web handleClient / NFC）
+  if (code == 200) {
+    s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
+  } else if (s_failStreak >= 2) {
+    s_nextMs = millis() + REMOTE_FAIL_BACKOFF_MS;
+  } else {
+    s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
+  }
 
   if (code != 200) {
     s_failStreak++;
     if (s_failStreak <= 5 || (s_failStreak % 10) == 0) {
-      Serial.printf("[REMOTE] HTTP %d streak=%d\n", code, s_failStreak);
+      Serial.printf("[REMOTE] HTTP %d streak=%d maxblk=%u next=+%ums\n", code,
+                    s_failStreak, (unsigned)ESP.getMaxAllocHeap(),
+                    (unsigned)(s_nextMs - millis()));
     }
     return;
   }

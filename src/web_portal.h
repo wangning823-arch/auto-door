@@ -31,6 +31,8 @@ class WebPortal {
   String staIp() const;
   String staHostname() const { return host_; }
   void loopSta();  // 非阻塞重连 + 状态打印
+  // STA 拿到 IP 后确保 HTTP server 已 begin（纯 STA 模式）
+  void ensureHttpIfSta();
 
   // OTA 就绪（ArduinoOTA begin/end 由 main 推送）
   void setOtaReady(bool on) { otaReady_ = on; }
@@ -61,6 +63,9 @@ class WebPortal {
   bool stopApPending_ = false;
   bool serverStarted_ = false;
   int trackMode_ = TRACK_MODE_DEFAULT;
+  // 跟踪模式切换后延时重启：运行中无法卸载已起的 BT 栈，重启才能真正二选一
+  bool modeRebootPending_ = false;
+  uint32_t modeRebootAtMs_ = 0;
   uint32_t apQuietUntilMs_ = 0;
   bool staWanted_ = false;   // NVS 里是否已配家庭 Wi‑Fi
   bool staTrying_ = false;   // 正在连接 / 已调用 WiFi.begin

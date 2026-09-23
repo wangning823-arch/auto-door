@@ -128,11 +128,10 @@
 #ifndef AP_MAX_CONN
 #define AP_MAX_CONN 4
 #endif
-// WiFi 调试模式：1=每次上电强制开 SoftAP（网页「关闭 WiFi」只影响本次运行，
-// 重新上电会再开，方便调试）；0=尊重 NVS，关掉后需运行中长按 BOOT 3s 或串口 wifi on
-// 完全稳定后改回 0 即可
+// WiFi 调试模式：1=每次上电强制开 SoftAP；0=尊重 NVS wifi_on
+// 关热点后若复位，1 会把热点拉回来 → 自动门用 0
 #ifndef WIFI_DEBUG_BOOT_ON
-#define WIFI_DEBUG_BOOT_ON 1
+#define WIFI_DEBUG_BOOT_ON 0
 #endif
 // SoftAP 打开期间蓝牙让射频：手机才能稳定关联并打开网页
 // （关联完成前 stationNum 仍可能为 0，不能只在「有客户端」时才降级）

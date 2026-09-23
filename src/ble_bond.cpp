@@ -306,6 +306,10 @@ void BleBond::clearSystemBonds() {
 }
 
 void BleBond::requestOpenPairing(uint32_t ms) {
+  if (!begun_) {
+    Serial.println("[BOND] BLE stack not started (classic mode?) — ignore pair");
+    return;
+  }
   if (ms == 0) {
     pendingOpen_ = true;
     pendingOpenMs_ = 0;
@@ -354,14 +358,19 @@ void BleBond::closePairingWindow(const char* why) {
   pairWin_ = false;
   pairWinSticky_ = false;
   pairWinEndMs_ = 0;
-  stopAdv();
-  // 延迟一点点再断连接/经典锁死，避开 SoftAP 恢复窗口
-  disconnectAll();
-  esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-  Serial.printf("[BOND] 配对关（%s）was=%d\n", why ? why : "-", (int)was);
+  if (begun_) {
+    stopAdv();
+    // 延迟一点点再断连接/经典锁死，避开 SoftAP 恢复窗口
+    disconnectAll();
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+  }
+  Serial.printf("[BOND] 配对关（%s）was=%d begun=%d\n", why ? why : "-",
+                (int)was, (int)begun_);
 }
 
 void BleBond::service() {
+  // 经典模式未 begin：不碰 BLEDevice，避免双栈/未初始化崩溃
+  if (!begun_) return;
   if (pendingOpen_ && (int32_t)(pendingOpenAt_ - millis()) <= 0) {
     pendingOpen_ = false;
     doOpen(pendingOpenMs_);
@@ -495,8 +504,8 @@ void BleBond::clearBond(const char* why) {
   bondPrefs.remove("irk");
   bondPrefs.remove("id");
   bondPrefs.end();
-  clearSystemBonds();
-  Serial.printf("[BOND] 已解绑（%s）\n", why ? why : "-");
+  if (begun_) clearSystemBonds();
+  Serial.printf("[BOND] 已解绑（%s）begun=%d\n", why ? why : "-", (int)begun_);
 }
 
 void BleBond::loadFromStore() {
@@ -512,7 +521,12 @@ void BleBond::loadFromStore() {
 }
 
 void BleBond::begin() {
+  if (begun_) {
+    loadFromStore();
+    return;
+  }
   loadFromStore();
+  begun_ = true;
   pairWin_ = false;
   pairWinSticky_ = false;
   pairWinEndMs_ = 0;
@@ -622,7 +636,7 @@ void BleBond::debugDump() {
 #else
 
 BleBond gBleBond;
-void BleBond::begin() {}
+void BleBond::begin() { begun_ = false; }
 void BleBond::requestOpenPairing(uint32_t) {}
 void BleBond::openPairingWindow(uint32_t) {}
 void BleBond::closePairingWindow(const char*) {}
@@ -646,5 +660,6 @@ void BleBond::requestDelayedClose(const char*, uint32_t) {}
 bool BleBond::hasPasskey() const { return false; }
 bool BleBond::allowSmp() const { return false; }
 void BleBond::debugDump() {}
+void BleBond::notePeer(const uint8_t*) {}
 
 #endif

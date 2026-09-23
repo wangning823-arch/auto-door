@@ -14,6 +14,8 @@ class BleBond {
 
   bool matchesAddr(const String& addrColon) const;
   bool hasIrk() const { return hasIrk_; }
+  // begin() 是否已拉起 BLE 栈（经典模式下为 false，service/配对应跳过）
+  bool begun() const { return begun_; }
   String identityMac() const { return identity_; }
   bool savePeerIdKey(const uint8_t* irk16, const uint8_t* identity6);
   void clearBond(const char* why);
@@ -32,6 +34,7 @@ class BleBond {
   void notePeer(const uint8_t* addr6);  // 回调里只记地址，service 再处理
 
  private:
+  bool begun_ = false;
   bool hasIrk_ = false;
   uint8_t irk_[16] = {0};
   String identity_;

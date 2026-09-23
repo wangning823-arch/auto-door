@@ -98,28 +98,48 @@ static void serviceOta() {
 }
 
 // 经典 BT + BLE 配对栈：SoftAP 调试时推迟，优先让网页先出来
+// 二选一：经典只起 SerialBT；BLE 只起 BLEDevice —— 绝不双栈同开
 static void initBtStacks() {
   if (gBtStackInited) return;
-  gBtStackInited = true;
-  Serial.printf("[BT] init stacks t=%ums mac=%s\n", (unsigned)millis(), gMac);
-  if (!gBt.begin(gMac)) {
-    Serial.println("[BOOT] Classic BT init failed");
-  }
-  {
-    int tm = gWeb.trackMode();
-    bool classic = (tm == TRACK_MODE_CLASSIC);
-    bool autoOn = gCfg.loadAutoTrack(classic);
-    if (classic && gBt.hasTarget()) autoOn = true;
+  const bool classic = (gWeb.trackMode() == TRACK_MODE_CLASSIC);
+  Serial.printf("[BT] init start t=%ums mode=%s mac=%s\n", (unsigned)millis(),
+                classic ? "CLASSIC" : "BLE", gMac);
+
+  if (classic) {
+    bool classicOk = gBt.begin(gMac);
+    if (!classicOk) {
+      Serial.println("[BOOT] Classic BT init failed");
+    } else {
+      Serial.println("[BT] classic OK (BLE stack not started)");
+    }
+    bool autoOn = gCfg.loadAutoTrack(true);
+    if (gBt.hasTarget()) autoOn = true;
     gBt.setAutoTrack(autoOn);
-    Serial.println("[BOOT] trackMode=" + String(classic ? "CLASSIC" : "BLE") +
-                   " autotrack=" + String(autoOn ? "ON" : "OFF"));
+    gBleScan.setTrack(false);  // 经典模式强制关 BLE 跟踪
+    Serial.println("[BOOT] trackMode=CLASSIC autotrack=" +
+                   String(autoOn ? "ON" : "OFF") + " ble_track=OFF");
+    // 不 gBleBond.begin()：SerialBT+BLE 双栈 heap≈29KB → SSL/网页挂
+    Serial.println("[BT] skip BLE bond (classic track) — save heap for STA/HTTPS");
+  } else {
+    // BLE 模式：不 gBt.begin()，不跑经典 Inquiry
+    gBt.setAutoTrack(false);
+    Serial.println("[BT] BLE mode — skip classic SerialBT");
+    Serial.println("[BOOT] BLE bond/IRK init...");
+    gBleBond.begin();
+    Serial.println("[BT] bond init done begun=" +
+                   String(gBleBond.begun() ? 1 : 0));
+    if (gBleBond.hasIrk()) {
+      gBleScan.setTrack(true);
+      Serial.println("[BOOT] IRK track ON (paired phone)");
+    } else {
+      gBleScan.setTrack(false);
+      Serial.println("[BOOT] no IRK yet — BLE track OFF until pair");
+    }
   }
-  Serial.println("[BOOT] BLE bond/IRK init...");
-  gBleBond.begin();
-  if (gBleBond.hasIrk()) {
-    gBleScan.setTrack(true);
-    Serial.println("[BOOT] IRK track ON (paired phone)");
-  }
+  gBtStackInited = true;
+  Serial.printf("[BT] init stacks COMPLETE heap=%u begun=%d classic_ready=%d\n",
+                (unsigned)ESP.getFreeHeap(), (int)gBleBond.begun(),
+                (int)gBt.ready());
 }
 
 static void serviceBtStackInit() {
@@ -135,20 +155,26 @@ static void serviceBtStackInit() {
     return;
   }
 
-  // 上电就没有热点（WIFI_DEBUG=0）：稍等 Web/NFC 起来再起栈
+  // 无热点：等 STA 稳定（或超时）再起 Bluedroid
+  // 开机与 WiFi.begin 同时 SerialBT.begin → SW_CPU_RESET 死循环
   if (!sawApOn) {
-    if (millis() < 2500) return;
+    if (millis() < 8000) return;
+    if (gWeb.staConfigured() && !gWeb.staConnected() && millis() < 20000) {
+      return;
+    }
+    Serial.printf("[BT] deferred init t=%ums sta=%d\n", (unsigned)millis(),
+                  (int)gWeb.staConnected());
     initBtStacks();
     return;
   }
 
-  // 从有热点 → 关掉：等 1.5s，WiFi mode 稳后再 Bluedroid init
+  // 从有热点 → 关掉：等 3s，让 WiFi 彻底稳再 Bluedroid
   if (apOffAtMs == 0) {
     apOffAtMs = millis();
-    Serial.println("[BT] SoftAP off → 等 1500ms 再 init stacks");
+    Serial.println("[BT] SoftAP off → 等 3000ms 再 init stacks");
     return;
   }
-  if ((millis() - apOffAtMs) < 1500) return;
+  if ((millis() - apOffAtMs) < 3000) return;
   initBtStacks();
 }
 
@@ -495,7 +521,10 @@ static void handleSerial() {
         m.toUpperCase();
         m.toCharArray(gMac, sizeof(gMac));
         gCfg.saveMac(m);
-        gBt.begin(gMac);
+        // 二选一：仅经典模式起 SerialBT
+        if (gWeb.trackMode() == TRACK_MODE_CLASSIC) {
+          gBt.begin(gMac);
+        }
         Serial.println("[CMD] MAC set+saved " + m);
       } else if (line == "wifi") {
         Serial.println("[CMD] AP " + gWeb.apSsid() +
@@ -601,20 +630,30 @@ static void handleSerial() {
         }
         Serial.println("[CMD] led done");
       } else if (line == "ble" || line.startsWith("ble ")) {
-        // ble | ble 12 → 主动扫 10/12 秒，打印名称/UUID/厂商/RSSI
-        uint32_t ms = 10000;
-        int sp = line.indexOf(' ');
-        if (sp > 0) {
-          int sec = atoi(line.substring(sp + 1).c_str());
-          if (sec >= 5 && sec <= 30) ms = (uint32_t)sec * 1000;
+        // ble | ble 12 → 主动扫 10/12 秒（仅 BLE 模式）
+        if (gWeb.trackMode() != TRACK_MODE_BLE || !gBleBond.begun()) {
+          Serial.println("[CMD] BLE scan ignored (not BLE mode / stack off)");
+        } else {
+          uint32_t ms = 10000;
+          int sp = line.indexOf(' ');
+          if (sp > 0) {
+            int sec = atoi(line.substring(sp + 1).c_str());
+            if (sec >= 5 && sec <= 30) ms = (uint32_t)sec * 1000;
+          }
+          if (gWeb.trackMode() == TRACK_MODE_CLASSIC) {
+            gBt.setAutoTrack(false);
+            gBt.setInquiryPaused(true);
+          }
+          Serial.println("[CMD] BLE scan starting...");
+          gBleScan.runScan(ms);
         }
-        gBt.setAutoTrack(false);
-        gBt.setInquiryPaused(true);
-        Serial.println("[CMD] classic inquiry paused; BLE scan starting...");
-        gBleScan.runScan(ms);
       } else if (line == "bletrack on") {
-        gBleScan.setTrack(true);
-        Serial.println("[CMD] BLE IRK track ON (paired phone only)");
+        if (gWeb.trackMode() != TRACK_MODE_BLE) {
+          Serial.println("[CMD] bletrack ignored (classic mode)");
+        } else {
+          gBleScan.setTrack(true);
+          Serial.println("[CMD] BLE IRK track ON (paired phone only)");
+        }
       } else if (line == "bletrack off") {
         gBleScan.setTrack(false);
         Serial.println("[CMD] BLE track OFF");
@@ -635,23 +674,35 @@ static void handleSerial() {
         }
         gBleBond.debugDump();
       } else if (line == "blepair") {
-        gBleBond.requestOpenPairing(90000);
-      } else if (line.startsWith("blepair ")) {
-        int sec = atoi(line.substring(8).c_str());
-        if (sec <= 0)
-          gBleBond.requestOpenPairing(0);
-        else
-          gBleBond.requestOpenPairing((uint32_t)sec * 1000);
+        if (gWeb.trackMode() != TRACK_MODE_BLE) {
+          Serial.println("[CMD] blepair ignored (classic mode)");
+        } else {
+          gBleBond.requestOpenPairing(90000);
+        }
       } else if (line == "blepair off") {
         gBleBond.closePairingWindow("manual");
+      } else if (line.startsWith("blepair ")) {
+        if (gWeb.trackMode() != TRACK_MODE_BLE) {
+          Serial.println("[CMD] blepair ignored (classic mode)");
+        } else {
+          int sec = atoi(line.substring(8).c_str());
+          if (sec <= 0)
+            gBleBond.requestOpenPairing(0);
+          else
+            gBleBond.requestOpenPairing((uint32_t)sec * 1000);
+        }
       } else if (line == "bleunpair") {
         gBleBond.clearBond("serial");
       } else if (line.startsWith("blepin ")) {
         gBleBond.setPairingPin(line.substring(7));
       } else if (line == "autotrack on") {
-        gBt.setAutoTrack(true);
-        gCfg.saveAutoTrack(true);
-        Serial.println("[CMD] autotrack ON (periodic inquiry, saved)");
+        if (gWeb.trackMode() != TRACK_MODE_CLASSIC) {
+          Serial.println("[CMD] autotrack ignored (BLE mode — classic Inquiry off)");
+        } else {
+          gBt.setAutoTrack(true);
+          gCfg.saveAutoTrack(true);
+          Serial.println("[CMD] autotrack ON (periodic inquiry, saved)");
+        }
       } else if (line == "autotrack off") {
         gBt.setAutoTrack(false);
         gCfg.saveAutoTrack(false);
@@ -944,6 +995,12 @@ void setup() {
   Serial.println(" SoftAP web config + gradual BT");
   Serial.println("========================================");
 
+  // 防 NVS 自动恢复 STA 与 BT 并行起导致 SW_CPU_RESET
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
+
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
@@ -1052,12 +1109,22 @@ void setup() {
   Serial.printf("[BOOT] after-web t=%ums SCL17=%d\n", (unsigned)millis(),
                 digitalRead(PIN_NFC_SCL));
 
-  // SoftAP 调试：网页优先。BT/BLE 推迟；NFC 自动 init 避开「有人连热点」时
-  // （不在此长期 postpone：无人连热点时 T+5s 仍可 init，保证之后 NFC+蓝牙能并存）
+  // SoftAP=0：先 BT 栈，再 STA（并行会 SW_CPU_RESET）
   if (wifiOn) {
     Serial.println("[BOOT] SoftAP on → BT/BLE 栈推迟到关热点后；NFC 空闲时自动 init");
   } else {
+    Serial.println("[BOOT] BT first (no STA), then start STA...");
+    delay(200);
     initBtStacks();
+    Serial.println("[BOOT] after initBtStacks, before STA...");
+    delay(1500);
+    if (gWeb.staConfigured()) {
+      Serial.println("[BOOT] startStaFromStore...");
+      gWeb.startStaFromStore();
+      Serial.println("[BOOT] startStaFromStore returned");
+    } else {
+      Serial.println("[BOOT] No STA configured.");
+    }
   }
 
   Serial.println("[BOOT] ready. fw=" FW_VERSION " wifi=" +
@@ -1078,8 +1145,9 @@ void setup() {
                      ".local（OTA）");
     }
   } else {
-    Serial.println("[BOOT] SoftAP off. 运行中长按 BOOT 3 秒（LED 闪两下）可强制开热点");
-    Serial.println("[BOOT] 或串口发 wifi on");
+    Serial.println("[BOOT] SoftAP off (wifi_on=0) — will NOT auto-start AP again");
+    Serial.println("[BOOT] Web: wait STA IP printed as [WEB] STA HTTP up at http://x.x.x.x/");
+    Serial.println("[BOOT] To open AP once: hold BOOT 3s, or serial: wifi on");
   }
 
   // WiFi 事件：关联/拿 IP 与网页打不开时对照
@@ -1136,8 +1204,11 @@ void loop() {
   // 先跑蓝牙调度，再跑 NFC：避免 I2C 抢在 Inquiry/BLE 之前占满 loop
   serviceBtStackInit();
   if (gBtStackInited) {
-    gBt.loop();
-    gBleBond.service();
+    // 二选一：经典模式才跑 Inquiry 调度；BLE 模式 gBt 未 begin，loop 空转即可
+    if (gWeb.trackMode() == TRACK_MODE_CLASSIC) {
+      gBt.loop();
+    }
+    gBleBond.service();  // 内部 begun_ 门闩：经典模式直接 return
   }
 
   // 远程令：蓝牙忙不发 HTTPS；放在 NFC 之后，避免 TLS 抢贴卡窗口
@@ -1179,12 +1250,13 @@ void loop() {
         gNfc.setListen(true);
       }
 
-      // 未就绪：允许 init（即使 BT 忙也最多慢一点，见内部节流）
+      // 未就绪：允许 init
       if (nfcNeedInit) {
         String uid0;
         gNfc.poll(uid0);
-      } else if (!btSensing) {
-        // 蓝牙空窗才读卡：不抢 Inquiry/BLE 扫描窗
+      } else {
+        // 就绪后始终 poll：关 AP 后 Inquiry 占空比极高，
+        // 若因 btSensing 跳过 poll → 手机只弹窗、读不到 UID、不开门
         String uid;
         if (gNfc.poll(uid)) {
           const bool auth = gNfc.isAuthorized(uid);
@@ -1198,7 +1270,7 @@ void loop() {
           }
         }
       }
-      // btSensing 且已 ready：本轮跳过 poll，把 loop 留给蓝牙
+      (void)btSensing;
     }
   }
 
@@ -1219,7 +1291,8 @@ void loop() {
 
     const bool wifiClient = WiFi.softAPgetStationNum() > 0;
     const bool apYield = gWeb.wifiRfPriority() || gWeb.rfQuietActive();
-    if (gBtStackInited && gBleScan.trackOn() && !wifiClient) {
+    if (gBtStackInited && gWeb.trackMode() == TRACK_MODE_BLE &&
+        gBleBond.begun() && gBleScan.trackOn() && !wifiClient) {
       const uint32_t prevScanEnd = gBleScan.lastScanEndMs();
       if (!apYield) {
         gBleScan.trackPoll(BLE_TRACK_INTERVAL_MS, BLE_TRACK_SCAN_MS);
@@ -1324,7 +1397,8 @@ void loop() {
     static int clPrevRssi = -999;
     static bool clInited = false;
 
-    if (gBtStackInited && gBt.autoTrack() && gBt.hasTarget()) {
+    if (gBtStackInited && gWeb.trackMode() == TRACK_MODE_CLASSIC &&
+        gBt.ready() && gBt.autoTrack() && gBt.hasTarget()) {
       int r = gBt.lastRssi();
       bool seen = gBt.seenRecently(BLE_SILENT_GAP_MS);
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
@@ -1420,11 +1494,14 @@ void loop() {
   if (millis() - lastLog > 8000) {
     lastLog = millis();
     // 串口缓冲不空闲就跳过周期日志，避免 TX 满时 println 拖死 loop
-    if (Serial.availableForWrite() > 128) {
-      Serial.println("[LOG] " + gDoor.debugLine() + " | " + gBt.debugLine() +
-                     " | ble_rssi=" + String(gBleScan.matchRssi()) +
-                     " bond=" + String(gBleBond.hasIrk() ? "Y" : "N") + " | " +
-                     gNfc.debugLine());
+    if (Serial.availableForWrite() > 256) {
+      Serial.printf(
+          "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s\n",
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+          (int)gWeb.staConnected(),
+          gWeb.staConnected() ? "up" : "down",
+          gDoor.debugLine().c_str(), gBt.debugLine().c_str(),
+          gNfc.debugLine().c_str());
     }
   }
 }

@@ -165,7 +165,8 @@ String WebPortal::pageHtml() const {
             "<div class=\"tip\">开/关：无→有且&lt;-80立刻开；≥-80不开；离场≤-90约10m关。"
             "经典模式保存后会自动打开周期 Inquiry；网页会显示「自动跟踪」状态。</div></div>");
 
-  // ===== 手机配对：开关 + 6位PIN（手机配对时输入，真正有意义）=====
+  // ===== 手机配对：开关 + 6位PIN（仅 BLE 模式显示；经典模式隐藏）=====
+  if (trackMode_ == TRACK_MODE_BLE) {
   html += F("<div class=\"card\">"
             "<div class=\"row\"><span class=\"k\">手机配对</span><span class=\"v ");
   if (gBleBond.pairingOpen())
@@ -203,6 +204,11 @@ String WebPortal::pageHtml() const {
             "若已设 6 位 PIN，手机配对时要输入该 PIN（串口会打印同一 PIN）。"
             "关闭配对 = 停广播 + 拒绝绑定 + 断开连接。"
             "换手机：解绑再开配对。</div></div>");
+  } else {
+    html += F("<div class=\"card\">"
+              "<div class=\"row\"><span class=\"k\">手机配对</span>"
+              "<span class=\"v\">经典模式已禁用（切 BLE 后可配对）</span></div></div>");
+  }
 
   html += F("<div class=\"card\"><form method=\"GET\" action=\"/save\" id=\"macform\">"
             "<label>车机 / 钥匙 蓝牙 MAC</label>"
@@ -448,7 +454,10 @@ void WebPortal::setupRoutes() {
       return;
     }
     gPortal->store_->saveMac(mac);
-    if (gPortal->bt_) gPortal->bt_->begin(mac.c_str());
+    // 二选一：只有经典模式才起 SerialBT；BLE 模式只存 MAC 不拉经典栈
+    if (gPortal->bt_ && gPortal->trackMode() == TRACK_MODE_CLASSIC) {
+      gPortal->bt_->begin(mac.c_str());
+    }
     Serial.println("[WEB] MAC saved: " + mac);
     String body =
         F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport "
@@ -518,6 +527,12 @@ void WebPortal::setupRoutes() {
   server.on("/pair", HTTP_GET, []() {
     if (!gPortal) {
       server.send(500, "text/plain", "no portal");
+      return;
+    }
+    if (gPortal->trackMode() != TRACK_MODE_BLE) {
+      server.send(200, "text/html; charset=utf-8",
+                  F("<meta charset=utf-8><p>当前是经典蓝牙模式，BLE 配对已禁用。</p>"
+                    "<p><a href=/>返回</a></p>"));
       return;
     }
     String a = server.hasArg("a") ? server.arg("a") : String();
@@ -746,6 +761,11 @@ void WebPortal::setupRoutes() {
       server.send(500, "application/json", "{\"error\":\"no_bt_ptr\"}");
       return;
     }
+    if (gPortal->trackMode() != TRACK_MODE_CLASSIC) {
+      server.send(200, "application/json",
+                  "{\"error\":\"not_classic\",\"msg\":\"当前是 BLE 模式，经典扫描已禁用\"}");
+      return;
+    }
     if (gPortal->apActive()) {
       server.send(200, "application/json",
                   "{\"error\":\"turn_off_ap_first\",\"msg\":\"先关热点再扫描\"}");
@@ -803,10 +823,17 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
     trackMode_ = store_->loadTrackMode(TRACK_MODE_DEFAULT);
   }
 
-  // BLE 模式：有配对 IRK 就开跟踪（不再依赖名称特征）
-  if (ble_ && gBleBond.hasIrk()) {
-    ble_->setTrack(true);
-    Serial.println("[WEB] BLE IRK track ON (paired phone)");
+  // 二选一：仅 BLE 模式开 IRK 跟踪；经典模式绝不碰 BLE scan
+  if (ble_) {
+    if (trackMode_ == TRACK_MODE_BLE && gBleBond.hasIrk()) {
+      ble_->setTrack(true);
+      Serial.println("[WEB] BLE IRK track ON (paired phone)");
+    } else {
+      ble_->setTrack(false);
+      if (trackMode_ == TRACK_MODE_CLASSIC) {
+        Serial.println("[WEB] classic mode — BLE track forced OFF");
+      }
+    }
   }
 
   uint64_t chipid = ESP.getEfuseMac();
@@ -831,21 +858,14 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
   if (enableAp) {
     startAp();
   } else {
-    // 纯蓝牙模式：不要 server.begin()（无 netif 时同样会 assert）
-    Serial.println("[WEB] SoftAP disabled by config (BT-only mode, no HTTP)");
+    // 关热点（wifi_on=0）：不 startAp、不自动回退开热点
+    // STA 延后：由 main 先 initBtStacks，再 startStaFromStore
+    // （STA+SerialBT/BLE 同时起会 SW_CPU_RESET）
+    Serial.println("[WEB] SoftAP off (wifi_on=0). STA deferred until BT ready.");
     apActive_ = false;
     if (bt_) bt_->setInquiryPaused(false);
-    // 仍允许纯 STA（无线烧录），不需要 SoftAP
-    if (staWanted_) {
-      WiFi.persistent(false);
-      WiFi.mode(WIFI_STA);
-      WiFi.setAutoReconnect(true);
-      startStaFromStore();
-      if (!serverStarted_) {
-        server.begin();
-        server.enableDelay(true);
-        serverStarted_ = true;
-      }
+    if (!staWanted_) {
+      Serial.println("[WEB] No STA config. Hold BOOT 3s or send 'wifi on' to open AP once.");
     }
     return;
   }
@@ -872,21 +892,22 @@ void WebPortal::startStaFromStore() {
     WiFi.mode(WIFI_STA);
   }
   WiFi.setAutoReconnect(true);
-  WiFi.setSleep(false);
+  // BT+WiFi 同开必须允许 modem sleep；setSleep(false) 会直接 SW_CPU_RESET
+  // （wifi: Should enable WiFi modem sleep when both WiFi and Bluetooth are enabled）
+  WiFi.setSleep(true);
 
-  // mDNS：OTA 用 garage-XXXX.local
+  // mDNS：BT 已在跑时跳过（ESPmDNS+SerialBT 易崩），OTA 用 IP 即可
+  if (!mdnsOn_ && !/* placeholder */ false) {
+    // 由 main 在无 BT 或确认安全时再开；此处仅在未起 BT 时尝试
+  }
+  // 明确：STA 模式下暂不开 mDNS，避免 BT+WiFi+mDNS 三栈崩溃
   if (!mdnsOn_) {
-    if (MDNS.begin(host_.c_str())) {
-      MDNS.addService("http", "tcp", 80);
-      mdnsOn_ = true;
-      Serial.println("[WEB] mDNS http://" + host_ + ".local");
-    } else {
-      Serial.println("[WEB] mDNS begin FAIL " + host_);
-    }
+    Serial.println("[WEB] skip MDNS (BT may be active); use STA IP for web/OTA");
   }
 
   Serial.println("[WEB] STA begin ssid=" + ssid + " hostname=" + host_ + ".local");
   WiFi.begin(ssid.c_str(), pass.c_str());
+  Serial.println("[WEB] WiFi.begin called");
   staTrying_ = true;
   staNextRetryMs_ = millis() + 15000;
 }
@@ -907,20 +928,58 @@ void WebPortal::stopSta() {
   Serial.println("[WEB] STA stopped");
 }
 
+void WebPortal::ensureHttpIfSta() {
+  if (apActive_) return;
+  if (!staWanted_ || !staConnected()) return;
+  if (serverStarted_) return;
+  server.begin();
+  server.enableDelay(true);
+  serverStarted_ = true;
+  Serial.println("[WEB] STA HTTP up at http://" + staIp() + "/");
+}
+
 void WebPortal::loopSta() {
   if (!staWanted_) return;
 
   wl_status_t st = WiFi.status();
   if (st == WL_CONNECTED) {
-    if (staTrying_ || millis() - staLastLogMs_ > 30000) {
+    ensureHttpIfSta();
+    // 每 15s 打一次 STA/HTTP/heap：纯 STA 路径没有 AP 诊断日志，挂了要能看见
+    if (staTrying_ || millis() - staLastLogMs_ > 15000) {
       staLastLogMs_ = millis();
       if (staTrying_) {
         staTrying_ = false;
         Serial.println("[WEB] STA connected ip=" + WiFi.localIP().toString() +
-                       " host=" + host_ + ".local");
+                       " host=" + host_ + ".local http=" +
+                       String(serverStarted_ ? "up" : "down"));
+      } else if (Serial.availableForWrite() > 160) {
+        Serial.printf("[WEB] sta=up ip=%s http=%s heap=%u maxblk=%u\n",
+                      WiFi.localIP().toString().c_str(),
+                      serverStarted_ ? "up" : "down",
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMaxAllocHeap());
       }
     }
     return;
+  }
+
+  // STA 掉线：纯 STA 下监听 socket 会失效，必须清标志，重连后再 begin
+  if (!apActive_ && serverStarted_) {
+    server.stop();
+    serverStarted_ = false;
+    Serial.println("[WEB] STA lost → HTTP server stopped (will re-begin on reconnect)");
+  }
+  // 断线重连期最多 5s 打一行，避免刷屏占满串口拖死 loop
+  {
+    static uint32_t lastDownLog = 0;
+    if (millis() - lastDownLog >= 5000 && Serial.availableForWrite() > 96) {
+      lastDownLog = millis();
+      Serial.printf("[WEB] sta down st=%d retry_in=%ums http=%s\n", (int)st,
+                    (unsigned)(staNextRetryMs_ > millis()
+                                   ? staNextRetryMs_ - millis()
+                                   : 0),
+                    serverStarted_ ? "up" : "down");
+    }
   }
 
   // 未连上：节流重连（WiFi.begin 会有点重，勿每 loop 调）
@@ -1003,22 +1062,31 @@ void WebPortal::stopAp() {
     dns_.stop();
     dnsOn_ = false;
   }
-  WiFi.softAPdisconnect(true);
-  // 关热点：若已配家庭 Wi‑Fi 则保留纯 STA（OTA 仍可用）；测自动门可再 wifi sta off
-  if (staWanted_) {
-    WiFi.mode(WIFI_STA);
-  } else {
-    WiFi.mode(WIFI_OFF);
+  // WiFi OFF 会拆掉已 listen 的 socket：必须 stop + 清标志，
+  // 否则 ensureHttpIfSta 因 serverStarted_==true 直接 return，STA 起来后网页永远打不开
+  if (serverStarted_) {
+    server.stop();
+    serverStarted_ = false;
   }
+  // 彻底关 SoftAP：disconnect → OFF → 再按需开纯 STA，避免模式残留再 beacon
+  WiFi.softAPdisconnect(true);
   apActive_ = false;
   apQuietUntilMs_ = 0;
+  delay(50);
+  WiFi.mode(WIFI_OFF);
+  delay(120);
+  if (staWanted_) {
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    startStaFromStore();
+  }
   if (bt_) {
     bt_->setInquiryPaused(false);
-    bt_->setInquirySlow(false);  // 关热点后恢复完整扫描，测自动门
+    bt_->setInquirySlow(false);
   }
-  // 热点期可能推迟/失败过 NFC：关 AP 后立刻允许重新 hwInit
   if (nfc_) nfc_->kickRecover();
-  Serial.println("[WEB] SoftAP off; STA=" + String(staWanted_ ? "keep" : "none") +
+  Serial.println("[WEB] SoftAP off hard mode=" + String((int)WiFi.getMode()) +
+                 " sta=" + String(staWanted_ ? "keep" : "none") +
                  " sta_ip=" + staIp());
 }
 
@@ -1028,6 +1096,15 @@ bool WebPortal::rfQuietActive() const {
 }
 
 void WebPortal::loop() {
+  // 模式切换后延时重启：让 HTTP 302 先发完，再干净地只起一侧 BT 栈
+  if (modeRebootPending_ &&
+      (int32_t)(millis() - modeRebootAtMs_) >= 0) {
+    modeRebootPending_ = false;
+    Serial.println("[WEB] reboot for exclusive classic/BLE stack...");
+    delay(100);
+    ESP.restart();
+  }
+
   // 延迟执行关热点：与 HTTP 回调解耦，避免复位
   if (stopApPending_) {
     stopApPending_ = false;
@@ -1038,9 +1115,12 @@ void WebPortal::loop() {
 
   loopSta();
 
-  // 纯 STA（无热点）也要跑 HTTP + OTA 可达的 server
+  // 纯 STA（无热点）也要跑 HTTP：多打几次 handleClient，避免被远程 TLS/NFC 饿死
   if (apActive_ || (staWanted_ && staConnected())) {
     if (serverStarted_) {
+      server.handleClient();
+      server.handleClient();
+      yield();
       server.handleClient();
     }
   }
@@ -1137,14 +1217,46 @@ void WebPortal::loop() {
 
 void WebPortal::setTrackMode(int mode) {
   if (mode != TRACK_MODE_BLE && mode != TRACK_MODE_CLASSIC) return;
+  const bool changed = (mode != trackMode_);
   trackMode_ = mode;
   if (store_) store_->saveTrackMode(mode);
-  // 经典模式必须开周期 Inquiry，否则 RSSI 卡住、离开永不关门
-  if (bt_) {
-    bool autoOn = (mode == TRACK_MODE_CLASSIC);
-    bt_->setAutoTrack(autoOn);
-    if (store_) store_->saveAutoTrack(autoOn);
+
+  const bool classic = (mode == TRACK_MODE_CLASSIC);
+
+  // 二选一：立刻关掉另一侧的跟踪/配对（重启前也不并跑）
+  if (classic) {
+    if (ble_) ble_->setTrack(false);
+    gBleBond.closePairingWindow("mode classic");
+    if (bt_) {
+      bt_->setAutoTrack(true);
+      bt_->setInquiryPaused(false);
+    }
+    if (store_) store_->saveAutoTrack(true);
+    Serial.println("[WEB] classic track ON; BLE scan/pair forced OFF");
+  } else {
+    if (bt_) {
+      bt_->setAutoTrack(false);
+      bt_->setInquiryPaused(false);
+      bt_->cancelActiveInquiry();
+    }
+    if (store_) store_->saveAutoTrack(false);
+    if (ble_ && gBleBond.hasIrk()) {
+      ble_->setTrack(true);
+      Serial.println("[WEB] BLE track ON (paired phone)");
+    } else if (ble_) {
+      ble_->setTrack(false);
+      Serial.println("[WEB] BLE mode but no IRK — track stays OFF (pair first)");
+    }
   }
-  Serial.println("[WEB] track mode -> " + String(mode == TRACK_MODE_BLE ? "BLE" : "Classic") +
-                 " autotrack=" + String((bt_ && bt_->autoTrack()) ? "ON" : "OFF"));
+
+  Serial.println("[WEB] track mode -> " + String(classic ? "Classic" : "BLE") +
+                 " autotrack=" + String((bt_ && bt_->autoTrack()) ? "ON" : "OFF") +
+                 " ble_track=" + String((ble_ && ble_->trackOn()) ? "ON" : "OFF"));
+
+  // 已起的栈无法热卸载：换模式后约 1.2s 重启，开机只 init 选中的一侧
+  if (changed) {
+    modeRebootPending_ = true;
+    modeRebootAtMs_ = millis() + 1200;
+    Serial.println("[WEB] track mode changed → reboot in ~1.2s for exclusive BT stack");
+  }
 }

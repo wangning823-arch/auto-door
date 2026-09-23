@@ -71,6 +71,11 @@ void BleScanTool::runScan(uint32_t durationMs) {
     Serial.println("[BLE] scan already running");
     return;
   }
+  // 经典模式：不 BLEDevice::init，绝不拉起 BLE 栈
+  if (!gBleBond.begun()) {
+    Serial.println("[BLE] scan skipped (BLE stack not started / classic mode)");
+    return;
+  }
   if (millis() - lastScanEndMs_ < 2500) {
     return;
   }
