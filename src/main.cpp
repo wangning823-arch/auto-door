@@ -13,6 +13,8 @@
 #include "default_rf_keys.h"
 #include "ble_bond.h"
 #include "remote_cmd.h"
+#include "log_ship.h"
+#include "remote_ota.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -571,6 +573,19 @@ static void handleSerial() {
         remoteCmdSetEnabled(true);
       } else if (line == "remote off") {
         remoteCmdSetEnabled(false);
+      } else if (line == "logs flush") {
+        logShipFlushNow();
+        Serial.println("[CMD] logs flush queued pending=" +
+                       String((unsigned)logShipPending()));
+      } else if (line == "logs") {
+        Serial.printf("[CMD] logship pending=%u last=%s\n",
+                      (unsigned)logShipPending(), remoteOtaLastMsg());
+      } else if (line == "ota check") {
+        remoteOtaCheckNow();
+        Serial.println("[CMD] ota check queued");
+      } else if (line == "ota") {
+        Serial.printf("[OTA] last=%s active=%d\n", remoteOtaLastMsg(),
+                      (int)remoteOtaActive());
       } else if (line == "wifi status") {
         Serial.printf("[CMD] mode=%d ap=%s ip=%s sta=%d apmac=%s heap=%u bt=%d\n",
                       (int)WiFi.getMode(), gWeb.apSsid().c_str(),
@@ -1014,8 +1029,26 @@ void setup() {
   pinMode(PIN_RF_TX, OUTPUT);
   digitalWrite(PIN_RF_TX, LOW);
   remoteCmdSetHandler(onRemoteCmd);
+  remoteCmdSetMemTrim([]() { gBleScan.releaseMemory(); });
   gCfg.begin();
   remoteCmdBegin(&gCfg);
+  logShipBegin();
+  remoteOtaBegin(&gCfg);
+  remoteOtaSetBusyHook([](bool on) {
+    gOtaActive = on;
+    if (on) {
+      gOtaActiveAtMs = millis();
+      gNfc.setListen(false);
+      if (gBtStackInited) {
+        gBt.setInquiryPaused(true);
+        gBt.cancelActiveInquiry();
+      }
+    } else {
+      if (gBtStackInited) gBt.setInquiryPaused(false);
+      if (gNfc.ok()) gNfc.setListen(true);
+      else gNfc.kickRecover();
+    }
+  });
   if (gCfg.loadRemote(false)) {
     remoteCmdSetEnabled(true);
   } else {
@@ -1279,6 +1312,8 @@ void loop() {
     const bool btBusy =
         gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
     remoteCmdService(btBusy, gWeb.staConnected());
+    logShipService(btBusy, gWeb.staConnected());
+    remoteOtaService(btBusy, gWeb.staConnected());
   }
 
   // ===== 跟踪模式分发 =====
@@ -1495,8 +1530,8 @@ void loop() {
     lastLog = millis();
     // 串口缓冲不空闲就跳过周期日志，避免 TX 满时 println 拖死 loop
     if (Serial.availableForWrite() > 256) {
-      Serial.printf(
-          "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s\n",
+      logShipf(
+          "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s",
           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
           (int)gWeb.staConnected(),
           gWeb.staConnected() ? "up" : "down",

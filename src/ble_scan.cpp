@@ -152,7 +152,16 @@ void BleScanTool::runScan(uint32_t durationMs) {
   }
 
   scan->clearResults();
+  // 广播表只为本轮日志/排障；TLS 等大块分配前必须让出（String 碎片会压低 maxblk）
+  hits_.clear();
+  hits_.shrink_to_fit();
   busy_ = false;
+}
+
+void BleScanTool::releaseMemory() {
+  if (busy_) return;
+  hits_.clear();
+  hits_.shrink_to_fit();
 }
 
 void BleScanTool::trackPoll(uint32_t intervalMs, uint32_t scanMs) {
@@ -169,6 +178,7 @@ void BleScanTool::runScan(uint32_t) {
   Serial.println("[BLE] BLE not enabled in this build");
 }
 void BleScanTool::trackPoll(uint32_t, uint32_t) {}
+void BleScanTool::releaseMemory() {}
 std::vector<BleAdvHit> BleScanTool::matchOnlyHits() const { return {}; }
 bool BleScanTool::matchHits(const BleAdvHit&) const { return false; }
 #endif

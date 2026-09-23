@@ -143,7 +143,12 @@ remote on/off   VPS 轮询远程开（蓝牙空隙才访问 WiFi）
 - **MCP**：`https://door.wzx.homes/mcp`（Streamable HTTP POST + 旧 SSE GET）；工具 `open_garage` / `close_garage` / `garage_status`
 - 本地调试服务端：`../vps/garage_gate.py`（Python3 标准库，零依赖）
 - 固件轮询：`src/remote_cmd.*`；**默认关**，串口 `remote on` 打开
-- `config.h` 已默认 `REMOTE_POLL_URL=https://door.wzx.homes/dev/poll`（HTTPS，MVP `REMOTE_HTTP_INSECURE=1`）
+- `config.h` 默认 `REMOTE_POLL_URL=http://door.wzx.homes/dev/poll`（**明文 HTTP**：TLS 在 BT+STA 下堆不够）
+- nginx：仅 `location = /dev/poll` 允许 80 口明文反代；`/mcp`、`/xiaoai/*`、`/health` 仍 HTTPS
+- **在线 OTA**：`GET /ota/version` 对比 `FW_VERSION`，不同则拉 `/ota/firmware.bin` 写入重启。发布：把 `firmware.bin` + `version.json` 放到 VPS `/opt/garage-gate/ota/`。串口 `ota check` 立刻查
+- **日志上报**：约 30s 推到 `/dev/logs`，VPS 存 `/opt/garage-gate/logs/device-YYYYMMDD.log`（保留 14 天）。串口 `logs flush`
+- **手机开关门页**：`https://door.wzx.homes/`（密码在 VPS `/opt/garage-gate/ui_password`）
+- 串口 `remote on/off`；日志看 `[REMOTE]`
 - 蓝牙优先：Inquiry / BLE 扫描进行中**绝不**发 HTTP；STA 已连才轮询
 - 冒烟：`curl -X POST https://door.wzx.homes/xiaoai/open` 后设备应打出 `[REMOTE] cmd=open`
 

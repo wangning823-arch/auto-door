@@ -25,17 +25,41 @@
 #endif
 
 // ===== 远程令：VPS 轮询（蓝牙空隙才访问 WiFi）=====
-// 改成你的 VPS：仅 443 对外 → https://door.wzx.homes/dev/poll
+// 设备侧用明文 HTTP：mbedTLS 需 ~42KB 连续堆，Classic/BLE+STA 下起不来 TLS。
+// nginx 只放行 location = /dev/poll 不跳转；MCP/小爱仍走 https://door.wzx.homes
 #ifndef REMOTE_POLL_URL
-#define REMOTE_POLL_URL "https://door.wzx.homes/dev/poll"
+#define REMOTE_POLL_URL "http://door.wzx.homes/dev/poll"
 #endif
-// HTTPS MVP：跳过证书校验（后续可换成 CA）；0 则要求证书有效
+// HTTPS MVP：跳过证书校验（仅当 REMOTE_POLL_URL 为 https:// 时用到）
 #ifndef REMOTE_HTTP_INSECURE
 #define REMOTE_HTTP_INSECURE 1
 #endif
-// TLS 握手需要时间；过短会导致连不上 nginx
+// 连接/读超时（HTTP 轮询）
 #ifndef REMOTE_POLL_TIMEOUT_MS
 #define REMOTE_POLL_TIMEOUT_MS 5000
+#endif
+// 留空 = 不使用第二地址；可填 https:// 备用（内存够时才有意义）
+#ifndef REMOTE_POLL_URL_HTTP
+#define REMOTE_POLL_URL_HTTP ""
+#endif
+// ===== 日志上报 / 在线 OTA（HTTP 明文，与轮询同一 nginx 放行策略）=====
+#ifndef LOG_SHIP_URL
+#define LOG_SHIP_URL "http://door.wzx.homes/dev/logs"
+#endif
+#ifndef LOG_SHIP_HOST
+#define LOG_SHIP_HOST "door.wzx.homes"
+#endif
+#ifndef LOG_SHIP_INTERVAL_MS
+#define LOG_SHIP_INTERVAL_MS 30000UL
+#endif
+#ifndef OTA_VERSION_URL
+#define OTA_VERSION_URL "http://door.wzx.homes/ota/version"
+#endif
+#ifndef OTA_BIN_URL
+#define OTA_BIN_URL "http://door.wzx.homes/ota/firmware.bin"
+#endif
+#ifndef OTA_CHECK_INTERVAL_MS
+#define OTA_CHECK_INTERVAL_MS (2UL * 60UL * 60UL * 1000UL)
 #endif
 // 轮询周期须明显小于服务端 TTL（8s），留出蓝牙空隙
 #ifndef REMOTE_POLL_INTERVAL_MS

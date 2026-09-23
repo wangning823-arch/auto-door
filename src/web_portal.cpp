@@ -246,6 +246,8 @@ String WebPortal::pageHtml() const {
   if (nfc_) {
     if (nfc_->ok())
       html += F("ok</span></div>");
+    else if (nfc_->absent())
+      html += F("未接模块 · 不再自动撞 I2C</span></div>");
     else if (nfc_->deferred())
       html += F("defer · 可网页强制初始化</span></div>");
     else
@@ -255,8 +257,8 @@ String WebPortal::pageHtml() const {
   }
   html += F("<form method=\"GET\" action=\"/nfcinit\">"
             "<button type=\"submit\" class=\"sec\">重新初始化 NFC</button></form>"
-            "<div class=\"tip\">上电约 5 秒后会自动初始化；失败则约每 10 分钟慢速重试。"
-            "刷卡无效时可在此强制 nfcinit。</div></div>");
+            "<div class=\"tip\">上电约 5 秒后短超时探测：无 PN532 则立刻 defer，"
+            "不再用 1s 超时堵网页。接上模块后点「重新初始化」。</div></div>");
 
   html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
             "<span class=\"v\">WiFi 与蓝牙共用 2.4G</span></div>"

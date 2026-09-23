@@ -35,6 +35,9 @@ static void forceIdlePullups(int sda, int scl) {
 // 失败后慢速自动重试（防止 15s 级 Error263 风暴锁死 SCL）
 #define NFC_AUTO_RETRY_GAP_MS (10UL * 60UL * 1000UL)
 #define NFC_AUTO_RETRY_MAX 20
+// 未接模块时的在场探测：必须短超时，否则每次 NACK 等 1s 把 Web/NFC 轮询堵死
+#define NFC_PROBE_TIMEOUT_MS 40
+#define NFC_PROBE_RETRIES 3
 
 static void i2cBusRecover(int sda, int scl) {
   // 先推拉顶一下：PN532 从机拉住 SCL 时，仅开漏 9-clock 顶不开
@@ -82,6 +85,37 @@ static void failRelease(const char* why, int sda, int scl, uint16_t* streak) {
   Serial.printf("[NFC] FAIL %s SCL=%d → Wire.end\n", why, digitalRead(scl));
   releaseBus(sda, scl);
   if (*streak < 60000) (*streak)++;
+}
+
+// 未接 PN532：短超时 ACK 探测。总线 idle 但芯片不在时，
+// Adafruit 库按 1000ms 超时连撞 → 主循环每秒卡死一次，网页打不开。
+bool NfcReader::probePresent() {
+  if (sda_ < 0) return false;
+  releaseBus(sda_, scl_);
+  if (!busIdle(sda_, scl_)) {
+    i2cBusRecover(sda_, scl_);
+    if (!busIdle(sda_, scl_)) return false;
+  }
+  Wire.begin(sda_, scl_, (uint32_t)100000);
+  Wire.setTimeOut(NFC_PROBE_TIMEOUT_MS);
+  forceIdlePullups(sda_, scl_);
+
+  // PN532 I2C 地址 0x24：有芯片时 ready 线会拉低/应答；无芯片连续 NACK
+  const uint8_t addr = 0x24;
+  int hits = 0;
+  for (int i = 0; i < NFC_PROBE_RETRIES; i++) {
+    uint8_t n = Wire.requestFrom((uint8_t)addr, (uint8_t)1);
+    if (n == 1) {
+      hits++;
+      if (Wire.available()) (void)Wire.read();
+    }
+    delay(5);
+  }
+  // 恢复正常 init/poll 用的超时（探测绝不能留在 40ms）
+  Wire.setTimeOut(200);
+  releaseBus(sda_, scl_);
+  forceIdlePullups(sda_, scl_);
+  return hits > 0;
 }
 
 // 仅诊断用：自拼 RFConfiguration。正常路径勿调（失败会留脏帧）
@@ -239,6 +273,23 @@ bool NfcReader::hwInit() {
     return false;
   }
 
+  // 未接芯片：先短超时探测，避免 1000ms×N 次把 HTTP/主循环堵死
+  if (!probePresent()) {
+    absent_ = true;
+    ok_ = false;
+    deferred_ = true;
+    // 自动重试打满 → maybeRecover 不再后台撞；网页/串口 nfcinit 可手动再试
+    if (autoRetryCount_ < NFC_AUTO_RETRY_MAX) autoRetryCount_ = NFC_AUTO_RETRY_MAX;
+    bootInitDone_ = true;
+    if (failStreak_ < 60000) failStreak_++;
+    Serial.println("[NFC] 未探测到 PN532（未接模块？）→ defer，不再长超时撞 I2C");
+    Serial.println("[NFC] 接上模块后网页「重新初始化 NFC」或串口 nfcinit");
+    releaseBus(sda_, scl_);
+    forceIdlePullups(sda_, scl_);
+    return false;
+  }
+  absent_ = false;
+
   // begin() 后芯片可能仍在 SAMConfig 忙，先松手再读 ver，避免首读固定 1.3s 超时
   releaseBus(sda_, scl_);
   delay(50);
@@ -349,6 +400,7 @@ bool NfcReader::begin(int sda, int scl) {
   ok_ = false;
   // 不再上电即永久 deferred：排程一次自动 init，断电重启后刷卡可自恢复
   deferred_ = false;
+  absent_ = false;
   bootInitDone_ = false;
   bootInitAt_ = millis() + NFC_BOOT_INIT_DELAY_MS;
   lastAutoRetryMs_ = 0;
@@ -398,6 +450,9 @@ void NfcReader::maybeRecover() {
       return;
     }
     if (!millisReached(now, bootInitAt_)) return;
+    // STA 网页未起来时再等一会：无芯片探测也别和 DHCP/HTTP 抢 loop
+    // （有 STA 配置且未连上时最多等到 15s；无 STA 则按原 5s）
+    // 注：探测本身仅 ~120ms，这里主要让 HTTP 先出日志/可访问
     bootInitDone_ = true;
     Serial.printf("[NFC] 上电自动 init t=%ums SCL=%d\n", (unsigned)now,
                   digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL));
@@ -405,15 +460,19 @@ void NfcReader::maybeRecover() {
       Serial.println("[NFC] 上电自动 init OK");
       return;
     }
-    // hwInit 失败路径已 deferred_=true
+    // hwInit 失败：无芯片已在内部打满 autoRetry / deferred
     lastAutoRetryMs_ = now;
-    autoRetryCount_ = 1;
-    Serial.println("[NFC] 上电自动 init 失败 → 进入慢速自动重试");
+    if (autoRetryCount_ < NFC_AUTO_RETRY_MAX) autoRetryCount_ = 1;
+    if (absent_) {
+      Serial.println("[NFC] 上电探测无 PN532 → 不再自动 init（不堵 Web）");
+    } else {
+      Serial.println("[NFC] 上电自动 init 失败 → 进入慢速自动重试");
+    }
     return;
   }
 
   // 2) deferred：慢速有限次重试，避免 Error263 风暴；超限后仅串口/网页 forceInit
-  //    OTA/STA 开着时上电首次 init 更容易被 WiFi 时序带失败 → 前几次改 30s 快重试
+  //    未接模块时 absent 已把 count 打满 → 这里直接 return
   if (deferred_) {
     if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX) return;
     uint32_t gap = (autoRetryCount_ <= 3) ? 30000UL : NFC_AUTO_RETRY_GAP_MS;
@@ -446,7 +505,11 @@ void NfcReader::maybeRecover() {
 bool NfcReader::forceInit() {
   lastRecoverMs_ = millis();
   bootInitDone_ = true;  // 手动初始化后不必再等上电排程
-  Serial.printf("[NFC] forceInit t=%ums\n", (unsigned)millis());
+  Serial.printf("[NFC] forceInit t=%ums absent=%d\n", (unsigned)millis(),
+                (int)absent_);
+  // 手动 nfcinit：清 absent/重试计数，允许再短探 + 完整 init
+  absent_ = false;
+  autoRetryCount_ = 0;
   bool ok = hwInit();
   if (ok) {
     deferred_ = false;
@@ -455,6 +518,7 @@ bool NfcReader::forceInit() {
     deferred_ = true;
     lastAutoRetryMs_ = millis();
     if (autoRetryCount_ < NFC_AUTO_RETRY_MAX) autoRetryCount_ = autoRetryCount_ ? autoRetryCount_ : 1;
+    if (absent_) autoRetryCount_ = NFC_AUTO_RETRY_MAX;
   }
   return ok;
 }
@@ -599,7 +663,7 @@ bool NfcReader::isAuthorized(const String& uid) const {
 }
 
 String NfcReader::debugLine() const {
-  const char* st = ok_ ? "ok" : (deferred_ ? "defer" : "wait");
+  const char* st = ok_ ? "ok" : (absent_ ? "nochip" : (deferred_ ? "defer" : "wait"));
   return "nfc=" + String(st) + " fail=" + String(failStreak_) +
          " retry=" + String(autoRetryCount_) +
          " auth=" + (authUid_.length() ? authUid_ : String("-"));

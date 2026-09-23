@@ -29,6 +29,8 @@ class NfcReader {
   // 上电自动 init / 慢速重试状态（网页诊断用）
   bool deferred() const { return deferred_; }
   uint8_t autoRetryCount() const { return autoRetryCount_; }
+  // 短超时探测：无 PN532（本机未接模块）→ 不再长超时撞 I2C
+  bool absent() const { return absent_; }
   // SoftAP 配置中推迟自动 init，避免 I2C 长操作卡住 HTTP
   void postponeBootInit(uint32_t delayMs);
   // 关热点 / 立刻允许下一轮 hwInit（清 10 分钟慢速重试等待）
@@ -38,9 +40,12 @@ class NfcReader {
   bool hwInit();
   void maybeRecover();
   bool recoverBusAndResync();
+  // 返回 true=总线上像有 PN532；false=未接/无应答（短超时）
+  bool probePresent();
 
   bool ok_ = false;
   bool deferred_ = false;
+  bool absent_ = false;  // 探测无芯片：自动 init 全部跳过
   bool listen_ = true;  // 就绪后默认持续读（门应用需要）
   uint32_t pollGapMs_ = 350;
   // 上电自动 init：避免断电重启后 NFC 永久失效（原先 deferred 永不自动初始化）

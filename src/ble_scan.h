@@ -32,6 +32,9 @@ class BleScanTool {
   bool trackOn() const { return trackOn_; }
   void trackPoll(uint32_t intervalMs = 3000, uint32_t scanMs = 1000);
 
+  // 释放 hits_ 占用（TLS/大块分配前调用）；匹配结果已在 matchRssi_ 保留
+  void releaseMemory();
+
   // 是否命中：仅 IRK 配对设备
   bool matchHits(const BleAdvHit& h) const;
   // 仅命中设备（给排障用，不按名称过滤）
