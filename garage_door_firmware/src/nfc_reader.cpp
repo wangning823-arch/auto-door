@@ -338,7 +338,9 @@ bool NfcReader::hwInit() {
     return false;
   }
 
-  // begin() 内已 SAMConfig；用库函数设重试（响应长度与官方例程一致）
+  // begin() 内已 SAMConfig
+  // 必须有限重试：0xFF 会让 InList 一直挂着，配合空读 NACK 的 isready()
+  // 把 NFC 任务堵死（手机弹窗=场在，但 UID 永远读不出）。0x04≈50ms 干净返回。
   {
     bool ack = nfc.setPassiveActivationRetries(0x04);
     Serial.printf("[NFC] setRetries ack=%d SCL=%d\n", (int)ack,
@@ -376,7 +378,7 @@ bool NfcReader::hwInit() {
   }
 
   // 100ms 太短：readPassiveTargetID 等待时会先撞 I2C 超时（Error263）
-  // 500ms 会把 poll 拖到 1.3s；RF 常开后 InList 应很快返回
+  // 200ms 覆盖 retries=0x04 的 ~50ms 寻卡 + 总线余量
   Wire.setTimeOut(200);
   ok_ = true;
   deferred_ = false;
@@ -500,7 +502,10 @@ void NfcReader::taskLoop() {
       vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (suspended_) continue;
-    if (!lockBus(200)) continue;
+    if (!lockBus(200)) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
     String uid;
     bool got = poll(uid);  // 内部含 maybeRecover / gap
     unlockBus();
@@ -673,11 +678,11 @@ bool NfcReader::poll(String& uid) {
   uint8_t buf[16];
   uint8_t len = 0;
   uint32_t tPoll = millis();
-  // 固定足够贴卡窗口：不再随 pollGap 缩到 80ms（跟踪期曾导致漏刷）
+  // 有限超时：to=0 会在本板「空读 NACK」下把 waitready 堵死（弹窗却读不到）。
+  // retries=0x04 时 InList 约 50ms 自行结束，不会和下一次叠枪。
   uint16_t to = NFC_READ_TIMEOUT_MS;
   uint8_t ret = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, buf, &len, to);
   uint32_t gap = pollGapMs_ ? pollGapMs_ : NFC_POLL_GAP_BT_TRACK_MS;
-  nextPollMs_ = millis() + gap;
   uint32_t cost = millis() - tPoll;
 
   if (!busIdle(sda_, scl_)) {
@@ -687,27 +692,26 @@ bool NfcReader::poll(String& uid) {
     lastPollSlow_ = true;
     slowAckStreak_ = 0;
     emptyPolls_ = 0;
+    nextPollMs_ = millis() + 100;
     return false;
   }
 
   if (!ret || len < 4) {
-    // 慢 ACK：rewire + drain，并 80ms 内立刻再试一次（卡可能还贴着）
-    if (cost > 800) {
-      Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
+    // 慢/超时：禁止 rewire（会掐死场内正在激活的卡）；只 drain 后立刻再 InList
+    if (cost > 400) {
+      Serial.printf("[NFC] poll ACK 慢 %ums → drain+retry streak=%u\n",
                     (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
-      nfcRewire(sda_, scl_);
       pn532Drain();
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
-      if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
+      if (slowAckStreak_ >= 8) {
         Serial.println("[NFC] 连续慢 ACK → resync");
         recoverBusAndResync();
         slowAckStreak_ = 0;
       }
-      nextPollMs_ = millis() + NFC_SLOW_RETRY_MS;
+      nextPollMs_ = millis();  // 立刻再试
       return false;
     }
-    // 正常无卡：不要例行 drain（会刷 Error 263 并可能打乱总线）
     lastPollSlow_ = false;
     slowAckStreak_ = 0;
     if (emptyPolls_ < 100000) emptyPolls_++;
@@ -718,8 +722,10 @@ bool NfcReader::poll(String& uid) {
                     (int)ret, (unsigned)len, (unsigned)cost,
                     digitalRead(scl_), (unsigned)emptyPolls_);
     }
+    nextPollMs_ = millis();  // 空读也立刻续枪，缩短盲区
     return false;
   }
+  nextPollMs_ = millis() + gap;
 
   failStreak_ = 0;
   lastOkMs_ = now;
