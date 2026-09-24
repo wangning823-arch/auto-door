@@ -68,12 +68,15 @@ MCP_SERVER_VERSION = "0.2.0"
 MCP_PROTOCOL_DEFAULT = "2024-11-05"
 MCP_PROTOCOL_KNOWN = ("2025-03-26", "2024-11-05", "2024-10-07")
 
-PENDING_TTL_S = 8.0
+# 蓝牙 Inquiry 忙时设备可能 >6s 才 poll 一次；TTL 过短会把指令扔掉
+PENDING_TTL_S = 25.0
 UPDATE_TTL_S = 600.0
 UPDATE_NOTIFY_GAP_S = 300.0
 MIN_SET_GAP = 2.0
 ONLINE_S = 45.0  # 超过则列表显示离线
 DEFAULT_DEVICE = "default"  # 兼容旧固件 / 不带 id 的主门
+# 小爱/MCP 不传 id 时的真实主门（必须是设备 poll 的 id，不能是 legacy default）
+MAIN_DEVICE = os.environ.get("GARAGE_MAIN_DEVICE", "garage-dda0")
 
 LOG_LINES = []
 _lock = threading.Lock()
@@ -168,10 +171,28 @@ def _expire_pending_locked(d):
     return None
 
 
+def _target_device(dev_id=None):
+    """解析指令目标：显式 id > 主门 > 在线非测试板 > legacy default。"""
+    if dev_id:
+        return dev_id
+    with _lock:
+        main = _devices.get(MAIN_DEVICE)
+        if main and _is_online(main):
+            return MAIN_DEVICE
+        for i, d in _devices.items():
+            if i in (DEFAULT_DEVICE, MAIN_DEVICE) or i.endswith("-lab"):
+                continue
+            if _is_online(d):
+                return i
+        if main:
+            return MAIN_DEVICE
+    return DEFAULT_DEVICE
+
+
 def set_pending(cmd, dev_id=None):
     if cmd == "update":
         return request_update("api", dev_id)
-    dev_id = dev_id or DEFAULT_DEVICE
+    dev_id = _target_device(dev_id)
     now = _now()
     with _lock:
         d = _device_locked(dev_id)
@@ -187,7 +208,7 @@ def set_pending(cmd, dev_id=None):
 
 
 def request_update(reason="api", dev_id=None):
-    dev_id = dev_id or DEFAULT_DEVICE
+    dev_id = _target_device(dev_id)
     now = _now()
     with _lock:
         d = _device_locked(dev_id)
@@ -495,11 +516,11 @@ def _mcp_tool_call(name, arguments):
     dev_id = (arguments or {}).get("id") or None
     if name == "open_garage":
         ok, why = set_pending("open", dev_id)
-        _log("mcp open_garage -> pending=%s (%s)" % (ok, why))
+        _log("mcp open_garage dev=%s -> pending=%s (%s)" % (_target_device(dev_id), ok, why))
         return False, ("已请求打开车库门" if ok else "指令去抖中，请稍后再试(%s)" % why)
     if name == "close_garage":
         ok, why = set_pending("close", dev_id)
-        _log("mcp close_garage -> pending=%s (%s)" % (ok, why))
+        _log("mcp close_garage dev=%s -> pending=%s (%s)" % (_target_device(dev_id), ok, why))
         return False, ("已请求关闭车库门" if ok else "指令去抖中，请稍后再试(%s)" % why)
     if name == "garage_status":
         return False, "状态: " + json.dumps(peek_state(), ensure_ascii=False)
@@ -527,7 +548,7 @@ def _mcp_handle_rpc(msg):
             "protocolVersion": proto,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION},
-            "instructions": "使用 open_garage 打开车库门。",
+            "instructions": "用 open_garage / close_garage 控制车库门；不传 id 时操作主门 garage-dda0。",
         }
         _log("mcp initialize proto=%s" % proto)
         return {"jsonrpc": "2.0", "id": mid, "result": result}
@@ -792,7 +813,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 self._read_body()
             ok, why = set_pending("open", self._q("id") or None)
-            _log("xiaoai open -> pending=%s (%s)" % (ok, why))
+            _log("xiaoai open dev=%s -> pending=%s (%s)" % (_target_device(self._q("id") or None), ok, why))
             st = peek_state()
             st["result"] = "ok" if ok else why
             self._send_json(200, st)
@@ -802,7 +823,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 self._read_body()
             ok, why = set_pending("close", self._q("id") or None)
-            _log("xiaoai close -> pending=%s (%s)" % (ok, why))
+            _log("xiaoai close dev=%s -> pending=%s (%s)" % (_target_device(self._q("id") or None), ok, why))
             st = peek_state()
             st["result"] = "ok" if ok else why
             self._send_json(200, st)
