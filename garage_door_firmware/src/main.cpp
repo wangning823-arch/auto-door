@@ -1129,7 +1129,18 @@ void setup() {
 
   // NFC：上电约 5s 后自动 init（原先永久 deferred，断电后刷卡会失效）
   Serial.println("[BOOT] NFC auto-init scheduled (~5s)");
-  gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL);
+  gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL, PIN_NFC_IRQ);
+  gNfc.setCardHandler([](const String& uid) {
+    const bool auth = gNfc.isAuthorized(uid);
+    if (auth) {
+      gDoor.requestManualToggle(OpenSource::NFC);
+      logShipf("[NFC] card: %s authorized → RF", uid.c_str());
+    } else if (gNfc.authUid().length() == 0) {
+      logShipf("[NFC] card: %s unregistered", uid.c_str());
+    } else {
+      logShipf("[NFC] card: %s unauthorized", uid.c_str());
+    }
+  });
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
   {
@@ -1252,30 +1263,17 @@ void loop() {
   // 远程令：蓝牙忙不发 HTTPS；放在 NFC 之后，避免 TLS 抢贴卡窗口
   // （见下方 NFC 块之后调用 remoteCmdService）
 
-  // ===== NFC 与 WiFi/蓝牙的共存策略 =====
-  // 射频层：NFC=13.56MHz，BT=2.4GHz，互不干扰。
-  // 软件层：PN532 poll 会阻塞 loop → Inquiry/BLE 扫描中不 poll；
-  //         扫描空窗用 350ms 密扫（原先 btTrack 固定 1200ms 导致贴卡常漏）。
+  // ===== NFC 异步：I2C 在独立任务，loop 只收事件 =====
   {
     const bool apOn = gWeb.apActive();
     const bool apClient = apOn && WiFi.softAPgetStationNum() > 0;
-    const bool nfcNeedInit = !gNfc.ok();
-    const bool btBusy = gBtStackInited && gBt.inquiryBusy();
-    const bool bleBusy = gBtStackInited && gBleScan.busy();
-    const bool btSensing = btBusy || bleBusy;
-
-    if (gOtaActive) {
-      // OTA 写 flash：完全不碰 NFC/I2C
-    } else {
+    gNfc.setSuspended(gOtaActive);
+    if (!gOtaActive) {
       static bool nfcWasQuiet = false;
       if (apClient != nfcWasQuiet) {
         nfcWasQuiet = apClient;
-        if (!apClient && !gNfc.ok()) {
-          gNfc.kickRecover();
-        }
+        if (!apClient && !gNfc.ok()) gNfc.kickRecover();
       }
-
-      // 空窗保持密扫；热点有人稍慢给网页；不再因 btTrack 拉到 1200
       if (apClient) {
         gNfc.setPollGapMs(800);
       } else if (apOn) {
@@ -1283,32 +1281,8 @@ void loop() {
       } else {
         gNfc.setPollGapMs(NFC_POLL_GAP_BT_TRACK_MS);
       }
-
-      if (gNfc.ok() && !gNfc.listen()) {
-        gNfc.setListen(true);
-      }
-
-      // 未就绪：允许 init
-      if (nfcNeedInit) {
-        String uid0;
-        gNfc.poll(uid0);
-      } else {
-        // 就绪后始终 poll：关 AP 后 Inquiry 占空比极高，
-        // 若因 btSensing 跳过 poll → 手机只弹窗、读不到 UID、不开门
-        String uid;
-        if (gNfc.poll(uid)) {
-          const bool auth = gNfc.isAuthorized(uid);
-          if (auth) {
-            gDoor.requestManualToggle(OpenSource::NFC);
-            logShipf("[NFC] card: %s authorized → RF", uid.c_str());
-          } else if (gNfc.authUid().length() == 0) {
-            logShipf("[NFC] card: %s unregistered", uid.c_str());
-          } else {
-            logShipf("[NFC] card: %s unauthorized", uid.c_str());
-          }
-        }
-      }
-      (void)btSensing;
+      if (gNfc.ok() && !gNfc.listen()) gNfc.setListen(true);
+      gNfc.service();  // 取读卡事件 → 开门回调
     }
   }
 

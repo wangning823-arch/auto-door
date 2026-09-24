@@ -127,6 +127,11 @@
 #ifndef PIN_NFC_SCL
 #define PIN_NFC_SCL 17
 #endif
+// PN532 IRQ（可选）：接上则事件驱动，未接则 FreeRTOS 任务轮询
+// 空闲为高（模块上拉）；固件用内部下拉探测「是否被外部拉高」
+#ifndef PIN_NFC_IRQ
+#define PIN_NFC_IRQ 4
+#endif
 
 // RF 抓包参数
 #define RF_CAPTURE_MAX_PULSES  512     // 最大记录脉冲数

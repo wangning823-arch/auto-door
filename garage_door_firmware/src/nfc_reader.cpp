@@ -8,6 +8,7 @@
 
 // 16/17 引脚定义不变（SDA=16 SCL=17）。0xFF=不用库的 IRQ/RESET 脚。
 static Adafruit_PN532 nfc((uint8_t)0xFF, (uint8_t)0xFF);
+static NfcReader* s_nfcSelf = nullptr;
 
 // 尽早拉高 SDA/SCL：模块与 ESP 同电，上电瞬间 SCL 必须为高，否则芯片易卡死
 static void earlyBusIdleHigh() {
@@ -392,9 +393,10 @@ bool NfcReader::hwInit() {
   return true;
 }
 
-bool NfcReader::begin(int sda, int scl) {
+bool NfcReader::begin(int sda, int scl, int irqPin) {
   sda_ = sda;
   scl_ = scl;
+  irq_ = irqPin;
   ok_ = false;
   // 不再上电即永久 deferred：排程一次自动 init，断电重启后刷卡可自恢复
   deferred_ = false;
@@ -408,9 +410,102 @@ bool NfcReader::begin(int sda, int scl) {
   nextPollMs_ = millis() + 200;
   lastRecoverMs_ = millis() - NFC_RECOVER_GAP_MS;
   forceIdlePullups(sda_, scl_);
+
+  if (!busMux_) busMux_ = xSemaphoreCreateMutex();
+  if (!cardQ_) cardQ_ = xQueueCreate(4, 32);  // uid 最长 28+1
+  irqWired_ = detectIrqWired();
+  if (irqWired_ && irq_ >= 0) {
+    pinMode(irq_, INPUT);  // 模块侧上拉；FALLING=有事件
+    attachInterrupt(digitalPinToInterrupt(irq_), []() {
+      // 仅唤醒任务；I2C 在任务里做
+      if (s_nfcSelf && s_nfcSelf->task_) {
+        BaseType_t hp = pdFALSE;
+        vTaskNotifyGiveFromISR(s_nfcSelf->task_, &hp);
+        if (hp == pdTRUE) portYIELD_FROM_ISR();
+      }
+    }, FALLING);
+    Serial.printf("[NFC] IRQ detected GPIO%d → 事件驱动\n", irq_);
+  } else {
+    Serial.printf("[NFC] IRQ GPIO%d not wired → FreeRTOS 任务轮询\n",
+                  irq_ >= 0 ? irq_ : -1);
+  }
+
+  if (!task_) {
+    s_nfcSelf = this;
+    xTaskCreatePinnedToCore(taskTrampoline, "nfc", 6144, this, 1, &task_, 1);
+    Serial.println("[NFC] async task started (loop 不再阻塞读卡)");
+  }
+
   Serial.printf("[NFC] setup：硬件初始化已排程，约 %ums 后自动 nfcinit\n",
                 (unsigned)NFC_BOOT_INIT_DELAY_MS);
   return false;
+}
+
+// 探测 IRQ 是否外接：模块 IRQ 空闲为高（板上拉）。
+// 未接线时内部下拉应读到 LOW；被外部拉高则读到 HIGH。
+bool NfcReader::detectIrqWired() {
+  if (irq_ < 0 || irq_ > 39) return false;
+  pinMode(irq_, INPUT_PULLDOWN);
+  delayMicroseconds(30);
+  int a = digitalRead(irq_);
+  delayMicroseconds(30);
+  int b = digitalRead(irq_);
+  // 再用上拉复核：真正接模块时两种电阻下都应稳定为高
+  pinMode(irq_, INPUT_PULLUP);
+  delayMicroseconds(30);
+  int c = digitalRead(irq_);
+  pinMode(irq_, INPUT_PULLDOWN);
+  return (a == HIGH && b == HIGH && c == HIGH);
+}
+
+bool NfcReader::lockBus(uint32_t timeoutMs) {
+  if (!busMux_) return true;
+  return xSemaphoreTake(busMux_, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+void NfcReader::unlockBus() {
+  if (busMux_) xSemaphoreGive(busMux_);
+}
+
+void NfcReader::pushCard(const String& uid) {
+  if (!cardQ_) return;
+  char buf[32] = {0};
+  uid.toCharArray(buf, sizeof(buf));
+  xQueueSend(cardQ_, buf, 0);
+}
+
+void NfcReader::service() {
+  if (!cardQ_ || !onCard_) return;
+  char buf[32];
+  while (xQueueReceive(cardQ_, buf, 0) == pdTRUE) {
+    String uid(buf);
+    if (uid.length()) onCard_(uid);
+  }
+}
+
+void NfcReader::taskTrampoline(void* arg) {
+  static_cast<NfcReader*>(arg)->taskLoop();
+}
+
+void NfcReader::taskLoop() {
+  for (;;) {
+    if (suspended_) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    if (irqWired_ && ok_ && listen_) {
+      // 无卡时睡死等 IRQ；超时只为 maybeRecover/场刷新
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(pollGapMs_ ? pollGapMs_ : 350));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (suspended_) continue;
+    if (!lockBus(200)) continue;
+    String uid;
+    bool got = poll(uid);  // 内部含 maybeRecover / gap
+    unlockBus();
+    if (got) pushCard(uid);
+  }
 }
 
 void NfcReader::postponeBootInit(uint32_t delayMs) {
@@ -657,5 +752,6 @@ String NfcReader::debugLine() const {
   const char* st = ok_ ? "ok" : (absent_ ? "nochip" : (deferred_ ? "defer" : "wait"));
   return "nfc=" + String(st) + " fail=" + String(failStreak_) +
          " retry=" + String(autoRetryCount_) +
+         " irq=" + String(irqWired_ ? 1 : 0) +
          " auth=" + (authUid_.length() ? authUid_ : String("-"));
 }
