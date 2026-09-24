@@ -48,6 +48,8 @@ WEB_DIR = os.path.join(BASE_DIR, "web")
 OTA_DIR = os.path.join(BASE_DIR, "ota")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 UI_PASSWORD_FILE = os.path.join(BASE_DIR, "ui_password")
+# 灰度：名单内设备不自动 update（sticky /api.../update 仍可手动推）
+OTA_AUTO_HOLD_FILE = os.path.join(BASE_DIR, "ota_hold")
 
 # 调试期关闭网页登录（地址未公开）。上线前改回 True。
 # 也可用环境变量 GARAGE_UI_AUTH=0/1 覆盖。
@@ -201,8 +203,23 @@ def request_update(reason="api", dev_id=None):
         return True, "ok"
 
 
+def _ota_auto_hold_ids():
+    try:
+        with open(OTA_AUTO_HOLD_FILE, "r") as f:
+            ids = set()
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    ids.add(s)
+            return ids
+    except Exception:
+        return set()
+
+
 def _maybe_auto_update_locked(d, device_fw):
     if not device_fw:
+        return False
+    if d.get("id") in _ota_auto_hold_ids():
         return False
     try:
         remote = _ota_version_info().get("version") or ""
