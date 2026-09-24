@@ -917,9 +917,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": 0, "error": "empty or too small"})
                 return
             meta = _save_ota_bin(data, version)
-            # 上传后可选立刻通知设备
+            # 上传后通知：指定 id 只发一台；默认发给所有已注册设备
             if self._q("notify") not in ("0", "false", "no"):
-                request_update("api", self._q("id") or DEFAULT_DEVICE)
+                only = self._q("id")
+                with _lock:
+                    ids = [only] if only else list(_devices.keys())
+                for i in ids:
+                    request_update("api", i)
             self._send_json(200, {"ok": 1, "ota": meta})
             return
 
