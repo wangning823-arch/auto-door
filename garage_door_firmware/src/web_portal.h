@@ -29,6 +29,7 @@ class WebPortal {
   bool staConfigured() const;
   bool staConnected() const;
   String staIp() const;
+  // 设备名（仅日志/OTA 协议元数据；无 mDNS，访问一律用 STA IP）
   String staHostname() const { return host_; }
   void loopSta();  // 非阻塞重连 + 状态打印
   // STA 拿到 IP 后确保 HTTP server 已 begin（纯 STA 模式）
@@ -58,7 +59,7 @@ class WebPortal {
   BleScanTool* ble_ = nullptr;
   NfcReader* nfc_ = nullptr;
   String apSsid_;
-  String host_;  // mDNS / OTA 主机名（小写，无连字符歧义：garage-xxxx）
+  String host_;  // 设备名（OTA 协议元数据/日志；无 mDNS）
   bool apActive_ = false;
   bool stopApPending_ = false;
   bool serverStarted_ = false;
@@ -69,7 +70,6 @@ class WebPortal {
   uint32_t apQuietUntilMs_ = 0;
   bool staWanted_ = false;   // NVS 里是否已配家庭 Wi‑Fi
   bool staTrying_ = false;   // 正在连接 / 已调用 WiFi.begin
-  bool mdnsOn_ = false;
   bool otaReady_ = false;  // ArduinoOTA 是否已 begin（STA 已连）
   uint32_t staNextRetryMs_ = 0;
   uint32_t staLastLogMs_ = 0;

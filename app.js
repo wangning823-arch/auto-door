@@ -304,10 +304,32 @@
   });
   $("uploadBtn").addEventListener("click", uploadOta);
 
-  if (token()) {
-    $("statusText").textContent = "已登录";
-    loadList();
-  } else {
-    show("login");
+  function boot() {
+    // 调试期服务端可关闭登录：/api/auth required=false 时直接进列表
+    fetch("/api/auth")
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.required === false) {
+          $("statusText").textContent = "调试模式 · 无鉴权";
+          $("logoutBtn").classList.add("hidden");
+          loadList();
+          return;
+        }
+        if (token()) {
+          $("statusText").textContent = "已登录";
+          loadList();
+        } else {
+          show("login");
+        }
+      })
+      .catch(function () {
+        if (token()) {
+          loadList();
+        } else {
+          show("login");
+        }
+      });
   }
+
+  boot();
 })();

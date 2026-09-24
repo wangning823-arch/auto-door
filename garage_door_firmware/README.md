@@ -51,7 +51,7 @@ cd D:\mimo\车库门自动化\garage_door_firmware
 
 ## 在线升级（桌面 OTA 客户端）
 
-**前置**：网页「家庭 Wi‑Fi」已填 2.4G SSID/密码，首页显示 `OTA: garage-xxxx.local`；设备与电脑同一局域网。
+**前置**：网页「家庭 Wi‑Fi」已填 2.4G SSID/密码，首页显示 `OTA: <STA IP>`；设备与电脑同一局域网。已去 mDNS，请用 IP，不要用 `.local`。
 
 1. 先用 USB 烧一次带 `/ota` 与 `FW_VERSION` 的新固件（之后才能读版本号）
 2. 双击 `tools\OTA升级.vbs`（或 `OTA升级.bat`）
@@ -71,7 +71,7 @@ cd D:\mimo\车库门自动化\garage_door_firmware
 
 ```powershell
 # 改 platformio.ini 里 upload_port，或：
-& $env:MIMO_PYTHON -m platformio run -e esp32dev_ota -t upload --upload-port garage-xxxx.local
+& $env:MIMO_PYTHON -m platformio run -e esp32dev_ota -t upload --upload-port 192.168.x.x
 ```
 
 版本号由 `tools/bump_version.py` 在**每次编译前**自动写入 `src/fw_version.h`：

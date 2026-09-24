@@ -64,7 +64,7 @@ static void serviceOta() {
   if (!gOtaBegun) {
     ArduinoOTA.setHostname(gWeb.staHostname().c_str());
     ArduinoOTA.onStart([]() {
-      Serial.println("[OTA] START " + String(gWeb.staHostname()) + ".local");
+      Serial.println("[OTA] START ip=" + gWeb.staIp());
       gOtaActive = true;
       gOtaActiveAtMs = millis();
       gNfc.setListen(false);
@@ -95,8 +95,7 @@ static void serviceOta() {
     ArduinoOTA.begin();
     gOtaBegun = true;
     gWeb.setOtaReady(true);
-    Serial.println("[OTA] ready host=" + gWeb.staHostname() +
-                   ".local ip=" + gWeb.staIp() + " fw=" FW_VERSION);
+    Serial.println("[OTA] ready ip=" + gWeb.staIp() + " fw=" FW_VERSION);
   }
   ArduinoOTA.handle();
 }
@@ -487,8 +486,7 @@ static void serviceBootLongPress() {
       Serial.println("[BOOT] force SoftAP ON -> " + gWeb.apSsid() +
                      " pass=" + AP_PASSWORD);
       Serial.println("[BOOT] 手机连热点后打开 http://192.168.4.1/");
-      Serial.println("[BOOT] STA ip=" + gWeb.staIp() + " ota=" +
-                     gWeb.staHostname() + ".local");
+      Serial.println("[BOOT] STA ip=" + gWeb.staIp() + " ota=ip");
     }
   } else {
     if (gForceApArmed && !gForceApHandled && (now - gBootHoldStartMs) >= 1500 &&
@@ -542,8 +540,8 @@ static void handleSerial() {
           Serial.println("[CMD] ap_ip=" + WiFi.softAPIP().toString());
         }
         Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
-                       " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
-                       ".local ota=" + String(gOtaBegun ? "on" : "off"));
+                       " ip=" + gWeb.staIp() + " name=" + gWeb.staHostname() +
+                       " ota=" + String(gOtaBegun ? "on" : "off"));
       } else if (line == "wifi off") {
         // 与网页一致：只关热点、保留 STA；BT 栈由 serviceBtStackInit 延时起
         gCfg.saveWifiEnabled(false);
@@ -600,8 +598,8 @@ static void handleSerial() {
                       WiFi.softAPmacAddress().c_str(),
                       (unsigned)ESP.getFreeHeap(), (int)gBtStackInited);
         Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
-                       " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
-                       ".local ota=" + String(gOtaBegun ? "on" : "off") +
+                       " ip=" + gWeb.staIp() + " name=" + gWeb.staHostname() +
+                       " ota=" + String(gOtaBegun ? "on" : "off") +
                        " rssi=" + String(gWeb.staConnected() ? WiFi.RSSI() : 0));
       } else if (line == "relay high" || line == "relay low" || line == "relay pulse") {
         int pin = gDoor.relayPin();
@@ -1181,8 +1179,7 @@ void setup() {
     Serial.println("[BOOT] WiFi=调试模式：重新上电会自动再开热点");
 #endif
     if (gWeb.staConfigured()) {
-      Serial.println("[BOOT] 已配家庭 Wi‑Fi，将连 STA：主机 " + gWeb.staHostname() +
-                     ".local（OTA）");
+      Serial.println("[BOOT] 已配家庭 Wi‑Fi，将连 STA（OTA 用 STA IP）");
     }
   } else {
     Serial.println("[BOOT] SoftAP off (wifi_on=0) — will NOT auto-start AP again");

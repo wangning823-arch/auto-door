@@ -2,7 +2,6 @@
 #include "config.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ESPmDNS.h>
 #include "ble_bond.h"
 
 static WebServer server(80);
@@ -110,7 +109,7 @@ String WebPortal::pageHtml() const {
   if (!staWanted_)
     html += F("未配置（OTA 需要）");
   else if (staConnected())
-    html += staIp() + F(" · OTA: ") + host_ + F(".local");
+    html += staIp() + F(" · OTA: ") + staIp();
   else
     html += F("连接中/失败");
   html += F("</span></div><div class=\"row\"><span class=\"k\">门状态</span><span class=\"v\">");
@@ -720,10 +719,8 @@ void WebPortal::setupRoutes() {
           "padding:24px;text-align:center'>"
           "<h2>家庭 Wi‑Fi 已保存</h2><p>SSID：<code>");
     body += ssid;
-    body += F("</code></p><p style='color:#f2c94c'>正在连接… 约几秒后刷新首页看状态。"
-              "连上后无线烧录主机名：</p><p><code>");
-    body += gPortal->host_;
-    body += F(".local</code></p>"
+    body += F("</code></p><p style='color:#2f80ed'>正在连接… 约几秒后刷新首页看状态。"
+              "连上后无线烧录用 STA IP（首页/串口 wifi status）。</p>"
               "<p><a style='color:#2f80ed' href='/'>返回设置</a></p></body>");
     server.send(200, "text/html; charset=utf-8", body);
   });
@@ -898,16 +895,8 @@ void WebPortal::startStaFromStore() {
   // （wifi: Should enable WiFi modem sleep when both WiFi and Bluetooth are enabled）
   WiFi.setSleep(true);
 
-  // mDNS：BT 已在跑时跳过（ESPmDNS+SerialBT 易崩），OTA 用 IP 即可
-  if (!mdnsOn_ && !/* placeholder */ false) {
-    // 由 main 在无 BT 或确认安全时再开；此处仅在未起 BT 时尝试
-  }
-  // 明确：STA 模式下暂不开 mDNS，避免 BT+WiFi+mDNS 三栈崩溃
-  if (!mdnsOn_) {
-    Serial.println("[WEB] skip MDNS (BT may be active); use STA IP for web/OTA");
-  }
-
-  Serial.println("[WEB] STA begin ssid=" + ssid + " hostname=" + host_ + ".local");
+  // 已去 mDNS（产品不需要，且 ESPmDNS+BT 易崩）：web/OTA 一律用 STA IP
+  Serial.println("[WEB] STA begin ssid=" + ssid);
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.println("[WEB] WiFi.begin called");
   staTrying_ = true;
@@ -918,10 +907,6 @@ void WebPortal::stopSta() {
   staWanted_ = false;
   staTrying_ = false;
   WiFi.disconnect(false, false);
-  if (mdnsOn_) {
-    MDNS.end();
-    mdnsOn_ = false;
-  }
   if (apActive_) {
     WiFi.mode(WIFI_AP);
   } else {
@@ -952,8 +937,7 @@ void WebPortal::loopSta() {
       if (staTrying_) {
         staTrying_ = false;
         Serial.println("[WEB] STA connected ip=" + WiFi.localIP().toString() +
-                       " host=" + host_ + ".local http=" +
-                       String(serverStarted_ ? "up" : "down"));
+                       " http=" + String(serverStarted_ ? "up" : "down"));
       } else if (Serial.availableForWrite() > 160) {
         Serial.printf("[WEB] sta=up ip=%s http=%s heap=%u maxblk=%u\n",
                       WiFi.localIP().toString().c_str(),

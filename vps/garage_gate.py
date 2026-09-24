@@ -49,6 +49,15 @@ OTA_DIR = os.path.join(BASE_DIR, "ota")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 UI_PASSWORD_FILE = os.path.join(BASE_DIR, "ui_password")
 
+# 调试期关闭网页登录（地址未公开）。上线前改回 True。
+# 也可用环境变量 GARAGE_UI_AUTH=0/1 覆盖。
+def _auth_required():
+    v = os.environ.get("GARAGE_UI_AUTH")
+    if v is not None:
+        return v not in ("0", "off", "false", "no")
+    return False
+
+
 _ui_tokens = set()
 _ui_lock = threading.Lock()
 
@@ -97,6 +106,8 @@ def _ui_password():
 
 
 def _check_ui_token(token):
+    if not _auth_required():
+        return True
     if not token:
         return False
     with _ui_lock:
@@ -837,6 +848,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # ===== 登录 / 管理 API =====
+        if path in ("/api/auth",) and method == "GET":
+            self._send_json(200, {"ok": 1, "required": _auth_required()})
+            return
+
         if path in ("/api/login",) and method == "POST":
             raw = self._read_body()
             try:
@@ -844,6 +859,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 body = {}
             pw = (body.get("password") or "").strip()
+            if not _auth_required():
+                token = uuid.uuid4().hex
+                with _ui_lock:
+                    _ui_tokens.add(token)
+                self._send_json(200, {"ok": 1, "token": token, "auth": 0})
+                return
             if pw and pw == _ui_password():
                 token = uuid.uuid4().hex
                 with _ui_lock:
