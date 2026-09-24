@@ -1,4 +1,10 @@
 #include "rf_capture.h"
+#include "esp32-hal-rmt.h"
+
+// RMT：硬件按 µs 时序发 OOK，主循环不必 delay 等待
+static rmt_obj_t* s_rmtTx = nullptr;
+// 每 rmt_data_t 装 2 段（level+duration）；80脉冲×12帧 + 帧间隔 ≈ 486 项
+static rmt_data_t s_rmtBuf[512];
 
 static volatile uint16_t rfPulseBuf[RF_CAPTURE_MAX_PULSES];
 static volatile uint32_t rfLastChangeUs = 0;
@@ -66,7 +72,29 @@ void RfCapture::begin(int rxPin, int txPin) {
   pinMode(txPin_, OUTPUT);
   digitalWrite(txPin_, LOW);
   txBusy_ = false;
+  txEndAtUs_ = 0;
   for (int i = 0; i < RF_KEY_COUNT; i++) keyLen_[i] = 0;
+  ensureRmt();
+}
+
+bool RfCapture::ensureRmt() {
+  if (s_rmtTx) return true;
+  if (txPin_ < 0) return false;
+  s_rmtTx = rmtInit(txPin_, RMT_TX_MODE, RMT_MEM_512);
+  if (!s_rmtTx) {
+    Serial.println("[RF] RMT init fail → 回退软件 bit-bang");
+    return false;
+  }
+  rmtSetTick(s_rmtTx, 1.0f);  // 1µs / tick
+  Serial.printf("[RF] RMT TX ready GPIO%d (async)\n", txPin_);
+  return true;
+}
+
+void RfCapture::service() {
+  if (!txBusy_) return;
+  if ((int32_t)(micros() - txEndAtUs_) < 0) return;
+  txBusy_ = false;
+  if (Serial.availableForWrite() > 32) Serial.println("[RF] async TX done");
 }
 
 void RfCapture::forceTxLow() {
@@ -570,21 +598,83 @@ void RfCapture::exportKeyCsv(int idx) const {
   Serial.println();
 }
 
-bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
+// 与旧软件发射同一语义：偶数段高（载波）、奇数段低；≥RF_INTER_FRAME_MIN_US 强制为低
+static bool rmtPack(const uint16_t* p, uint16_t n, uint8_t repeats,
+                    rmt_data_t* out, size_t maxItems, size_t* outItems,
+                    uint32_t* outUs) {
+  // 先摊平成 (level, us) 再两两压入 rmt_data_t
+  struct Slot {
+    uint16_t us;
+    uint8_t level;
+  };
+  static Slot slots[RF_KEY_MAX_PULSES * RF_PLAY_REPEATS + 32];
+  size_t ns = 0;
+  uint32_t totalUs = 0;
+  if (repeats == 0) repeats = 1;
+  for (uint8_t r = 0; r < repeats; r++) {
+    for (uint16_t i = 0; i < n; i++) {
+      uint16_t d = p[i];
+      if (d >= RF_INTER_FRAME_MIN_US) d = (d > 32767) ? 32767 : d;
+      else if (d > 32767) d = 32767;
+      uint8_t level = ((i % 2) == 0 && d < RF_INTER_FRAME_MIN_US) ? 1 : 0;
+      if (d == 0) continue;
+      if (ns < sizeof(slots) / sizeof(slots[0])) {
+        slots[ns].us = d;
+        slots[ns].level = level;
+        ns++;
+        totalUs += d;
+      }
+    }
+    if (r + 1 < repeats) {
+      uint16_t g = RF_FRAME_GAP_US;
+      if (g > 32767) g = 32767;
+      if (ns < sizeof(slots) / sizeof(slots[0])) {
+        slots[ns].us = g;
+        slots[ns].level = 0;
+        ns++;
+        totalUs += g;
+      }
+    }
+  }
+  // 奇数段补 0 长度占位，保证末位为低
+  if (ns < sizeof(slots) / sizeof(slots[0]) && (ns % 2) == 1) {
+    slots[ns].us = 1;
+    slots[ns].level = 0;
+    ns++;
+    totalUs += 1;
+  }
+  size_t items = (ns + 1) / 2;
+  if (items > maxItems) return false;
+  for (size_t i = 0; i < items; i++) {
+    size_t a = i * 2;
+    size_t b = a + 1;
+    out[i].val = 0;
+    out[i].duration0 = (a < ns) ? slots[a].us : 0;
+    out[i].level0 = (a < ns) ? slots[a].level : 0;
+    out[i].duration1 = (b < ns) ? slots[b].us : 0;
+    out[i].level1 = (b < ns) ? slots[b].level : 0;
+  }
+  // 结束符
+  if (items < maxItems) {
+    out[items].val = 0;
+    items++;
+  }
+  *outItems = items;
+  *outUs = totalUs;
+  return true;
+}
+
+bool RfCapture::playFrameSoftware(const uint16_t* p, uint16_t n, uint8_t repeats) {
   if (txPin_ < 0 || !p || n < 5) return false;
   if (repeats == 0) repeats = 1;
-  // 日志放到发射之后：TX 缓冲满时 println 会阻塞，等于永远不发 RF
   pinMode(txPin_, OUTPUT);
   digitalWrite(txPin_, LOW);
   delayMicroseconds(100);
   txBusy_ = true;
-
   for (uint8_t r = 0; r < repeats; r++) {
     for (uint16_t i = 0; i < n; i++) {
-      // OOK：偶数段为高（载波开），奇数为低；帧内长间隔当低电平保持
       bool high = (i % 2) == 0;
       uint16_t d = p[i];
-      // 关中断再 delay：WiFi/BT ISR 会拉长 delayMicroseconds，门机解不了码
       noInterrupts();
       digitalWrite(txPin_, high ? HIGH : LOW);
       if (d >= RF_INTER_FRAME_MIN_US) {
@@ -600,9 +690,45 @@ bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
   }
   digitalWrite(txPin_, LOW);
   txBusy_ = false;
+  return true;
+}
+
+bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
+  if (txPin_ < 0 || !p || n < 5) return false;
+  if (repeats == 0) repeats = 1;
+  if (!ensureRmt()) return playFrameSoftware(p, n, repeats);
+
+  size_t items = 0;
+  uint32_t totalUs = 0;
+  if (!rmtPack(p, n, repeats, s_rmtBuf,
+               sizeof(s_rmtBuf) / sizeof(s_rmtBuf[0]), &items, &totalUs)) {
+    // 超长：退回软件路径（阻塞，但功能不丢）
+    return playFrameSoftware(p, n, repeats);
+  }
+
+  // rmtWrite 非阻塞：波形由 RMT 硬件发出，loop 立刻继续
+  if (!rmtWrite(s_rmtTx, s_rmtBuf, items)) {
+    return playFrameSoftware(p, n, repeats);
+  }
+  txBusy_ = true;
+  txEndAtUs_ = micros() + totalUs + 500;  // 余量
   if (Serial.availableForWrite() > 32) {
-    Serial.printf("[RF] 发射完成 TX=GPIO%d x%u 帧, %u 脉冲\n", txPin_,
-                  repeats, n);
+    Serial.printf("[RF] async TX start GPIO%d x%u 帧 ~%uus\n", txPin_,
+                  repeats, (unsigned)totalUs);
+  }
+  return true;
+}
+
+bool RfCapture::playFrameWait(const uint16_t* p, uint16_t n, uint8_t repeats) {
+  if (!playFrame(p, n, repeats)) return false;
+  uint32_t start = millis();
+  while (txBusy_) {
+    service();
+    if ((millis() - start) > 5000) {
+      txBusy_ = false;
+      break;
+    }
+    delay(1);
   }
   return true;
 }
@@ -764,7 +890,7 @@ bool RfCapture::loopbackKey(int idx, uint8_t repeats) {
   // 3) 空帧唤醒发射通路（不计入对比），再正式发
   {
     uint16_t warm[8] = {100, 100, 400, 400, 100, 100, 400, 400};
-    playFrame(warm, 8, 1);
+    playFrameWait(warm, 8, 1);
     delay(100);
   }
   rfCapturing = false;
@@ -774,7 +900,7 @@ bool RfCapture::loopbackKey(int idx, uint8_t repeats) {
   rfCapturing = true;
   Serial.println("[RF] 开始正式发射...");
 
-  bool txOk = playFrame(txP, txN, repeats);
+  bool txOk = playFrameWait(txP, txN, repeats);
 
   // 4) 等帧间静默结束
   uint32_t waitStart = millis();
@@ -964,7 +1090,7 @@ bool RfCapture::benchLoopbackKey(int idx, uint8_t rounds, uint32_t intervalMs) {
 
     uint32_t t0 = millis();
     Serial.printf("[RF] ---- 轮次 %u/%u ----\n", r, rounds);
-    playFrame(txP, txN, RF_PLAY_REPEATS);
+    playFrameWait(txP, txN, RF_PLAY_REPEATS);
 
     uint32_t waitStart = millis();
     while (rfCapturing && (millis() - waitStart) < 1500) {

@@ -1314,6 +1314,7 @@ void loop() {
 
   // 远程令：蓝牙忙（Inquiry/BLE 扫描）绝不发 HTTP；STA 已连才轮询
   {
+    gRf.service();  // 异步 RF 发射到点后清 busy
     const bool btBusy =
         gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
     remoteCmdService(btBusy, gWeb.staConnected());
