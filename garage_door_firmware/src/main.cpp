@@ -63,6 +63,7 @@ static void serviceOta() {
   }
   if (!gOtaBegun) {
     ArduinoOTA.setHostname(gWeb.staHostname().c_str());
+    ArduinoOTA.setMdnsEnabled(false);  // 无 mDNS，客户端用 STA IP:3232
     ArduinoOTA.onStart([]() {
       Serial.println("[OTA] START ip=" + gWeb.staIp());
       gOtaActive = true;
