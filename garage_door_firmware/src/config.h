@@ -216,6 +216,11 @@
 // #define RSSI_LEAVE_SILENT_MS  35000
 
 // ===== NFC 读卡（与蓝牙共存）=====
+// I2C 超时必须短：isready 空读会 NACK，Wire 超时多长就卡多久。
+// 曾留在 1000ms → 串口反复「poll ACK 慢 1204ms」，贴卡落在黑洞里就漏刷。
+#ifndef NFC_WIRE_TIMEOUT_MS
+#define NFC_WIRE_TIMEOUT_MS 50
+#endif
 // 跟踪期不再把 poll 间隔拉到 1200ms：改「蓝牙忙时不 poll + 空窗 350ms 密扫」
 #ifndef NFC_POLL_GAP_BT_TRACK_MS
 #define NFC_POLL_GAP_BT_TRACK_MS 350

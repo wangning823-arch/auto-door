@@ -152,7 +152,7 @@ static void pn532Drain() {
       seen++;
     }
   }
-  Wire.setTimeOut(oldTo ? oldTo : 200);
+  Wire.setTimeOut(oldTo ? oldTo : NFC_WIRE_TIMEOUT_MS);
 }
 
 // 重开 I2C：RF/长超时后外设状态脏，残留 RDY 会让下一条 ACK 等到 1.3s
@@ -160,7 +160,7 @@ static void nfcRewire(int sda, int scl) {
   releaseBus(sda, scl);
   delay(25);
   Wire.begin(sda, scl, (uint32_t)100000);
-  Wire.setTimeOut(200);
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda, scl);
   delay(15);
 }
@@ -208,6 +208,7 @@ bool NfcReader::recoverBusAndResync() {
     return false;
   }
   Wire.begin(sda_, scl_, (uint32_t)100000);
+  // init 可以宽一点，结束前必须收回短超时，否则 isready NACK 会拖成 1s 级慢 ACK
   Wire.setTimeOut(1000);
   delay(50);
 
@@ -247,6 +248,7 @@ bool NfcReader::recoverBusAndResync() {
   ok_ = true;
   deferred_ = false;
   lastFieldMs_ = millis();
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   Serial.printf("[NFC] resync OK rf=%d\n", (int)rfOk);
   return true;
 }
@@ -293,8 +295,7 @@ bool NfcReader::hwInit() {
   releaseBus(sda_, scl_);
   delay(50);
   Wire.begin(sda_, scl_, (uint32_t)100000);
-  Wire.setTimeOut(1000);
-  gpio_set_pull_mode((gpio_num_t)sda_, GPIO_PULLUP_ONLY);
+  Wire.setTimeOut(1000);  // init 期宽超时；成功后在函数末尾收到 NFC_WIRE_TIMEOUT_MS
   gpio_set_pull_mode((gpio_num_t)scl_, GPIO_PULLUP_ONLY);
   delay(50);
 
@@ -377,9 +378,8 @@ bool NfcReader::hwInit() {
     return false;
   }
 
-  // 100ms 太短：readPassiveTargetID 等待时会先撞 I2C 超时（Error263）
-  // 200ms 覆盖 retries=0x04 的 ~50ms 寻卡 + 总线余量
-  Wire.setTimeOut(200);
+  // I2C 快失败：isready 空读 NACK 的阻塞时间 = Wire 超时
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   ok_ = true;
   deferred_ = false;
   listen_ = true;
@@ -677,6 +677,8 @@ bool NfcReader::poll(String& uid) {
 
   uint8_t buf[16];
   uint8_t len = 0;
+  // 每枪前钉死短超时：recover/init 可能留下 1000ms，会把 isready 拖成 1.2s 黑洞
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   uint32_t tPoll = millis();
   // 有限超时：to=0 会在本板「空读 NACK」下把 waitready 堵死（弹窗却读不到）。
   // retries=0x04 时 InList 约 50ms 自行结束，不会和下一次叠枪。
