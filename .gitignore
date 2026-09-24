@@ -20,5 +20,11 @@ id_*
 # 固件构建产物（源码本身在 monorepo 里跟踪）
 garage_door_firmware/.pio/
 
+# 内置 Adafruit_PN532 只保留源码/许可；上游附带物不入库
+garage_door_firmware/lib/Adafruit_PN532/.github/
+garage_door_firmware/lib/Adafruit_PN532/.gitignore
+garage_door_firmware/lib/Adafruit_PN532/.piopm
+garage_door_firmware/lib/Adafruit_PN532/examples/
+
 # 3D 外壳本地素材
 外壳安装3D/
