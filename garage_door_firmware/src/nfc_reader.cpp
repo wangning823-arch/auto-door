@@ -51,20 +51,20 @@ static bool busIdle(int sda, int scl) {
   return digitalRead(sda) && digitalRead(scl);
 }
 
-// SCL 被从机/半截传输按死时：必须先 Wire.end() 把引脚还给 GPIO，再 9-clock 顶开
+// SCL 被从机/半截传输按死时：Wire.end 还脚 + 推挽 9-clock。
+// 关键：时钟必须是推挽 OUTPUT；开漏 HIGH 只是松手，从机仍可按住 SCL。
 static void i2cBusRecover(int sda, int scl) {
   Wire.end();
   delay(2);
-  // 彻底把引脚从 I2C 外设拿回来，避免 GPIO 拧不动
   gpio_reset_pin((gpio_num_t)scl);
   gpio_reset_pin((gpio_num_t)sda);
   pinMode(scl, OUTPUT);
   digitalWrite(scl, HIGH);
-  delay(5);  // 推高一段时间，逼开从机拉住的 SCL
-  pinMode(scl, OUTPUT_OPEN_DRAIN);
-  digitalWrite(scl, HIGH);
-  delayMicroseconds(50);
-  pinMode(sda, INPUT_PULLUP);
+  delay(50);
+  pinMode(sda, OUTPUT);
+  digitalWrite(sda, HIGH);
+  delay(2);
+  int pushScl = digitalRead(scl);
   for (int round = 0; round < 5; round++) {
     for (int i = 0; i < 9; i++) {
       digitalWrite(scl, LOW);
@@ -72,7 +72,6 @@ static void i2cBusRecover(int sda, int scl) {
       digitalWrite(scl, HIGH);
       delayMicroseconds(80);
     }
-    pinMode(sda, OUTPUT_OPEN_DRAIN);
     digitalWrite(sda, LOW);
     delayMicroseconds(80);
     digitalWrite(sda, HIGH);
@@ -80,8 +79,12 @@ static void i2cBusRecover(int sda, int scl) {
     if (digitalRead(sda) && digitalRead(scl)) break;
     delay(5);
   }
+  // 推挽态读回：1=我们能驱动；0=硬短/对地
+  int pushAfter = digitalRead(scl);
   forceIdlePullups(sda, scl);
   delay(5);
+  Serial.printf("[NFC] bus recover pushScl=%d pushAfter=%d idleScl=%d\n",
+                pushScl, pushAfter, digitalRead(scl));
 }
 
 // I2C 超时后必须松手：否则 ESP 外设/从机时钟拉伸会把 SCL 按在 0.04
@@ -454,40 +457,37 @@ bool NfcReader::hwInit() {
   }
   absent_ = false;
 
-  // 全裸 init：nfc.begin/getFirmwareVersion 的库 waitready 会把 SCL 卡死
+  // 全裸 init：OTA 软重启不会给 PN532 断电，必须唤醒 + 清残留后再 SAM
   i2cBusRecover(sda_, scl_);
   Wire.begin(sda_, scl_, (uint32_t)100000);
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda_, scl_);
   delay(30);
   pn532Wakeup();
-  delay(10);
-  if (!pn532SamConfig()) {
-    logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
-    failRelease("raw SAM", sda_, scl_, &failStreak_);
-    ok_ = false;
-    deferred_ = true;
-    return false;
-  }
   delay(20);
-  uint32_t ver = pn532GetFwVer();
-  Serial.printf("[NFC] raw ver=0x%08X SCL=%d\n", ver, digitalRead(scl_));
-  if (!ver) {
+  pn532Drain();
+  pn532Wakeup();
+  if (!pn532SamConfig()) {
+    // 再救一轮：残余 InList 会让第一条 SAM 失败
     releaseBus(sda_, scl_);
     i2cBusRecover(sda_, scl_);
     Wire.begin(sda_, scl_, (uint32_t)100000);
     Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
-    delay(50);
-    if (pn532SamConfig()) ver = pn532GetFwVer();
-    Serial.printf("[NFC] raw ver retry=0x%08X SCL=%d\n", ver, digitalRead(scl_));
+    pn532Wakeup();
+    delay(20);
+    pn532Drain();
+    if (!pn532SamConfig()) {
+      logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
+      failRelease("raw SAM", sda_, scl_, &failStreak_);
+      ok_ = false;
+      deferred_ = true;
+      return false;
+    }
   }
-  if (!ver) {
-    logShipf("[NFC] FAIL raw ver=0 SCL=%d", digitalRead(scl_));
-    failRelease("raw ver=0", sda_, scl_, &failStreak_);
-    ok_ = false;
-    deferred_ = true;
-    return false;
-  }
+  delay(20);
+  // 版本号仅诊断：SAM 已过就不要因 ver=0 砍掉 NFC
+  uint32_t ver = pn532GetFwVer();
+  Serial.printf("[NFC] raw ver=0x%08X SCL=%d\n", ver, digitalRead(scl_));
 
   // begin() 内已 SAMConfig
   // 芯片内寻卡 0x30≈0.5s；主机 800ms 必须等到 InList 自己结束
@@ -622,6 +622,20 @@ void NfcReader::unlockBus() {
   if (busMux_) xSemaphoreGive(busMux_);
 }
 
+void NfcReader::stopForOta() {
+  suspended_ = true;
+  listen_ = false;
+  if (lockBus(300)) {
+    // 终止片上 InList，否则 OTA 软重启后 PN532 仍按住 SCL
+    pn532SetRetries(0x01);
+    pn532Drain();
+    s_inlistOpen = false;
+    releaseBus(sda_, scl_);
+    unlockBus();
+  }
+  Serial.println("[NFC] stopForOta: InList aborted, bus released");
+}
+
 void NfcReader::pushCard(const String& uid) {
   if (!cardQ_) return;
   char buf[32] = {0};
@@ -719,7 +733,8 @@ void NfcReader::maybeRecover() {
 
   // 2) deferred：慢速重试。超过 MAX 仍按 30min 保活再试，禁止永久放弃
   if (deferred_) {
-    uint32_t gap = (autoRetryCount_ < 3) ? 30000UL : NFC_AUTO_RETRY_GAP_MS;
+    // 前几次快速重试：OTA 重启后 PN532 可能 1-2s 内还忙，30s 太久
+    uint32_t gap = (autoRetryCount_ < 5) ? 3000UL : NFC_AUTO_RETRY_GAP_MS;
     if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX) gap = NFC_SLOW_KEEPALIVE_MS;
     if (!millisReached(now, lastAutoRetryMs_ + gap)) return;
     lastAutoRetryMs_ = now;

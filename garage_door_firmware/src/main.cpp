@@ -1044,7 +1044,7 @@ void setup() {
     gOtaActive = on;
     if (on) {
       gOtaActiveAtMs = millis();
-      gNfc.setListen(false);
+      gNfc.stopForOta();
       if (gBtStackInited) {
         gBt.setInquiryPaused(true);
         gBt.cancelActiveInquiry();

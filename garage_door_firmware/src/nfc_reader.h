@@ -25,6 +25,8 @@ class NfcReader {
   // OTA 写 flash / 总线占用时暂停任务
   void setSuspended(bool on) { suspended_ = on; }
   bool suspended() const { return suspended_; }
+  // OTA 前停掉片上 InList 并松总线，避免重启后 SCL 被按死
+  void stopForOta();
 
   // 是否探测到 IRQ 线
   bool irqWired() const { return irqWired_; }
