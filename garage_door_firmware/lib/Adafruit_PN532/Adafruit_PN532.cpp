@@ -58,6 +58,9 @@
 /**************************************************************************/
 
 #include "Adafruit_PN532.h"
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+#include <Wire.h>
+#endif
 
 byte pn532ack[] = {0x00, 0x00, 0xFF,
                    0x00, 0xFF, 0x00}; ///< ACK message from PN532
@@ -1554,10 +1557,18 @@ bool Adafruit_PN532::isready() {
     spi_dev->write_then_read(&cmd, 1, &reply, 1);
     return reply == PN532_SPI_READY;
   } else if (i2c_dev) {
-    // I2C ready check via reading RDY byte
-    uint8_t rdy[1];
-    i2c_dev->read(rdy, 1);
-    return rdy[0] == PN532_I2C_READY;
+    // 本板空读会 NACK：一次 isready 可能卡满 Wire 超时，必须 15ms 快失败
+    uint8_t rdy[1] = {0};
+    bool ok = false;
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+    uint16_t oldTo = (uint16_t)Wire.getTimeOut();
+    Wire.setTimeOut(15);
+    ok = i2c_dev->read(rdy, 1);
+    Wire.setTimeOut(oldTo ? oldTo : 50);
+#else
+    ok = i2c_dev->read(rdy, 1);
+#endif
+    return ok && rdy[0] == PN532_I2C_READY;
   } else if (ser_dev) {
     // Serial ready check based on non-zero read buffer
     return (ser_dev->available() != 0);
@@ -1576,21 +1587,22 @@ bool Adafruit_PN532::isready() {
 */
 /**************************************************************************/
 bool Adafruit_PN532::waitready(uint16_t timeout) {
-  // 必须用墙钟超时：原实现每圈 +10ms，但 isready() 在本板空读 NACK 时
-  // 一圈就要 ~50ms，200ms 虚拟超时实际会拖到 ~1.2s（串口反复 poll ACK 慢 1220ms）
+  // 墙钟超时 + 先看表再 isready：原 +10ms 虚拟时钟在本板会把 200ms 拖成 1.2s
   uint32_t start = millis();
-  while (!isready()) {
-    if (timeout != 0) {
-      if ((millis() - start) >= timeout) {
+  for (;;) {
+    if (timeout != 0 && (millis() - start) >= timeout) {
 #ifdef PN532DEBUG
-        PN532DEBUGPRINT.println("TIMEOUT!");
+      PN532DEBUGPRINT.println("TIMEOUT!");
 #endif
-        return false;
-      }
+      return false;
     }
-    delay(5);
+    if (isready()) return true;
+    if (timeout == 0) {
+      delay(2);
+      continue;
+    }
+    delay(2);
   }
-  return true;
 }
 
 /**************************************************************************/

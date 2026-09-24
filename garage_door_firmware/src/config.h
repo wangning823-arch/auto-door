@@ -225,9 +225,9 @@
 #ifndef NFC_POLL_GAP_BT_TRACK_MS
 #define NFC_POLL_GAP_BT_TRACK_MS 350
 #endif
-// readPassiveTargetID 等待：过短（80ms）贴卡易漏；固定给足窗口
+// readPassiveTargetID 主机等待：须 > 芯片 retries=0x10 的 ~200ms 寻卡窗口
 #ifndef NFC_READ_TIMEOUT_MS
-#define NFC_READ_TIMEOUT_MS 200
+#define NFC_READ_TIMEOUT_MS 280
 #endif
 // 慢 ACK 后立刻重试的间隔（卡可能还贴着）
 #ifndef NFC_SLOW_RETRY_MS

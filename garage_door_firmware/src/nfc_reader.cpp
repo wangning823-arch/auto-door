@@ -183,7 +183,8 @@ static bool pn532RfFieldOn(int sda, int scl) {
       Serial.printf("[NFC] RF resp %02X %02X %02X %02X %02X %02X %02X %02X\n",
                     resp[0], resp[1], resp[2], resp[3], resp[4], resp[5],
                     resp[6], resp[7]);
-      nfcRewire(sda, scl);  // 读完再干净开下一条 poll
+      // 成功后禁止 rewire：会把下一条 InList 打成 1s 级慢 ACK
+      Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
       return true;
     }
     Serial.printf("[NFC] RF field try%d ack=0\n", attempt);
@@ -225,7 +226,7 @@ bool NfcReader::recoverBusAndResync() {
     return false;
   }
   {
-    bool retriesOk = nfc.setPassiveActivationRetries(0x04);
+    bool retriesOk = nfc.setPassiveActivationRetries(0x10);
     if (!retriesOk) {
       failRelease("resync retries", sda_, scl_, &failStreak_);
       ok_ = false;
@@ -340,10 +341,10 @@ bool NfcReader::hwInit() {
   }
 
   // begin() 内已 SAMConfig
-  // 必须有限重试：0xFF 会让 InList 一直挂着，配合空读 NACK 的 isready()
-  // 把 NFC 任务堵死（手机弹窗=场在，但 UID 永远读不出）。0x04≈50ms 干净返回。
+  // 0x10≈200ms 芯片内寻卡：盖住一次贴卡；主机超时须 > 芯片窗口，避免超时叠枪。
+  // 0x04≈50ms 太短，贴卡经常落在 InList 空窗里（漏刷）。
   {
-    bool ack = nfc.setPassiveActivationRetries(0x04);
+    bool ack = nfc.setPassiveActivationRetries(0x10);
     Serial.printf("[NFC] setRetries ack=%d SCL=%d\n", (int)ack,
                   digitalRead(scl_));
     if (!ack || !busIdle(sda_, scl_)) {
@@ -700,9 +701,10 @@ bool NfcReader::poll(String& uid) {
 
   if (!ret || len < 4) {
     // 慢/超时：禁止 rewire（会掐死场内正在激活的卡）；只 drain 后立刻再 InList
-    if (cost > 400) {
-      Serial.printf("[NFC] poll ACK 慢 %ums → drain+retry streak=%u\n",
-                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
+    if (cost > 500) {
+      Serial.printf("[NFC] poll ACK 慢 %ums wire=%u to=%u → drain+retry streak=%u\n",
+                    (unsigned)cost, (unsigned)Wire.getTimeOut(),
+                    (unsigned)NFC_READ_TIMEOUT_MS, (unsigned)(slowAckStreak_ + 1));
       pn532Drain();
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
