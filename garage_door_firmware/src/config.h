@@ -1,5 +1,10 @@
 #pragma once
 
+// 多板区分：量产主门 door；测试板编译加 -DDEVICE_ROLE=\"lab\"
+#ifndef DEVICE_ROLE
+#define DEVICE_ROLE "door"
+#endif
+
 // ===== 车库门控制器 P0 配置 =====
 // 引脚按 ESP32 DevKit / WROOM32 常见接法，可按实际改
 
@@ -57,6 +62,9 @@
 #endif
 #ifndef OTA_BIN_URL
 #define OTA_BIN_URL "http://door.wzx.homes/ota/firmware.bin"
+#endif
+#ifndef STATUS_REPORT_URL
+#define STATUS_REPORT_URL "http://door.wzx.homes/dev/status"
 #endif
 #ifndef OTA_CHECK_INTERVAL_MS
 #define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 正式每天一次；开发用 poll 的 update 令

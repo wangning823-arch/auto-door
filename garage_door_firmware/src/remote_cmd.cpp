@@ -1,5 +1,6 @@
 #include "remote_cmd.h"
 #include "config.h"
+#include "device_id.h"
 #include "log_ship.h"
 
 #include <WiFi.h>
@@ -272,11 +273,13 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
     path = REMOTE_HTTP_PATH;
     isHttps = (port == 443);
   }
-  // 带上固件版本：服务端落后时直接回 {"cmd":"update"}
+  // 带上设备 id + 固件版本：多板不抢指令；落后时直接回 {"cmd":"update"}
   {
     String q = path;
     q += (path.indexOf('?') >= 0) ? '&' : '?';
-    q += "fw=";
+    q += "id=";
+    q += deviceId();
+    q += "&fw=";
     q += FW_VERSION;
     path = q;
   }

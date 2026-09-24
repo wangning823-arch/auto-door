@@ -1,5 +1,6 @@
 #include "log_ship.h"
 #include "config.h"
+#include "device_id.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 
@@ -148,6 +149,11 @@ void logShipService(bool btBusy, bool wifiOk) {
   String body;
   body.reserve(s_len);
   body.concat(s_ring, s_len);
+  if (path.indexOf("id=") < 0) {
+    path += (path.indexOf('?') >= 0 ? '&' : '?');
+    path += "id=";
+    path += deviceId();
+  }
   const bool ok = httpPostLogs(host, port, path, body);
   s_force = false;
   if (ok) {

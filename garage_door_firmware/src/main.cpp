@@ -15,6 +15,8 @@
 #include "remote_cmd.h"
 #include "log_ship.h"
 #include "remote_ota.h"
+#include "status_report.h"
+#include "device_id.h"
 
 // ===== 车库门智能控制器 P0.1 =====
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
@@ -1037,6 +1039,7 @@ void setup() {
   gCfg.begin();
   remoteCmdBegin(&gCfg);
   logShipBegin();
+  statusReportBegin();
   remoteOtaBegin(&gCfg);
   remoteOtaSetBusyHook([](bool on) {
     gOtaActive = on;
@@ -1318,6 +1321,30 @@ void loop() {
     remoteCmdService(btBusy, gWeb.staConnected());
     logShipService(btBusy, gWeb.staConnected());
     remoteOtaService(btBusy, gWeb.staConnected());
+    {
+      StatusBits sb;
+      sb.nfcOk = gNfc.ok();
+      sb.nfcDeferred = gNfc.deferred();
+      sb.nfcAbsent = gNfc.absent();
+      sb.nfcListen = gNfc.listen();
+      sb.webUp = true;
+      sb.sta = gWeb.staConnected();
+      sb.ap = gWeb.apActive();
+      sb.rfOpen = gRf.keyValid(RF_KEY_OPEN);
+      sb.rfClose = gRf.keyValid(RF_KEY_CLOSE);
+      sb.rfTxBusy = gRf.txBusy();
+      sb.remoteOn = remoteCmdEnabled();
+      sb.door = (int)gDoor.doorState();
+      sb.rssi = gWeb.staConnected() ? WiFi.RSSI() : 0;
+      sb.heap = ESP.getFreeHeap();
+      sb.maxblk = ESP.getMaxAllocHeap();
+      sb.uptimeMs = millis();
+#ifdef DEVICE_ROLE
+      sb.role = DEVICE_ROLE;
+#endif
+      statusReportSetBits(sb);
+      statusReportService(btBusy, gWeb.staConnected());
+    }
   }
 
   // ===== 跟踪模式分发 =====
