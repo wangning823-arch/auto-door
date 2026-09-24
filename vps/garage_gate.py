@@ -16,7 +16,7 @@
   管理（HTTPS + token）：
     POST /api/login
     GET  /api/devices | /api/devices/{id} | /api/devices/{id}/logs
-    POST /api/devices/{id}/open|close|update
+    POST /api/devices/{id}/open|close|update|logs/clear
     POST /api/open|close|update          # 不带 id → 主门
     GET  /api/ota
     POST /api/ota/upload?version=        # raw firmware.bin
@@ -377,11 +377,32 @@ def _health_bits(st):
     return {"nfc": nfc_s, "web": web_s, "rf": rf_s, "sta": "ok" if (st or {}).get("sta") else "off"}
 
 
+def _stamp_device_log(text):
+    """给每行打上服务器接收时间；已带时间戳的行不重复加。"""
+    if not text or not text.strip():
+        return ""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        s = line.lstrip()
+        # 形如 2026-09-24 21:30:00 …
+        if len(s) >= 19 and s[4] == "-" and s[7] == "-" and s[10] == " " and s[13] == ":":
+            out.append(line)
+        else:
+            out.append("%s %s" % (ts, line))
+    return "\n".join(out) + "\n"
+
+
 def _append_device_log(text, dev_id=None):
     dev_id = (dev_id or DEFAULT_DEVICE).replace("/", "_").replace("..", "_")[:48]
     try:
         if not os.path.isdir(LOG_DIR):
             os.makedirs(LOG_DIR)
+        text = _stamp_device_log(text)
+        if not text:
+            return True
         day = time.strftime("%Y%m%d")
         path = os.path.join(LOG_DIR, "device-%s-%s.log" % (dev_id, day))
         # 兼容旧文件名
@@ -391,8 +412,6 @@ def _append_device_log(text, dev_id=None):
                 path = legacy
         with open(path, "a") as f:
             f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
         try:
             names = sorted(
                 n for n in os.listdir(LOG_DIR)
@@ -428,6 +447,33 @@ def _read_device_log(dev_id, day=None, lines=200):
         return "".join(all_lines[-n:])
     except Exception as e:
         return "read fail: %s\n" % e
+
+
+def _clear_device_log(dev_id):
+    """删除该设备全部历史日志文件，返回删除个数。"""
+    dev_id = (dev_id or DEFAULT_DEVICE).replace("/", "_").replace("..", "_")[:48]
+    removed = 0
+    try:
+        if not os.path.isdir(LOG_DIR):
+            return 0
+        prefix = "device-%s-" % dev_id
+        for n in os.listdir(LOG_DIR):
+            if not n.endswith(".log"):
+                continue
+            path = os.path.join(LOG_DIR, n)
+            if not os.path.isfile(path):
+                continue
+            hit = n.startswith(prefix)
+            if not hit and dev_id == DEFAULT_DEVICE:
+                body = n[len("device-"):-len(".log")]
+                hit = body.isdigit() and len(body) == 8
+            if hit:
+                os.remove(path)
+                removed += 1
+        return removed
+    except Exception as e:
+        _log("clear device log fail: %s" % e)
+        return removed
 
 
 def _ota_version_info():
@@ -926,6 +972,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._read_body()
                 self._cmd_for_device(parts[4], unquote(parts[3]))
                 return
+            # POST /api/devices/{id}/logs/clear — 清掉该设备历史日志
+            if len(parts) == 6 and parts[4] == "logs" and parts[5] == "clear":
+                self._read_body()
+                if not self._require_auth():
+                    return
+                dev_id = unquote(parts[3])
+                n = _clear_device_log(dev_id)
+                _log("[%s] device logs cleared (%d files)" % (dev_id, n))
+                self._send_json(200, {"ok": 1, "id": dev_id, "removed": n})
+                return
 
         if path in ("/api/devices",) and method == "GET":
             if not self._require_auth():
@@ -936,7 +992,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": 1, "devices": items, "ota": _ota_version_info()})
             return
 
-        if method == "GET" and path.startswith("/api/devices/"):
+        if method in ("GET", "DELETE") and path.startswith("/api/devices/"):
             parts = path.split("/")
             if len(parts) >= 4:
                 dev_id = unquote(parts[3])
@@ -955,6 +1011,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if len(parts) == 5 and parts[4] == "logs":
                     if not self._require_auth():
+                        return
+                    if method == "DELETE":
+                        n = _clear_device_log(dev_id)
+                        _log("[%s] device logs cleared (%d files)" % (dev_id, n))
+                        self._send_json(200, {"ok": 1, "id": dev_id, "removed": n})
                         return
                     day = self._q("day") or time.strftime("%Y%m%d")
                     lines = self._q("lines") or "200"
