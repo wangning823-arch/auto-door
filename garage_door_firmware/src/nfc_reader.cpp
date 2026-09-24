@@ -43,38 +43,45 @@ static void forceIdlePullups(int sda, int scl) {
 #define NFC_PROBE_TIMEOUT_MS 40
 #define NFC_PROBE_RETRIES 3
 
+// （实现见上方 i2cBusRecover：前向声明供 pn532WaitRdy 等使用）
+
+static bool busIdle(int sda, int scl) {
+  forceIdlePullups(sda, scl);
+  delay(2);
+  return digitalRead(sda) && digitalRead(scl);
+}
+
+// SCL 被从机/半截传输按死时：必须先 Wire.end() 把引脚还给 GPIO，再 9-clock 顶开
 static void i2cBusRecover(int sda, int scl) {
-  // 先推拉顶一下：PN532 从机拉住 SCL 时，仅开漏 9-clock 顶不开
+  Wire.end();
+  delay(2);
+  // 彻底把引脚从 I2C 外设拿回来，避免 GPIO 拧不动
+  gpio_reset_pin((gpio_num_t)scl);
+  gpio_reset_pin((gpio_num_t)sda);
   pinMode(scl, OUTPUT);
   digitalWrite(scl, HIGH);
-  delay(2);
+  delay(5);  // 推高一段时间，逼开从机拉住的 SCL
   pinMode(scl, OUTPUT_OPEN_DRAIN);
   digitalWrite(scl, HIGH);
   delayMicroseconds(50);
   pinMode(sda, INPUT_PULLUP);
-  for (int round = 0; round < 3; round++) {
+  for (int round = 0; round < 5; round++) {
     for (int i = 0; i < 9; i++) {
       digitalWrite(scl, LOW);
       delayMicroseconds(80);
       digitalWrite(scl, HIGH);
       delayMicroseconds(80);
     }
+    pinMode(sda, OUTPUT_OPEN_DRAIN);
+    digitalWrite(sda, LOW);
+    delayMicroseconds(80);
+    digitalWrite(sda, HIGH);
+    delayMicroseconds(80);
     if (digitalRead(sda) && digitalRead(scl)) break;
-    delay(3);
+    delay(5);
   }
-  pinMode(sda, OUTPUT_OPEN_DRAIN);
-  digitalWrite(sda, LOW);
-  delayMicroseconds(80);
-  digitalWrite(sda, HIGH);
-  delayMicroseconds(80);
   forceIdlePullups(sda, scl);
   delay(5);
-}
-
-static bool busIdle(int sda, int scl) {
-  forceIdlePullups(sda, scl);
-  delay(2);
-  return digitalRead(sda) && digitalRead(scl);
 }
 
 // I2C 超时后必须松手：否则 ESP 外设/从机时钟拉伸会把 SCL 按在 0.04
@@ -120,6 +127,7 @@ bool NfcReader::probePresent() {
 }
 
 // ===== 裸 PN532 I2C：绕开 Adafruit waitready（假时钟会把贴卡拖成 1.3s 超时）=====
+static void pn532Drain();
 static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   const uint8_t addr = PN532_I2C_ADDRESS;
   uint8_t packet[32];
@@ -142,17 +150,25 @@ static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   Wire.endTransmission();
 }
 
+static void i2cBusRecover(int sda, int scl);
+
 static bool pn532WaitRdy(uint32_t budgetMs) {
   uint32_t start = millis();
-  Wire.setTimeOut(15);
-  for (;;) {
-    if ((millis() - start) >= budgetMs) return false;
+  uint16_t oldTo = (uint16_t)Wire.getTimeOut();
+  Wire.setTimeOut(15);  // 仅状态轮询要快失败；结束后必须恢复
+  bool ready = false;
+  while ((millis() - start) < budgetMs) {
     uint8_t rdy = 0;
     uint8_t n = Wire.requestFrom((uint8_t)PN532_I2C_ADDRESS, (uint8_t)1);
     if (n == 1 && Wire.available()) rdy = (uint8_t)Wire.read();
-    if (rdy == PN532_I2C_READY) return true;
+    if (rdy == PN532_I2C_READY) {
+      ready = true;
+      break;
+    }
     delay(2);
   }
+  Wire.setTimeOut(oldTo ? oldTo : NFC_WIRE_TIMEOUT_MS);
+  return ready;
 }
 
 // 读一帧（先剥 RDY 字节）；budgetMs 内等 RDY
@@ -183,37 +199,91 @@ static bool pn532ReadAck(uint32_t budgetMs) {
          buf[4] == 0xFF && buf[5] == 0x00;
 }
 
-// InListPassiveTarget：芯片内寻卡 waitMs，成功则写出 UID
-// 返回 1=读到卡 0=无卡 -1=总线/超时（禁止在 -1 时立刻 drain，可能正卡着响应）
+// InList 是否仍在芯片里搜卡（retries=0xFF 时超时后芯片继续搜，禁止叠发新 InList）
+static bool s_inlistOpen = false;
+
+// 等当前 InList 的出卡帧。s_inlistOpen 时先不发新命令。
+// 返回 1=卡 0=本轮窗口未出卡（芯片可能仍在搜） -1=帧/总线错
 static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
-  uint8_t cmd[3] = {0x4A, 0x01, 0x04};  // InList, 1 tg, ISO14443A
-  pn532WriteCmd(cmd, 3);
-  if (!pn532ReadAck(NFC_INLIST_ACK_MS)) return -1;
+  if (!s_inlistOpen) {
+    uint8_t cmd[3] = {0x4A, 0x01, 0x04};  // InList, 1 tg, ISO14443A
+    pn532WriteCmd(cmd, 3);
+    if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
+      pn532Drain();
+      return -1;
+    }
+    s_inlistOpen = true;
+  }
   uint8_t resp[32] = {0};
   int n = pn532ReadFrame(resp, 28, NFC_INLIST_WAIT_MS);
-  if (n < 8) return -1;
-  // 帧：00 00 FF LEN LCS TFI(=D5) 4B NbTg ...
-  int p = 0;
-  if (n >= 6 && resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) {
-    p = 5;  // 过 preamble/start/len/lcs → TFI
+  if (n < 8) {
+    // 本轮没出卡：InList 仍在芯片里（0xFF），保持 open，禁止再 write
+    // 若 SCL 已被按死，必须先救总线，否则永远读不到出卡帧
+    if (!digitalRead(PIN_NFC_SCL) || !digitalRead(PIN_NFC_SDA)) {
+      i2cBusRecover(PIN_NFC_SDA, PIN_NFC_SCL);
+    }
+    return 0;
   }
+  s_inlistOpen = false;
+  int p = 0;
+  if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
   if (p >= n || resp[p] != 0xD5) return -1;
   p++;
   if (p >= n || resp[p] != 0x4B) return -1;
   p++;
   if (p >= n) return -1;
-  uint8_t nb = resp[p++];  // NbTg
-  if (nb == 0) return 0;
+  uint8_t nb = resp[p++];
+  if (nb == 0) {
+    // 有限重试会回 0 tags：允许下一轮重发
+    return 0;
+  }
   if (p + 3 >= n) return -1;
-  p++;                   // Tg
-  p += 2;                // SENS_RES
-  p++;                   // SEL_RES
+  p++;
+  p += 2;
+  p++;
   if (p >= n) return -1;
   uint8_t idLen = resp[p++];
   if (idLen < 4 || idLen > 7 || p + idLen > n) return -1;
   for (uint8_t i = 0; i < idLen; i++) uid[i] = resp[p + i];
   *uidLen = idLen;
   return 1;
+}
+
+// 裸发命令并吃掉响应：setRetries/SAMConfig 不再走 Adafruit waitready
+static bool pn532Xfer(const uint8_t* cmd, uint8_t cmdlen, uint32_t waitMs) {
+  pn532WriteCmd(cmd, cmdlen);
+  if (!pn532ReadAck(80)) return false;
+  uint8_t resp[24] = {0};
+  int n = pn532ReadFrame(resp, 20, waitMs);
+  return n >= 3 && resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF;
+}
+
+// RFConfiguration item5：MxRtyPassiveActivation = retries
+static bool pn532SetRetries(uint8_t retries) {
+  uint8_t cmd[5] = {0x32, 0x05, 0xFF, 0x01, retries};
+  return pn532Xfer(cmd, 5, 200);
+}
+
+// SAMConfig：normal mode
+static bool pn532SamConfig() {
+  uint8_t cmd[4] = {0x14, 0x01, 0x14, 0x01};
+  return pn532Xfer(cmd, 4, 200);
+}
+
+// GetFirmwareVersion
+static uint32_t pn532GetFwVer() {
+  uint8_t cmd[1] = {0x02};
+  pn532WriteCmd(cmd, 1);
+  if (!pn532ReadAck(100)) return 0;
+  uint8_t resp[24] = {0};
+  int n = pn532ReadFrame(resp, 20, 300);
+  if (n < 11) return 0;
+  int p = 0;
+  if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
+  if (p + 5 >= n || resp[p] != 0xD5 || resp[p + 1] != 0x03) return 0;
+  uint32_t ver = ((uint32_t)resp[p + 2] << 24) | ((uint32_t)resp[p + 3] << 16) |
+                 ((uint32_t)resp[p + 4] << 8) | (uint32_t)resp[p + 5];
+  return ver;
 }
 
 // 仅诊断用：自拼 RFConfiguration。正常路径勿调（失败会留脏帧）
@@ -262,32 +332,17 @@ static void nfcRewire(int sda, int scl) {
   delay(15);
 }
 
-// 持续开 RF 场：setRetries 后先 drain 再发；失败 rewire 后重试一次
+// 持续开 RF 场：必须走裸命令；库 sendCommandCheckAck 的 waitready 会把总线弄脏
 static bool pn532RfFieldOn(int sda, int scl) {
+  (void)sda;
+  (void)scl;
+  pn532Drain();
+  delay(10);
   uint8_t rfOn[3] = {0x32, 0x01, 0x01};
-  for (int attempt = 0; attempt < 2; attempt++) {
-    if (attempt == 0) {
-      pn532Drain();  // setRetries 响应可能比库读的 6 字节长
-      delay(20);
-    } else {
-      nfcRewire(sda, scl);
-      pn532Drain();
-      delay(30);
-    }
-    if (nfc.sendCommandCheckAck(rfOn, 3, 800)) {
-      uint8_t resp[12] = {0};
-      nfc.readResponse(resp, 10);
-      Serial.printf("[NFC] RF resp %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                    resp[0], resp[1], resp[2], resp[3], resp[4], resp[5],
-                    resp[6], resp[7]);
-      // 成功后禁止 rewire：会把下一条 InList 打成 1s 级慢 ACK
-      Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
-      return true;
-    }
-    Serial.printf("[NFC] RF field try%d ack=0\n", attempt);
-  }
-  nfcRewire(sda, scl);
-  return false;
+  bool ok = pn532Xfer(rfOn, 3, 200);
+  Serial.printf("[NFC] RF field raw ack=%d\n", (int)ok);
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
+  return ok;
 }
 
 // 读卡连续失败后的总线复活：不整颗 nfc.begin（避免和成功路径打架）
@@ -310,7 +365,7 @@ bool NfcReader::recoverBusAndResync() {
   Wire.setTimeOut(1000);
   delay(50);
 
-  if (!nfc.SAMConfig()) {
+  if (!pn532SamConfig()) {
     failRelease("resync SAM", sda_, scl_, &failStreak_);
     ok_ = false;
     deferred_ = true;
@@ -323,7 +378,7 @@ bool NfcReader::recoverBusAndResync() {
     return false;
   }
   {
-    bool retriesOk = nfc.setPassiveActivationRetries(NFC_INLIST_RETRIES);
+    bool retriesOk = pn532SetRetries(NFC_INLIST_RETRIES);
     if (!retriesOk) {
       failRelease("resync retries", sda_, scl_, &failStreak_);
       ok_ = false;
@@ -345,6 +400,7 @@ bool NfcReader::recoverBusAndResync() {
   failStreak_ = 0;
   ok_ = true;
   deferred_ = false;
+  s_inlistOpen = false;
   lastFieldMs_ = millis();
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   Serial.printf("[NFC] resync OK rf=%d\n", (int)rfOk);
@@ -356,17 +412,21 @@ bool NfcReader::hwInit() {
   if (sda_ < 0) return false;
   Serial.printf("[NFC] hwInit t=%ums\n", (unsigned)millis());
 
+  // SCL 被按死是本板常见故障：多轮时钟恢复，仍死则记日志退出
   releaseBus(sda_, scl_);
-  if (!busIdle(sda_, scl_)) {
-    Serial.println("[NFC] bus low → recover first");
+  for (int r = 0; r < 4 && !(digitalRead(sda_) && digitalRead(scl_)); r++) {
+    Serial.printf("[NFC] bus low → recover %d SDA=%d SCL=%d\n", r,
+                  digitalRead(sda_), digitalRead(scl_));
     i2cBusRecover(sda_, scl_);
+    releaseBus(sda_, scl_);
+    delay(10);
   }
   int idleSda = digitalRead(sda_);
   int idleScl = digitalRead(scl_);
   Serial.printf("[NFC] idle SDA=%d SCL=%d (t=%ums)\n", idleSda, idleScl,
                 (unsigned)millis());
-  // 总线仍被拉死时禁止 nfc.begin/getFirmwareVersion（会 1s 超时连打卡死 loop）
   if (!idleSda || !idleScl) {
+    logShipf("[NFC] FAIL bus stuck SDA=%d SCL=%d", idleSda, idleScl);
     Serial.println("[NFC] abort: bus not idle, will not touch PN532 cmds");
     ok_ = false;
     deferred_ = true;
@@ -389,61 +449,48 @@ bool NfcReader::hwInit() {
   }
   absent_ = false;
 
-  // begin() 后芯片可能仍在 SAMConfig 忙，先松手再读 ver，避免首读固定 1.3s 超时
-  releaseBus(sda_, scl_);
-  delay(50);
+  // 全裸 init：nfc.begin/getFirmwareVersion 的库 waitready 会把 SCL 卡死
+  i2cBusRecover(sda_, scl_);
   Wire.begin(sda_, scl_, (uint32_t)100000);
-  Wire.setTimeOut(1000);  // init 期宽超时；成功后在函数末尾收到 NFC_WIRE_TIMEOUT_MS
-  gpio_set_pull_mode((gpio_num_t)scl_, GPIO_PULLUP_ONLY);
-  delay(50);
-
-  uint32_t t0 = millis();
-  nfc.begin();  // 内部 wakeup→SAMConfig，可能拉伸
-  delay(300);   // 给 SAMConfig/时钟拉伸收尾时间
-  if (!busIdle(sda_, scl_)) {
-    failRelease("begin/SAMConfig", sda_, scl_, &failStreak_);
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
+  forceIdlePullups(sda_, scl_);
+  delay(30);
+  if (!pn532SamConfig()) {
+    logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
+    failRelease("raw SAM", sda_, scl_, &failStreak_);
     ok_ = false;
     deferred_ = true;
     return false;
   }
-
-  uint32_t ver = nfc.getFirmwareVersion();
-  Serial.printf("[NFC] ver=0x%08X cost=%ums SCL=%d\n", ver,
-                (unsigned)(millis() - t0), digitalRead(scl_));
-
+  delay(20);
+  uint32_t ver = pn532GetFwVer();
+  Serial.printf("[NFC] raw ver=0x%08X SCL=%d\n", ver, digitalRead(scl_));
   if (!ver) {
-    Serial.println("[NFC] ver=0 → recover + retry once");
     releaseBus(sda_, scl_);
     i2cBusRecover(sda_, scl_);
-    if (!busIdle(sda_, scl_)) {
-      failRelease("ver retry idle", sda_, scl_, &failStreak_);
-      ok_ = false;
-      deferred_ = true;
-      return false;
-    }
     Wire.begin(sda_, scl_, (uint32_t)100000);
-    Wire.setTimeOut(1000);
-    delay(200);
-    nfc.begin();
-    delay(200);
-    ver = nfc.getFirmwareVersion();
-    Serial.printf("[NFC] retry ver=0x%08X SCL=%d\n", ver, digitalRead(scl_));
+    Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
+    delay(50);
+    if (pn532SamConfig()) ver = pn532GetFwVer();
+    Serial.printf("[NFC] raw ver retry=0x%08X SCL=%d\n", ver, digitalRead(scl_));
   }
-
   if (!ver) {
-    failRelease("ver=0", sda_, scl_, &failStreak_);
+    logShipf("[NFC] FAIL raw ver=0 SCL=%d", digitalRead(scl_));
+    failRelease("raw ver=0", sda_, scl_, &failStreak_);
     ok_ = false;
     deferred_ = true;
     return false;
   }
 
   // begin() 内已 SAMConfig
-  // 芯片内寻卡 0x30≈0.5s，盖住一次贴卡；主机 wait 800ms 等完整 ATR
+  // 芯片内寻卡 0x30≈0.5s；主机 800ms 必须等到 InList 自己结束
+  // （若 retries 仍是默认 0xFF，空场 InList 永不结束 → 永远 ir=-1）
   {
-    bool ack = nfc.setPassiveActivationRetries(NFC_INLIST_RETRIES);
-    Serial.printf("[NFC] setRetries ack=%d SCL=%d\n", (int)ack,
-                  digitalRead(scl_));
+    bool ack = pn532SetRetries(NFC_INLIST_RETRIES);
+    Serial.printf("[NFC] setRetries raw ack=%d val=0x%02X SCL=%d\n", (int)ack,
+                  (unsigned)NFC_INLIST_RETRIES, digitalRead(scl_));
     if (!ack || !busIdle(sda_, scl_)) {
+      logShipf("[NFC] FAIL setRetries ack=%d SCL=%d", (int)ack, digitalRead(scl_));
       failRelease("setRetries", sda_, scl_, &failStreak_);
       ok_ = false;
       deferred_ = true;
@@ -469,6 +516,8 @@ bool NfcReader::hwInit() {
   }
 
   if (!busIdle(sda_, scl_)) {
+    logShipf("[NFC] FAIL post-init SDA=%d SCL=%d", digitalRead(sda_),
+             digitalRead(scl_));
     failRelease("post-init", sda_, scl_, &failStreak_);
     ok_ = false;
     deferred_ = true;
@@ -480,7 +529,7 @@ bool NfcReader::hwInit() {
   ok_ = true;
   deferred_ = false;
   listen_ = true;
-  listenUntilMs_ = 0;
+  s_inlistOpen = false;  // init 后从干净 InList 开始
   failStreak_ = 0;
   lastOkMs_ = millis();
   nextPollMs_ = millis() + 200;
@@ -782,7 +831,8 @@ bool NfcReader::poll(String& uid) {
   uint32_t cost = millis() - tPoll;
   bool ret = (ir == 1 && len >= 4);
 
-  if (!busIdle(sda_, scl_)) {
+  // 只在读到卡后才查总线；空等/出错路径上 SCL 毛刺会误触 resync 并把 ok_ 打掉
+  if (ir == 1 && !busIdle(sda_, scl_)) {
     Serial.println("[NFC] poll bus LOW → release + resync");
     releaseBus(sda_, scl_);
     recoverBusAndResync();
@@ -795,31 +845,33 @@ bool NfcReader::poll(String& uid) {
 
   if (!ret) {
     if (ir < 0) {
-      // 总线/超时：只轻量 drain，禁止 rewire（会掐死场内激活）
-      Serial.printf("[NFC] inlist miss ir=%d cost=%ums → retry streak=%u\n",
-                    ir, (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
+      Serial.printf("[NFC] inlist err ir=%d cost=%ums streak=%u open=%d\n", ir,
+                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1),
+                    (int)s_inlistOpen);
       pn532Drain();
+      s_inlistOpen = false;
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
-      if (slowAckStreak_ >= 10) {
-        Serial.println("[NFC] 连续 inlist 失败 → resync");
-        recoverBusAndResync();
+      if (slowAckStreak_ >= 3) {
+        Serial.println("[NFC] 连续 inlist 错误 → setRetries");
+        pn532SetRetries(NFC_INLIST_RETRIES);
         slowAckStreak_ = 0;
       }
       nextPollMs_ = millis();
       return false;
     }
-    // ir==0 正常无卡
+    // ir==0：等待窗内没出卡。retries=0xFF 时芯片可能仍在搜，只查看活，不重发 InList
     lastPollSlow_ = false;
     slowAckStreak_ = 0;
     if (emptyPolls_ < 100000) emptyPolls_++;
     static uint32_t lastQuietLog = 0;
     if (listen_ && millis() - lastQuietLog > 5000) {
       lastQuietLog = millis();
-      Serial.printf("[NFC] poll 无卡 cost=%ums empty=%u\n", (unsigned)cost,
+      Serial.printf("[NFC] 等卡中 cost=%ums empty=%u\n", (unsigned)cost,
                     (unsigned)emptyPolls_);
     }
-    nextPollMs_ = millis();  // 空读立刻续枪，寻卡窗口无缝衔接
+    // 短间隔只再等同一张 InList 的出卡帧（s_inlistOpen=1 时不会重发）
+    nextPollMs_ = millis() + 50;
     return false;
   }
   nextPollMs_ = millis() + gap;

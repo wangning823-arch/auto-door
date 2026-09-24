@@ -225,16 +225,18 @@
 #ifndef NFC_POLL_GAP_BT_TRACK_MS
 #define NFC_POLL_GAP_BT_TRACK_MS 350
 #endif
-// InList 芯片内寻卡窗口（RFConfiguration MxRtyPassiveActivation）
-// 0x30≈400-500ms：盖住一次贴卡；主机等待必须更长，否则卡正在 ATR 时被超时+drain 掐死
+// InList：0xFF=芯片内一直寻卡直到出卡。
+// 手机 HCE 激活要「场连续 + 同一条 InList 不中断」；短窗口反复重发会重置 ATR → 弹窗却无 UID。
+// 主机用裸 waitRdy 等到出卡（15ms 快失败，不会像 Adafruit waitready 那样假超时/堵死）。
 #ifndef NFC_INLIST_RETRIES
-#define NFC_INLIST_RETRIES 0x30
+#define NFC_INLIST_RETRIES 0xFF
 #endif
+// 单次等待上限：没卡就继续等同一条 InList（芯片仍在寻），到点后检查总线是否还活着
 #ifndef NFC_INLIST_WAIT_MS
-#define NFC_INLIST_WAIT_MS 800
+#define NFC_INLIST_WAIT_MS 3000
 #endif
 #ifndef NFC_INLIST_ACK_MS
-#define NFC_INLIST_ACK_MS 80
+#define NFC_INLIST_ACK_MS 100
 #endif
 // 慢 ACK 后立刻重试的间隔（卡可能还贴着）
 #ifndef NFC_SLOW_RETRY_MS
