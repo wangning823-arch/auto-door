@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 420" width="680" height="420">
+  <style>
+    text { font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+  </style>
+
+  <!-- 标题 -->
+  <text x="340" y="28" text-anchor="middle" font-size="14" font-weight="500" fill="#e7ecf1">PN532 NFC ↔ ESP32 接线（I2C 模式）</text>
+  <text x="340" y="48" text-anchor="middle" font-size="11" fill="#8b9aab">模块焊盘确认拨到 I2C · VCC 接 3.3V（勿接 5V）</text>
+
+  <!-- ESP32 -->
+  <rect x="40" y="80" width="200" height="260" rx="8" fill="#1a2332" stroke="#2e3d52" stroke-width="1"/>
+  <text x="140" y="110" text-anchor="middle" font-size="14" font-weight="500" fill="#2f80ed">ESP32 DevKit</text>
+  <line x1="55" y1="125" x2="225" y2="125" stroke="#2e3d52" stroke-width="0.5"/>
+
+  <!-- ESP32 引脚标签 -->
+  <text x="70" y="160" font-size="12" fill="#e7ecf1">3.3V</text>
+  <circle cx="220" cy="156" r="4" fill="#3dd68c"/>
+  <text x="70" y="200" font-size="12" fill="#e7ecf1">GND</text>
+  <circle cx="220" cy="196" r="4" fill="#8b9aab"/>
+  <text x="70" y="240" font-size="12" fill="#e7ecf1">GPIO16 (SDA)</text>
+  <circle cx="220" cy="236" r="4" fill="#2f80ed"/>
+  <text x="70" y="280" font-size="12" fill="#e7ecf1">GPIO17 (SCL)</text>
+  <circle cx="220" cy="276" r="4" fill="#f2c94c"/>
+  <text x="70" y="320" font-size="11" fill="#6b7c8f">GPIO21 已被继电器占用</text>
+
+  <!-- PN532 -->
+  <rect x="440" y="80" width="200" height="260" rx="8" fill="#1a2332" stroke="#2e3d52" stroke-width="1"/>
+  <text x="540" y="110" text-anchor="middle" font-size="14" font-weight="500" fill="#e74c3c">PN532 NFC</text>
+  <text x="540" y="130" text-anchor="middle" font-size="11" fill="#8b9aab">焊盘拨到 I2C</text>
+  <line x1="455" y1="145" x2="625" y2="145" stroke="#2e3d52" stroke-width="0.5"/>
+
+  <!-- PN532 引脚标签 -->
+  <text x="470" y="175" font-size="12" fill="#e7ecf1">VCC</text>
+  <circle cx="460" cy="171" r="4" fill="#3dd68c"/>
+  <text x="470" y="215" font-size="12" fill="#e7ecf1">GND</text>
+  <circle cx="460" cy="211" r="4" fill="#8b9aab"/>
+  <text x="470" y="255" font-size="12" fill="#e7ecf1">SDA</text>
+  <circle cx="460" cy="251" r="4" fill="#2f80ed"/>
+  <text x="470" y="295" font-size="12" fill="#e7ecf1">SCL</text>
+  <circle cx="460" cy="291" r="4" fill="#f2c94c"/>
+  <text x="470" y="330" font-size="11" fill="#6b7c8f">IRQ/RST 可悬空</text>
+
+  <!-- 连线 VCC -->
+  <path d="M 220 156 L 340 156 L 340 171 L 460 171" fill="none" stroke="#3dd68c" stroke-width="1.5"/>
+  <text x="340" y="148" text-anchor="middle" font-size="10" fill="#3dd68c">3.3V</text>
+
+  <!-- 连线 GND -->
+  <path d="M 220 196 L 340 196 L 340 211 L 460 211" fill="none" stroke="#8b9aab" stroke-width="1.5"/>
+  <text x="340" y="188" text-anchor="middle" font-size="10" fill="#8b9aab">GND</text>
+
+  <!-- 连线 SDA -->
+  <path d="M 220 236 L 400 236 L 400 251 L 460 251" fill="none" stroke="#2f80ed" stroke-width="1.5"/>
+  <text x="400" y="228" text-anchor="middle" font-size="10" fill="#2f80ed">SDA</text>
+
+  <!-- 连线 SCL -->
+  <path d="M 220 276 L 420 276 L 420 291 L 460 291" fill="none" stroke="#f2c94c" stroke-width="1.5"/>
+  <text x="420" y="268" text-anchor="middle" font-size="10" fill="#f2c94c">SCL</text>
+
+  <!-- 底部提示 -->
+  <rect x="40" y="360" width="600" height="44" rx="6" fill="#0f1419" stroke="#2e3d52" stroke-width="0.5"/>
+  <text x="340" y="378" text-anchor="middle" font-size="11" fill="#f2c94c">使用前确认：模块背面焊盘拨到 I2C；VCC 只接 3.3V</text>
+  <text x="340" y="396" text-anchor="middle" font-size="11" fill="#8b9aab">串口：nfcscan 读卡 → nfcsave &lt;UID&gt; 注册 → 刷卡即开关门</text>
+</svg>

@@ -1,0 +1,8 @@
+# ESP32 4MB dual OTA partitions (online upgrade)
+# app0 @0x10000 / app1 @0x200000, each 0x1F0000 (2031616), 64KB aligned
+# firmware ~1.95MB, ~80KB margin; NVS only, no SPIFFS
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x1F0000,
+app1,     app,  ota_1,   0x200000, 0x1F0000,

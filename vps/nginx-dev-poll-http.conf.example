@@ -1,0 +1,35 @@
+# ESP32 堆不够起 TLS 时的明文降级轮询。
+# 放到 door.wzx.homes 的 server{} 内（与 HTTPS 同一 vhost），在 certbot 的
+# return 301 之前生效，或单独 listen 80 server 只暴露本 location。
+#
+# 安全：/dev/poll 会消费开关门指令，务必加 token 或 restrict IP。
+# 设备侧：config.h 里 REMOTE_POLL_URL_HTTP="http://door.wzx.homes/dev/poll"
+
+# --- 方案 A：在现有 80 跳转 server 里，本 location 不跳转 ---
+location = /dev/poll {
+    # 限制来源（按需改成车库公网/家庭出口 IP）
+    # allow 1.2.3.4;
+    # deny all;
+
+    # 简单共享密钥（与设备请求头一致；也可改 nginx auth_request）
+    if ($http_x_garage_token != "change-me") {
+        return 403;
+    }
+
+    proxy_pass http://127.0.0.1:18080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+
+# --- 方案 B（更干净）：8080 只开轮询，主站仍 80→443 跳转 ---
+# server {
+#     listen 8080;
+#     server_name door.wzx.homes;
+#     location = /dev/poll {
+#         proxy_pass http://127.0.0.1:18080;
+#         proxy_set_header Host $host;
+#     }
+#     location / { return 404; }
+# }

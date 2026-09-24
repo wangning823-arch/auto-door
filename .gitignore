@@ -1,5 +1,8 @@
-# PlatformIO
+# PlatformIO / build
 .pio/
+garage_door_firmware/.pio/
+*.bin
+*.elf
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
@@ -18,7 +21,7 @@ __pycache__/
 .venv/
 venv/
 
-# 临时/一次性调试脚本（tools/_ 前缀 + 根目录诊断）
+# 临时/一次性调试脚本
 tools/_*.py
 tools/_patch_fsm.py
 diag_bus*.py
@@ -26,21 +29,28 @@ read_boot.py
 send_nfcinit.py
 test_*.py
 
-# 本机构建/日志/备份（仓库外或生成物）
+# 本机构建/日志/备份
 *.log
+*.err
 *.tmp
 *.bak
-firmware.bin
-*.elf
 ble_logs/
 drive_test*
 firmware_backup/
 
-# 生成的版本头（编译前会自动重建）
-# src/fw_version.h
-
-# 敏感信息（勿提交）
+# 密码/密钥（VPS 上用 ui_password 文件，勿提交）
+ui_password
 .env
 *.pem
 *.key
+id_*
 tokens.json
+
+# 内置 Adafruit_PN532 只保留源码/许可；上游附带物不入库
+garage_door_firmware/lib/Adafruit_PN532/.github/
+garage_door_firmware/lib/Adafruit_PN532/.gitignore
+garage_door_firmware/lib/Adafruit_PN532/.piopm
+garage_door_firmware/lib/Adafruit_PN532/examples/
+
+# 3D 外壳本地素材
+外壳安装3D/

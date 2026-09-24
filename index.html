@@ -1,0 +1,103 @@
+<!-- AI生成 -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1220">
+  <title>车库门控制台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<p data-aigc-mark="1" style="margin:0 0 8px;font-size:10px;line-height:1.3;color:#6b6560;font-weight:400;">AI生成</p>
+
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="logo"></span>
+        <div>
+          <h1>车库门控制台</h1>
+          <p class="sub" id="statusText">未登录</p>
+        </div>
+      </div>
+      <button id="logoutBtn" class="btn ghost hidden" type="button">退出</button>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>登录</h2>
+      <p class="muted">查看设备状态、日志，在线升级固件</p>
+      <label for="pw">访问密码</label>
+      <input id="pw" type="password" autocomplete="current-password" placeholder="输入密码">
+      <button id="loginBtn" class="btn primary" type="button">进入</button>
+      <p class="tip" id="loginTip"></p>
+    </section>
+
+    <section id="listView" class="hidden">
+      <div class="toolbar">
+        <h2>设备</h2>
+        <div class="toolbar-actions">
+          <button id="refreshBtn" class="btn ghost sm" type="button">刷新</button>
+          <button id="otaBtn" class="btn primary sm" type="button">上传固件</button>
+        </div>
+      </div>
+      <div id="otaBar" class="card ota-card hidden">
+        <h3>在线 OTA</h3>
+        <p class="muted">上传 <code>firmware.bin</code> 后设备会自动比对升级</p>
+        <div class="ota-row">
+          <input id="verInput" type="text" placeholder="版本号（可选，如 0.2.202609241200）">
+          <input id="binInput" type="file" accept=".bin">
+        </div>
+        <div class="btn-row">
+          <button id="uploadBtn" class="btn primary sm" type="button">上传并通知设备</button>
+          <span id="otaMsg" class="tip"></span>
+        </div>
+        <p class="muted" id="otaCurrent"></p>
+      </div>
+      <div id="deviceList" class="device-list"></div>
+      <p class="tip" id="listTip"></p>
+    </section>
+
+    <section id="detailView" class="hidden">
+      <div class="toolbar">
+        <button id="backBtn" class="btn ghost sm" type="button">← 返回</button>
+        <h2 id="devTitle">设备</h2>
+        <div class="toolbar-actions">
+          <button id="dRefreshBtn" class="btn ghost sm" type="button">刷新</button>
+        </div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="card">
+          <div class="head-row">
+            <h3>运行状态</h3>
+            <span id="devOnline" class="pill">—</span>
+          </div>
+          <div id="statusGrid" class="status-grid"></div>
+          <div class="meta" id="devMeta"></div>
+        </div>
+
+        <div class="card">
+          <h3>控制</h3>
+          <div class="btns">
+            <button id="openBtn" class="btn open" type="button">开门</button>
+            <button id="closeBtn" class="btn close" type="button">关门</button>
+          </div>
+          <div class="btn-row">
+            <button id="updateBtn" class="btn sec" type="button">检查更新</button>
+          </div>
+          <p class="tip" id="ctrlTip">指令 8 秒内由设备轮询领取</p>
+        </div>
+
+        <div class="card log-card">
+          <div class="head-row">
+            <h3>设备日志</h3>
+            <button id="logRefreshBtn" class="btn ghost sm" type="button">刷新</button>
+          </div>
+          <pre id="logBox" class="log-box">加载中…</pre>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

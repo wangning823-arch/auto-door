@@ -1,0 +1,4 @@
+{
+  "displayName": "车库门 OTA 发布",
+  "brief": "编译后推送固件到 VPS，触发在线 OTA，并用远程日志调试"
+}
