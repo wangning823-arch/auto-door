@@ -1,4 +1,5 @@
 #include "door_fsm.h"
+#include "log_ship.h"
 #include "config.h"
 
 // millisReached 在 config.h
@@ -157,7 +158,7 @@ void DoorFsm::requestManualOpen(OpenSource src) {
   lastAnyActionTs_ = millis();
   // 只挡后续自动开，不挡离场自动关
   suppressAutoOpenUntil_ = millis() + MANUAL_SUPPRESS_MS;
-  Serial.println("[FSM] MANUAL OPEN done");
+  logShipf("[FSM] MANUAL OPEN src=%d", (int)src);
 }
 
 void DoorFsm::requestManualClose(OpenSource src) {
@@ -170,7 +171,7 @@ void DoorFsm::requestManualClose(OpenSource src) {
   pending_ = DoorAction::NONE;
   lastAnyActionTs_ = millis();
   suppressAutoOpenUntil_ = millis() + MANUAL_SUPPRESS_MS;
-  Serial.println("[FSM] MANUAL CLOSE done");
+  logShipf("[FSM] MANUAL CLOSE src=%d", (int)src);
 }
 
 void DoorFsm::loop(BleTracker& bt) {

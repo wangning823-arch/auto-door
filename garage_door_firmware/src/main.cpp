@@ -1299,11 +1299,11 @@ void loop() {
           const bool auth = gNfc.isAuthorized(uid);
           if (auth) {
             gDoor.requestManualToggle(OpenSource::NFC);
-            Serial.println("[NFC] card: " + uid + " authorized → RF");
+            logShipf("[NFC] card: %s authorized → RF", uid.c_str());
           } else if (gNfc.authUid().length() == 0) {
-            Serial.println("[NFC] card: " + uid + " 未注册卡，串口: nfcsave " + uid);
+            logShipf("[NFC] card: %s unregistered", uid.c_str());
           } else {
-            Serial.println("[NFC] card: " + uid + " 未授权卡");
+            logShipf("[NFC] card: %s unauthorized", uid.c_str());
           }
         }
       }
