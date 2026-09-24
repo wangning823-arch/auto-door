@@ -205,26 +205,25 @@ static bool s_inlistOpen = false;
 // 等当前 InList 的出卡帧。s_inlistOpen 时先不发新命令。
 // 返回 1=卡 0=本轮窗口未出卡（芯片可能仍在搜） -1=帧/总线错
 static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
-  if (!s_inlistOpen) {
-    uint8_t cmd[3] = {0x4A, 0x01, 0x04};  // InList, 1 tg, ISO14443A
-    pn532WriteCmd(cmd, 3);
-    if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
-      pn532Drain();
-      return -1;
-    }
-    s_inlistOpen = true;
+  // 每轮都发新 InList：有限重试下芯片会自己结束（0 tags/出卡），
+  // 禁止 s_inlistOpen 粘住不重发（曾导致永远「等卡中」0 读卡）
+  uint8_t cmd[3] = {0x4A, 0x01, 0x04};  // InList, 1 tg, ISO14443A
+  pn532WriteCmd(cmd, 3);
+  if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
+    pn532Drain();
+    return -1;
   }
   uint8_t resp[32] = {0};
   int n = pn532ReadFrame(resp, 28, NFC_INLIST_WAIT_MS);
   if (n < 8) {
-    // 本轮没出卡：InList 仍在芯片里（0xFF），保持 open，禁止再 write
-    // 若 SCL 已被按死，必须先救总线，否则永远读不到出卡帧
+    // 超时：丢弃残留，下一轮必须重发
     if (!digitalRead(PIN_NFC_SCL) || !digitalRead(PIN_NFC_SDA)) {
       i2cBusRecover(PIN_NFC_SDA, PIN_NFC_SCL);
+    } else {
+      pn532Drain();
     }
-    return 0;
+    return -1;
   }
-  s_inlistOpen = false;
   int p = 0;
   if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
   if (p >= n || resp[p] != 0xD5) return -1;
@@ -233,10 +232,7 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
   p++;
   if (p >= n) return -1;
   uint8_t nb = resp[p++];
-  if (nb == 0) {
-    // 有限重试会回 0 tags：允许下一轮重发
-    return 0;
-  }
+  if (nb == 0) return 0;
   if (p + 3 >= n) return -1;
   p++;
   p += 2;
@@ -881,8 +877,8 @@ bool NfcReader::poll(String& uid) {
       Serial.printf("[NFC] 等卡中 cost=%ums empty=%u\n", (unsigned)cost,
                     (unsigned)emptyPolls_);
     }
-    // 短间隔只再等同一张 InList 的出卡帧（s_inlistOpen=1 时不会重发）
-    nextPollMs_ = millis() + 50;
+    // 立刻重发下一条 InList，缩短盲区
+    nextPollMs_ = millis();
     return false;
   }
   nextPollMs_ = millis() + gap;

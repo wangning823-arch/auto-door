@@ -229,11 +229,11 @@
 // 手机 HCE 激活要「场连续 + 同一条 InList 不中断」；短窗口反复重发会重置 ATR → 弹窗却无 UID。
 // 主机用裸 waitRdy 等到出卡（15ms 快失败，不会像 Adafruit waitready 那样假超时/堵死）。
 #ifndef NFC_INLIST_RETRIES
-#define NFC_INLIST_RETRIES 0xFF
+#define NFC_INLIST_RETRIES 0x30
 #endif
 // 单次等待上限：没卡就继续等同一条 InList（芯片仍在寻），到点后检查总线是否还活着
 #ifndef NFC_INLIST_WAIT_MS
-#define NFC_INLIST_WAIT_MS 3000
+#define NFC_INLIST_WAIT_MS 700
 #endif
 #ifndef NFC_INLIST_ACK_MS
 #define NFC_INLIST_ACK_MS 100
