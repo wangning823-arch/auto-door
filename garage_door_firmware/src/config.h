@@ -225,9 +225,16 @@
 #ifndef NFC_POLL_GAP_BT_TRACK_MS
 #define NFC_POLL_GAP_BT_TRACK_MS 350
 #endif
-// readPassiveTargetID 主机等待：须 > 芯片 retries=0x10 的 ~200ms 寻卡窗口
-#ifndef NFC_READ_TIMEOUT_MS
-#define NFC_READ_TIMEOUT_MS 280
+// InList 芯片内寻卡窗口（RFConfiguration MxRtyPassiveActivation）
+// 0x30≈400-500ms：盖住一次贴卡；主机等待必须更长，否则卡正在 ATR 时被超时+drain 掐死
+#ifndef NFC_INLIST_RETRIES
+#define NFC_INLIST_RETRIES 0x30
+#endif
+#ifndef NFC_INLIST_WAIT_MS
+#define NFC_INLIST_WAIT_MS 800
+#endif
+#ifndef NFC_INLIST_ACK_MS
+#define NFC_INLIST_ACK_MS 80
 #endif
 // 慢 ACK 后立刻重试的间隔（卡可能还贴着）
 #ifndef NFC_SLOW_RETRY_MS
