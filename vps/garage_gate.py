@@ -197,7 +197,8 @@ def _maybe_auto_update_locked(d, device_fw):
         remote = _ota_version_info().get("version") or ""
     except Exception:
         remote = ""
-    if not remote or device_fw == remote:
+    # 只升级「更旧 → 更新」；相等或本地更新都不动（防降级）
+    if not remote or device_fw == remote or device_fw >= remote:
         return False
     now = _now()
     if d["update_sticky"]:

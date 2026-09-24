@@ -226,11 +226,17 @@ static void doOta() {
       s_active = false;
       if (s_busyFn) s_busyFn(false);
       setMsg("write fail");
-      logShipf("[OTA] write fail at %u", (unsigned)written);
+      logShipf("[OTA] write fail at %u err=%s", (unsigned)written,
+               Update.errorString());
       return;
     }
     written += (size_t)r;
     start = millis();
+    // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
+    yield();
+    if ((written & 0x7FFF) == 0) {
+      logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
+    }
   }
   client.stop();
 
@@ -253,8 +259,13 @@ void remoteOtaService(bool btBusy, bool wifiOk) {
   if (s_active || s_done || !wifiOk) return;
   const uint32_t now = millis();
   if (!s_force && (int32_t)(now - s_nextMs) < 0) return;
-  // 蓝牙忙不写 flash；强制检查也等空隙
-  if (btBusy) return;
+  // 蓝牙忙不写 flash；但 update 令/到点检查等太久则插队（否则 Inquiry 几乎常亮会饿死 OTA）
+  static uint32_t s_waitMs = 0;
+  if (btBusy && !s_force) {
+    if (!s_waitMs) s_waitMs = now;
+    if ((now - s_waitMs) < 15000UL) return;
+  }
+  s_waitMs = 0;
   s_nextMs = millis() + OTA_CHECK_INTERVAL_MS;
   doOta();
 }
