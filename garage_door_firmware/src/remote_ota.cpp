@@ -1,5 +1,6 @@
 #include "remote_ota.h"
 #include "config.h"
+#include "device_id.h"
 #include "log_ship.h"
 #include <Update.h>
 #include <WiFi.h>
@@ -115,6 +116,14 @@ static bool parseJsonStr(const String& body, const char* key, String* out) {
   return out->length() > 0;
 }
 
+static String withId(const String& path) {
+  String p = path;
+  p += (p.indexOf('?') >= 0 ? '&' : '?');
+  p += "id=";
+  p += deviceId();
+  return p;
+}
+
 static void doOta() {
   s_force = false;
   if (s_active || s_done) return;
@@ -138,12 +147,13 @@ static void doOta() {
       }
     }
   }
+  vpath = withId(vpath);
 
   WiFiClient client;
   long clen = -1;
   if (!httpGetStream(host, port, vpath, &client, &clen)) {
     setMsg("version fetch fail");
-    logShipf("[OTA] version fetch fail");
+    logShipf("[OTA] version fetch fail id=%s", deviceId().c_str());
     return;
   }
   String body;
@@ -168,27 +178,31 @@ static void doOta() {
     logShipf("[OTA] up to date %s", FW_VERSION);
     return;
   }
-  logShipf("[OTA] new %s -> %s", FW_VERSION, remoteVer.c_str());
+  logShipf("[OTA] new %s -> %s id=%s", FW_VERSION, remoteVer.c_str(),
+           deviceId().c_str());
 
   s_active = true;
   if (s_busyFn) s_busyFn(true);
 
   long fsize = -1;
-  String bpath = "/ota/firmware.bin";
+  String bpath = withId("/ota/firmware.bin");
   if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize <= 0) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     setMsg("bin fetch fail");
-    logShipf("[OTA] bin fetch fail");
+    logShipf("[OTA] bin fetch fail id=%s", deviceId().c_str());
     return;
   }
+  logShipf("[OTA] bin ok size=%ld maxblk=%u", fsize,
+           (unsigned)ESP.getMaxAllocHeap());
 
   if (!Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN)) {
     client.stop();
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     setMsg("update begin fail");
-    logShipf("[OTA] Update.begin fail err=%s", Update.errorString());
+    logShipf("[OTA] Update.begin fail err=%s maxblk=%u", Update.errorString(),
+             (unsigned)ESP.getMaxAllocHeap());
     return;
   }
 
@@ -228,8 +242,10 @@ static void doOta() {
     return;
   }
   setMsg("rebooting");
-  logShipf("[OTA] OK bytes=%u -> reboot", (unsigned)written);
-  delay(200);
+  logShipf("[OTA] OK bytes=%u id=%s -> reboot", (unsigned)written,
+           deviceId().c_str());
+  logShipFlushNow();
+  delay(300);
   ESP.restart();
 }
 

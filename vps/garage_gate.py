@@ -939,9 +939,22 @@ class Handler(BaseHTTPRequestHandler):
 
         # ===== OTA 静态（设备）=====
         if path in ("/ota/version", "/ota/version.json") and method == "GET":
-            self._send_json(200, _ota_version_info())
+            info = _ota_version_info()
+            did = self._q("id")
+            if did:
+                with _lock:
+                    d = _device_locked(did)
+                    _touch_locked(d)
+                _log("[%s] ota version fetch remote=%s" % (did, info.get("version")))
+            self._send_json(200, info)
             return
         if path in ("/ota/firmware.bin",) and method == "GET":
+            did = self._q("id")
+            if did:
+                with _lock:
+                    d = _device_locked(did)
+                    _touch_locked(d)
+                _log("[%s] ota firmware.bin fetch" % did)
             self._send_file(os.path.join(OTA_DIR, "firmware.bin"),
                             content_type="application/octet-stream")
             return
