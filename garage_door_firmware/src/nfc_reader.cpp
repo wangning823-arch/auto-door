@@ -252,7 +252,7 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
 // 裸发命令并吃掉响应：setRetries/SAMConfig 不再走 Adafruit waitready
 static bool pn532Xfer(const uint8_t* cmd, uint8_t cmdlen, uint32_t waitMs) {
   pn532WriteCmd(cmd, cmdlen);
-  if (!pn532ReadAck(80)) return false;
+  if (!pn532ReadAck(200)) return false;
   uint8_t resp[24] = {0};
   int n = pn532ReadFrame(resp, 20, waitMs);
   return n >= 3 && resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF;
@@ -264,10 +264,19 @@ static bool pn532SetRetries(uint8_t retries) {
   return pn532Xfer(cmd, 5, 200);
 }
 
-// SAMConfig：normal mode
+// 上电/掉线后 PN532 可能睡死：先发 dummy 地址字节唤醒
+static void pn532Wakeup() {
+  Wire.beginTransmission(PN532_I2C_ADDRESS);
+  Wire.write((uint8_t)0x00);
+  Wire.endTransmission();
+  delay(2);
+}
+
+// SAMConfig：normal mode, 不用 IRQ（未接 IRQ 时 useIRQ=1 会卡命令）
 static bool pn532SamConfig() {
-  uint8_t cmd[4] = {0x14, 0x01, 0x14, 0x01};
-  return pn532Xfer(cmd, 4, 200);
+  pn532Wakeup();
+  uint8_t cmd[4] = {0x14, 0x01, 0x14, 0x00};
+  return pn532Xfer(cmd, 4, 300);
 }
 
 // GetFirmwareVersion
@@ -455,6 +464,8 @@ bool NfcReader::hwInit() {
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda_, scl_);
   delay(30);
+  pn532Wakeup();
+  delay(10);
   if (!pn532SamConfig()) {
     logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
     failRelease("raw SAM", sda_, scl_, &failStreak_);
