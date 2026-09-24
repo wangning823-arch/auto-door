@@ -1576,18 +1576,19 @@ bool Adafruit_PN532::isready() {
 */
 /**************************************************************************/
 bool Adafruit_PN532::waitready(uint16_t timeout) {
-  uint16_t timer = 0;
+  // 必须用墙钟超时：原实现每圈 +10ms，但 isready() 在本板空读 NACK 时
+  // 一圈就要 ~50ms，200ms 虚拟超时实际会拖到 ~1.2s（串口反复 poll ACK 慢 1220ms）
+  uint32_t start = millis();
   while (!isready()) {
     if (timeout != 0) {
-      timer += 10;
-      if (timer > timeout) {
+      if ((millis() - start) >= timeout) {
 #ifdef PN532DEBUG
         PN532DEBUGPRINT.println("TIMEOUT!");
 #endif
         return false;
       }
     }
-    delay(10);
+    delay(5);
   }
   return true;
 }
