@@ -61,21 +61,21 @@ void DoorFsm::pulseRelay() {
 void DoorFsm::emitOpen() {
   if (rfEmit_ && rfEmit_(true)) {
     lastAnyActionTs_ = millis();
-    // 串口缓冲满时也必须留下痕迹，否则「点了没反应」无法区分
-    Serial.println("[FSM] RF TX open/up");
+    // 串口 + VPS 都要有：网页点开关时才能看到是否真发射频
+    logShipf("[FSM] RF TX open/up");
     return;
   }
-  Serial.println("[FSM] RF emit fail → relay");
+  logShipf("[FSM] RF emit fail → relay");
   pulseRelay();
 }
 
 void DoorFsm::emitClose() {
   if (rfEmit_ && rfEmit_(false)) {
     lastAnyActionTs_ = millis();
-    Serial.println("[FSM] RF TX close/down");
+    logShipf("[FSM] RF TX close/down");
     return;
   }
-  Serial.println("[FSM] RF emit fail → relay");
+  logShipf("[FSM] RF emit fail → relay");
   pulseRelay();
 }
 
