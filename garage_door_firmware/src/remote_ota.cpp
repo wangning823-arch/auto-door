@@ -251,6 +251,8 @@ static void doOta() {
   logShipf("[OTA] OK bytes=%u id=%s -> reboot", (unsigned)written,
            deviceId().c_str());
   logShipFlushNow();
+  // 软重启前再收一次 NFC：避免踩在 InList 半截 → PN532 拉死 SCL
+  if (s_busyFn) s_busyFn(true);
   delay(300);
   ESP.restart();
 }

@@ -954,6 +954,7 @@ static void handleSerial() {
       } else if (line == "nfcscan") {
         Serial.println("[CMD] NFC 持续监听已开，贴卡（最多 30 秒）...");
         if (!gNfc.ok()) gNfc.forceInit();
+        gNfc.setSuspended(true);  // 避免与 nfc 任务并发摸 I2C
         gNfc.startListen(0);  // 持续
         String uid;
         uint32_t t0 = millis();
@@ -965,6 +966,7 @@ static void handleSerial() {
           delay(20);
         }
         if (uid.length() == 0) Serial.println("[NFC] 超时未读到卡");
+        gNfc.setSuspended(false);
         Serial.printf("[NFC] scan end SCL17=%d\n",
                       digitalRead(PIN_NFC_SCL));
       } else if (line.startsWith("nfcsave ")) {
