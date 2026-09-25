@@ -929,19 +929,20 @@ bool NfcReader::poll(String& uid) {
   }
   if (!millisReached(now, nextPollMs_)) return false;
 
-  // 慢 ACK 后不要立刻 drain：会掐掉手机 HCE 激活中的卡帧
-  if (lastPollSlow_ && slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
+  // 上一次慢 ACK：先丢残留 RDY，再发 InList（避免交替 1.3s 脏 ACK）
+  if (lastPollSlow_) {
     pn532Drain();
     lastPollSlow_ = false;
   }
 
-  // 空窗很久才补 RF；listen 中频繁刷场/rewire 会只剩弹窗读不出 UID
-  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS && (now - lastFieldMs_) > 30000UL) {
+  // 仅「连续空轮询够多」才刷 RF 场；绝不能 empty=1 就刷
+  // （场 on+rewire 后立刻 InList 会打出 1.2s 慢 ACK，形成死循环）
+  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS) {
     Serial.printf("[NFC] 空轮询 %u → 刷新 RF field\n", (unsigned)emptyPolls_);
     pn532RfFieldOn(sda_, scl_);
     emptyPolls_ = 0;
     lastFieldMs_ = now;
-    nextPollMs_ = millis() + 200;
+    nextPollMs_ = millis() + 200;  // rewire 后多等一会再 InList
     return false;
   }
 
@@ -966,18 +967,18 @@ bool NfcReader::poll(String& uid) {
   }
 
   if (!ret || len < 4) {
-    // 慢 ACK：只记录，不要 rewire/drain（会重置手机 ATR → 弹窗无 UID）
-    // 只有连续多次 + 总线异常才恢复
+    // 慢 ACK：rewire + drain，并 80ms 内立刻再试一次（卡可能还贴着）
     if (cost > 800) {
-      Serial.printf("[NFC] poll ACK 慢 %ums streak=%u\n", (unsigned)cost,
-                    (unsigned)(slowAckStreak_ + 1));
+      Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
+                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
+      nfcRewire(sda_, scl_);
+      pn532Drain();
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
         Serial.println("[NFC] 连续慢 ACK → resync");
         recoverBusAndResync();
         slowAckStreak_ = 0;
-        lastPollSlow_ = false;
       }
       nextPollMs_ = millis() + NFC_SLOW_RETRY_MS;
       return false;

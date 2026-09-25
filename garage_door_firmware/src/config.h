@@ -227,7 +227,7 @@
 #endif
 // readPassiveTargetID 单次等待（同步版在用；太短会漏卡）
 #ifndef NFC_READ_TIMEOUT_MS
-#define NFC_READ_TIMEOUT_MS 500
+#define NFC_READ_TIMEOUT_MS 200
 #endif
 // InList 粘滞：同一条 InList 期间禁止重发/drain，保护手机 HCE ATR。
 // retries 用有限值（非 0xFF）：片上会自己结束，OTA 前才能安全 abort；
