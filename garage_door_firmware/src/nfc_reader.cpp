@@ -539,50 +539,48 @@ bool NfcReader::hwInit() {
     return false;
   }
 
-  // 不做裸 0x24 probe：地址 ACK 后再 SAM，中间态容易把从机卡住
-  // 芯片不在时 SAM 会失败，效果等价于 probe
+  // 与 0.2.202609251249 能出 ready 的路径一致：probe + recover + 唤醒 + SAM
+  if (!probePresent()) {
+    absent_ = true;
+    ok_ = false;
+    deferred_ = true;
+    bootInitDone_ = true;
+    if (failStreak_ < 60000) failStreak_++;
+    logShipf("[NFC] probe no ACK → defer (absent?) SCL=%d", digitalRead(scl_));
+    releaseBus(sda_, scl_);
+    forceIdlePullups(sda_, scl_);
+    return false;
+  }
   absent_ = false;
 
+  i2cBusRecover(sda_, scl_);
   Wire.begin(sda_, scl_, (uint32_t)100000);
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda_, scl_);
-  delay(50);
-  logShipf("[NFC] init pre-wake SCL=%d", digitalRead(scl_));
+  delay(30);
   pn532Wakeup();
-  delay(50);
+  delay(20);
   pn532Drain();
+  pn532Wakeup();
   logShipf("[NFC] init pre-SAM SCL=%d", digitalRead(scl_));
-  bool samOk = false;
-  for (int samTry = 0; samTry < 3 && !samOk; samTry++) {
-    // 上电/OTA 后 PN532 要多醒一会；立刻 SAM 容易 NACK，重试又把总线卡死
-    pn532Wakeup();
-    delay(80);
-    pn532Drain();
-    delay(20);
-    samOk = pn532SamConfig();
-    logShipf("[NFC] SAM try=%d ok=%d SCL=%d", samTry, (int)samOk,
-             digitalRead(scl_));
-    if (samOk) break;
-    // 失败但总线仍空闲：只松手拉长间隔，禁止 recover（毛刺会把 SCL 打死）
+  if (!pn532SamConfig()) {
     releaseBus(sda_, scl_);
-    if (!digitalRead(scl_) || !digitalRead(sda_)) {
-      logShipf("[NFC] SAM fail bus low → recover SCL=%d", digitalRead(scl_));
-      i2cBusRecover(sda_, scl_);
-    }
+    i2cBusRecover(sda_, scl_);
     Wire.begin(sda_, scl_, (uint32_t)100000);
     Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
-    delay(200);
     pn532Wakeup();
-    delay(100);
+    delay(20);
     pn532Drain();
-    delay(50);
-  }
-  if (!samOk) {
-    logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
-    failRelease("raw SAM", sda_, scl_, &failStreak_);
-    ok_ = false;
-    deferred_ = true;
-    return false;
+    if (!pn532SamConfig()) {
+      logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
+      failRelease("raw SAM", sda_, scl_, &failStreak_);
+      ok_ = false;
+      deferred_ = true;
+      return false;
+    }
+    logShipf("[NFC] SAM2 OK SCL=%d", digitalRead(scl_));
+  } else {
+    logShipf("[NFC] SAM1 OK SCL=%d", digitalRead(scl_));
   }
   delay(20);
   // 版本号仅诊断：SAM 已过就不要因 ver=0 砍掉 NFC
