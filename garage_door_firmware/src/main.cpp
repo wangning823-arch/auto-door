@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <ArduinoOTA.h>
+#include <driver/gpio.h>
 #include "config.h"
 #include "ble_tracker.h"
 #include "door_fsm.h"
@@ -861,6 +862,11 @@ static void handleSerial() {
       } else if (line == "gpio17" || line == "i2cscan" || line == "i2cscan2") {
         // 推拉测试只给 gpio17：i2cscan 前不要动 SCL，否则会把 PN532 弄挂
         if (line == "gpio17") {
+          // 先停 NFC + 断开 I2C 矩阵，否则对侧任务/Wire 会把 SCL 按住，测不准
+          gNfc.setSuspended(true);
+          Wire.end();
+          gpio_reset_pin((gpio_num_t)PIN_NFC_SCL);
+          gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
           pinMode(PIN_NFC_SCL, OUTPUT);
           digitalWrite(PIN_NFC_SCL, HIGH);
           delay(2);
@@ -871,6 +877,7 @@ static void handleSerial() {
           pinMode(PIN_NFC_SCL, INPUT_PULLUP);
           delay(5);
           int released = digitalRead(PIN_NFC_SCL);
+          gNfc.setSuspended(false);
           pinMode(PIN_NFC_SDA, INPUT_PULLUP);
           delay(2);
           int sda = digitalRead(PIN_NFC_SDA);
@@ -937,13 +944,23 @@ static void handleSerial() {
         pinMode(PIN_NFC_SCL, INPUT_PULLUP);
         Serial.printf("[BUS] buspull SDA16=%d SCL17=%d\n",
                       digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
-      } else if (line == "busfree") {
-        // 只松 Wire，不碰 PN532 命令（Error263 后 SCL 卡 0.04 时用）
+      } else if (line == "busfree" || line == "busreset") {
+        // 松 Wire + 强制脚回 GPIO：I2C 矩阵仍挂着时 SCL 会被外设按在 0
+        gNfc.setSuspended(true);
         Wire.end();
+        gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
+        gpio_reset_pin((gpio_num_t)PIN_NFC_SCL);
         pinMode(PIN_NFC_SDA, INPUT_PULLUP);
         pinMode(PIN_NFC_SCL, INPUT_PULLUP);
-        Serial.printf("[BUS] busfree Wire.end SDA16=%d SCL17=%d\n",
+        delay(5);
+        Serial.printf("[BUS] %s SDA16=%d SCL17=%d\n", line.c_str(),
                       digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
+        if (line == "busreset") {
+          delay(300);
+          Serial.printf("[BUS] after300ms SDA16=%d SCL17=%d\n",
+                        digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
+        }
+        gNfc.setSuspended(false);
       } else if (line == "nfcinit") {
         Serial.println("[CMD] nfcinit 强制重新初始化...");
         if (gNfc.forceInit()) {
@@ -1024,12 +1041,19 @@ void setup() {
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
+  gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
+  gpio_reset_pin((gpio_num_t)PIN_NFC_SCL);
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
   delay(2);
   Serial.printf("[BOOT] early SDA16=%d SCL17=%d t=%ums\n",
                 digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL),
                 (unsigned)millis());
+  if (!digitalRead(PIN_NFC_SCL)) {
+    // 软件尚未碰 Wire：仍为 0 则是外部（PN532/短路），不是 I2C 矩阵
+    Serial.printf("[BOOT] early SCL=0 → 脚已 gpio_reset+pullup，外部拉住 t=%ums\n",
+                  (unsigned)millis());
+  }
 
   gDoor.begin();
   // 尽早钳位 RF TX，避免上电到 gRf.begin 之间脚位浮空乱发

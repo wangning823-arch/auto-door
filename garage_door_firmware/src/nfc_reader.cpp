@@ -90,8 +90,11 @@ static void i2cBusRecover(int sda, int scl) {
 }
 
 // I2C 超时后必须松手：否则 ESP 外设/从机时钟拉伸会把 SCL 按在 0.04
+// Wire.end() 不一定把脚从 I2C 矩阵断开；必须 gpio_reset_pin 才回到 GPIO 上拉
 static void releaseBus(int sda, int scl) {
   Wire.end();
+  if (scl >= 0) gpio_reset_pin((gpio_num_t)scl);
+  if (sda >= 0) gpio_reset_pin((gpio_num_t)sda);
   forceIdlePullups(sda, scl);
   delay(2);
 }
@@ -763,8 +766,11 @@ void NfcReader::maybeRecover() {
 
   // 2) deferred：慢速重试。超过 MAX 仍按 30min 保活再试，禁止永久放弃
   if (deferred_) {
+    // 总线被按住时不要 3s 连撞（i2cBusRecover/Wire.begin 会再占 I2C 矩阵）
     // 前几次快速重试：OTA 重启后 PN532 可能 1-2s 内还忙，30s 太久
-    uint32_t gap = (autoRetryCount_ < 5) ? 3000UL : NFC_AUTO_RETRY_GAP_MS;
+    uint32_t gap = (failStreak_ > 0 && !digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL))
+                       ? 30000UL
+                       : ((autoRetryCount_ < 5) ? 3000UL : NFC_AUTO_RETRY_GAP_MS);
     if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX) gap = NFC_SLOW_KEEPALIVE_MS;
     if (!millisReached(now, lastAutoRetryMs_ + gap)) return;
     lastAutoRetryMs_ = now;
