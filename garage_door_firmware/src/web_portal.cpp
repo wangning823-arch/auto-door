@@ -437,18 +437,27 @@ void WebPortal::setupRoutes() {
     Serial.printf("[WEB] GET / from %s\n",
                   server.client().remoteIP().toString().c_str());
     String html = gPortal->pageHtml();
-    // 8KB 整包 send 在 BT Inquiry 忙时只发出响应头、正文卡死
-    // → 分块 sendContent，块间 yield
-    server.setContentLength(html.length());
-    server.send(200, "text/html; charset=utf-8", "");
-    const unsigned chunk = 1024;
-    for (unsigned i = 0; i < html.length(); i += chunk) {
-      server.sendContent(html.substring(i, i + chunk));
+    // WebServer::send 对 8KB 页面只发出响应头、正文卡死
+    // → 直接用 WiFiClient 分片写，块间 yield，避免 TCP 发送缓冲卡死
+    WiFiClient c = server.client();
+    String hdr = F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
+    hdr += String(html.length());
+    hdr += F("\r\nConnection: close\r\n\r\n");
+    c.print(hdr);
+    size_t off = 0;
+    const size_t total = html.length();
+    while (off < total) {
+      size_t n = total - off;
+      if (n > 512) n = 512;
+      size_t w = c.write((const uint8_t*)html.c_str() + off, n);
+      if (w == 0) break;
+      off += w;
+      delay(1);
       yield();
     }
-    Serial.printf("[WEB] GET / bytes=%u gen=%ums clients=%d\n",
-                  (unsigned)html.length(), (unsigned)(millis() - t0),
-                  WiFi.softAPgetStationNum());
+    c.stop();
+    Serial.printf("[WEB] GET / sent=%u/%u gen=%ums\n", (unsigned)off,
+                  (unsigned)total, (unsigned)(millis() - t0));
   });
 
   server.on("/save", HTTP_GET, []() {
