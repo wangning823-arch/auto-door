@@ -228,6 +228,34 @@ static bool gCloseArmed = false;
 static bool gStrongAfterOpen = false;
 static uint32_t gLastAutoCloseMs = 0;
 static bool gLeaveQual = false;
+static bool gTrueNo = true;  // 上电视为「无」，首次有信号即可开
+
+// 误触取证：最近 8 次信号观测（-127=无），离场资格/发关码时上送 VPS
+static int8_t gSigLog[8];
+static uint8_t gSigLogN = 0, gSigLogHead = 0;
+static int gLastSigRssi = -127;
+
+static void sigLogPush(int rssi) {
+  int v = rssi;
+  if (v > 127) v = 127;
+  if (v < -127) v = -127;
+  gSigLog[gSigLogHead] = (int8_t)v;
+  gSigLogHead = (uint8_t)((gSigLogHead + 1) % 8);
+  if (gSigLogN < 8) gSigLogN++;
+}
+
+static void sigLogShip(const char* tag, int rssi) {
+  char body[80];
+  size_t off = 0;
+  for (uint8_t i = 0; i < gSigLogN && off < sizeof(body) - 8; i++) {
+    uint8_t idx = (uint8_t)((gSigLogHead - gSigLogN + i + 16) % 8);
+    off += snprintf(body + off, sizeof(body) - off, "%s%d", i ? " " : "",
+                    (int)gSigLog[idx]);
+  }
+  logShipf("[FSM] sig %s rssi=%d leaveQ=%d strongAfter=%d trueNo=%d | %s",
+           tag, rssi, (int)gLeaveQual, (int)gStrongAfterOpen, (int)gTrueNo,
+           body);
+}
 
 static void clearLeaveQual(const char* why) {
   if (gLeaveQual) {
@@ -270,6 +298,7 @@ static bool tryCloseIfOpen(const char* why) {
     return false;
   }
   bool ok = autoCloseGuarded(why);
+  sigLogShip(ok ? "autoClose" : "closeSkip", gLastSigRssi);
   if (ok) {
     gLastAutoCloseMs = now;
     clearLeaveQual("已发关码");
@@ -321,12 +350,13 @@ struct RssiTrendWin {
 };
 
 static RssiTrendWin gRssiTrend;
-static bool gTrueNo = true;      // 上电视为「无」，首次有信号即可开
 static bool gEverHadSignal = false;
 static uint32_t gNoSigSince = 0; // 0=当前有信号
 
 static void observeSignal(bool hasSignal, int rssi) {
   const uint32_t now = millis();
+  sigLogPush(hasSignal ? rssi : -127);
+  gLastSigRssi = hasSignal ? rssi : -127;
   gBt.recordTs(hasSignal ? (int16_t)rssi : (int16_t)-127);
   if (hasSignal) {
     gNoSigSince = 0;
@@ -342,6 +372,7 @@ static void observeSignal(bool hasSignal, int rssi) {
         Serial.printf("[FSM] 离场趋势合格 rssi=%d（≥%d 点单调变弱） strongAfter=%d\n",
                       rssi, (int)RSSI_TREND_MIN_N, (int)gStrongAfterOpen);
         gRssiTrend.dump();
+        sigLogShip("leaveQual", rssi);
       }
       gLeaveQual = true;
     }
