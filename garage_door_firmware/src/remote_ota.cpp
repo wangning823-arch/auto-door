@@ -173,8 +173,10 @@ static void doOta() {
     logShipf("[OTA] version.json missing version");
     return;
   }
+  remoteVer.trim();  // 防 \r/空白导致永远判成有新版本
   if (remoteVer == FW_VERSION) {
     setMsg("up to date");
+    s_done = true;  // 本次启动不再重复拉固件
     logShipf("[OTA] up to date %s", FW_VERSION);
     return;
   }
@@ -182,6 +184,7 @@ static void doOta() {
            deviceId().c_str());
 
   s_active = true;
+  s_done = true;  // 禁止 service 再进 doOta 造成刷屏/重复下载
   if (s_busyFn) s_busyFn(true);
 
   long fsize = -1;

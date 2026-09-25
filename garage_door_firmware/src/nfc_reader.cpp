@@ -139,6 +139,27 @@ bool NfcReader::probePresent() {
 
 // ===== 裸 PN532 I2C：绕开 Adafruit waitready（假时钟会把贴卡拖成 1.3s 超时）=====
 static void pn532Drain();
+static void nfcPulse9Clk() {
+  // 从机可能卡在半字节：补 9 个时钟 + STOP，常比整段 recover 温和
+  Wire.end();
+  digitalWrite(PIN_NFC_SCL, HIGH);
+  pinMode(PIN_NFC_SCL, OUTPUT);
+  digitalWrite(PIN_NFC_SDA, HIGH);
+  pinMode(PIN_NFC_SDA, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(PIN_NFC_SCL, LOW);
+    delayMicroseconds(80);
+    digitalWrite(PIN_NFC_SCL, HIGH);
+    delayMicroseconds(80);
+  }
+  digitalWrite(PIN_NFC_SDA, LOW);
+  delayMicroseconds(80);
+  digitalWrite(PIN_NFC_SDA, HIGH);
+  delayMicroseconds(80);
+  forceIdlePullups(PIN_NFC_SDA, PIN_NFC_SCL);
+  delay(2);
+}
+
 static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   const uint8_t addr = PN532_I2C_ADDRESS;
   uint8_t packet[32];
@@ -299,10 +320,18 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
 // 裸发命令并吃掉响应：setRetries/SAMConfig 不再走 Adafruit waitready
 static bool pn532Xfer(const uint8_t* cmd, uint8_t cmdlen, uint32_t waitMs) {
   pn532WriteCmd(cmd, cmdlen);
-  if (!pn532ReadAck(200)) return false;
+  if (!pn532ReadAck(200)) {
+    // 从机可能卡在半字节 → 立刻补时钟，否则 SCL 被按死
+    nfcPulse9Clk();
+    return false;
+  }
   uint8_t resp[24] = {0};
   int n = pn532ReadFrame(resp, 20, waitMs);
-  return n >= 3 && resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF;
+  if (n < 3) {
+    nfcPulse9Clk();
+    return false;
+  }
+  return resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF;
 }
 
 // RFConfiguration item5：MxRtyPassiveActivation = retries
@@ -493,33 +522,22 @@ bool NfcReader::hwInit() {
     return false;
   }
 
-  // 未接芯片：先短超时探测，避免 1000ms×N 次把 HTTP/主循环堵死
-  if (!probePresent()) {
-    absent_ = true;
-    ok_ = false;
-    deferred_ = true;
-    // 不再打满 autoRetry：允许慢速保活重试，避免一次毛刺后永久失联
-    bootInitDone_ = true;
-    if (failStreak_ < 60000) failStreak_++;
-    logShipf("[NFC] probe no ACK → defer (absent?) SCL=%d", digitalRead(scl_));
-    releaseBus(sda_, scl_);
-    forceIdlePullups(sda_, scl_);
-    return false;
-  }
+  // 不做裸 0x24 probe：地址 ACK 后再 SAM，中间态容易把从机卡住
+  // 芯片不在时 SAM 会失败，效果等价于 probe
   absent_ = false;
 
-  // 总线已空闲时禁止 i2cBusRecover：推挽时钟毛刺会把空闲 PN532 弄成拉死 SCL
-  // （只在 probe 后仍乱、或 SAM 失败时才 recover）
   Wire.begin(sda_, scl_, (uint32_t)100000);
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda_, scl_);
-  delay(30);
+  delay(50);
+  logShipf("[NFC] init pre-wake SCL=%d", digitalRead(scl_));
   pn532Wakeup();
-  delay(20);
+  delay(50);
   pn532Drain();
-  pn532Wakeup();
+  logShipf("[NFC] init pre-SAM SCL=%d", digitalRead(scl_));
   if (!pn532SamConfig()) {
     // 再救一轮：残余 InList 会让第一条 SAM 失败
+    logShipf("[NFC] SAM1 fail SCL=%d", digitalRead(scl_));
     releaseBus(sda_, scl_);
     i2cBusRecover(sda_, scl_);
     Wire.begin(sda_, scl_, (uint32_t)100000);
@@ -534,6 +552,9 @@ bool NfcReader::hwInit() {
       deferred_ = true;
       return false;
     }
+    logShipf("[NFC] SAM2 OK SCL=%d", digitalRead(scl_));
+  } else {
+    logShipf("[NFC] SAM1 OK SCL=%d", digitalRead(scl_));
   }
   delay(20);
   // 版本号仅诊断：SAM 已过就不要因 ver=0 砍掉 NFC
