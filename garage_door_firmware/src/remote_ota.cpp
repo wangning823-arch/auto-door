@@ -204,21 +204,28 @@ static void doOta() {
     logShipf("[OTA] bin fetch fail id=%s", deviceId().c_str());
     return;
   }
-  logShipf("[OTA] bin ok size=%ld maxblk=%u", fsize,
-           (unsigned)ESP.getMaxAllocHeap());
+  logShipf("[OTA] bin ok size=%ld heap=%u maxblk=%u", fsize,
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
+  // 清掉可能残留的 Update 状态（begin 若报 already running 会 err=No Error）
+  Update.abort();
   if (!Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN)) {
-    client.stop();
-    s_active = false;
-    if (s_busyFn) s_busyFn(false);
-    setMsg("update begin fail");
-    logShipf("[OTA] Update.begin fail err=%s maxblk=%u", Update.errorString(),
-             (unsigned)ESP.getMaxAllocHeap());
-    return;
+    Update.abort();
+    if (!Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN)) {
+      client.stop();
+      s_active = false;
+      if (s_busyFn) s_busyFn(false);
+      setMsg("update begin fail");
+      logShipf("[OTA] Update.begin fail err=%s heap=%u maxblk=%u",
+               Update.errorString(), (unsigned)ESP.getFreeHeap(),
+               (unsigned)ESP.getMaxAllocHeap());
+      return;
+    }
   }
 
   uint8_t buf[1024];
   size_t written = 0;
+  size_t nextLogAt = 0x20000;
   start = millis();
   while ((client.connected() || client.available()) &&
          (fsize < 0 || (long)written < fsize)) {
@@ -246,17 +253,29 @@ static void doOta() {
     // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
     yield();
     delay(0);
-    if ((written & 0x1FFFF) == 0) {
+    if (written >= nextLogAt && fsize > 0) {
       logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
+      nextLogAt += 0x20000;
     }
   }
   client.stop();
+
+  // 半截镜像不能激活：end(true) 会去 set_boot，全镜像校验必失败
+  if (fsize > 0 && (long)written < fsize) {
+    Update.abort();
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    setMsg("partial write");
+    logShipf("[OTA] partial %u/%ld → abort", (unsigned)written, fsize);
+    return;
+  }
 
   if (!Update.end(true)) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     setMsg("end fail");
-    logShipf("[OTA] Update.end fail err=%s", Update.errorString());
+    logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld", Update.errorString(),
+             (unsigned)written, fsize);
     return;
   }
   setMsg("rebooting");
