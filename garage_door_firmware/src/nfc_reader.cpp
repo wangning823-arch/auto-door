@@ -160,7 +160,7 @@ static void nfcPulse9Clk() {
   delay(2);
 }
 
-static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
+static bool pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   const uint8_t addr = PN532_I2C_ADDRESS;
   uint8_t packet[32];
   uint8_t len = (uint8_t)(cmdlen + 1);
@@ -177,10 +177,16 @@ static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   }
   packet[6 + cmdlen] = (uint8_t)(~sum + 1);
   packet[7 + cmdlen] = 0x00;
-  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);  // 写也不许 1s 级阻塞
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   Wire.beginTransmission(addr);
   Wire.write(packet, (uint8_t)(8 + cmdlen));
-  Wire.endTransmission();
+  uint8_t e = Wire.endTransmission();
+  if (e != 0) {
+    // 写中断会把从机停在半字节 → 必须补时钟，否则 SCL 被锁死
+    nfcPulse9Clk();
+    return false;
+  }
+  return true;
 }
 
 static void i2cBusRecover(int sda, int scl);
@@ -323,9 +329,8 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
 
 // 裸发命令并吃掉响应：setRetries/SAMConfig 不再走 Adafruit waitready
 static bool pn532Xfer(const uint8_t* cmd, uint8_t cmdlen, uint32_t waitMs) {
-  pn532WriteCmd(cmd, cmdlen);
+  if (!pn532WriteCmd(cmd, cmdlen)) return false;
   if (!pn532ReadAck(200)) {
-    // 从机可能卡在半字节 → 立刻补时钟，否则 SCL 被按死
     nfcPulse9Clk();
     return false;
   }
@@ -362,10 +367,17 @@ static bool pn532SamConfig() {
 // GetFirmwareVersion
 static uint32_t pn532GetFwVer() {
   uint8_t cmd[1] = {0x02};
-  pn532WriteCmd(cmd, 1);
-  if (!pn532ReadAck(100)) return 0;
+  if (!pn532WriteCmd(cmd, 1)) return 0;
+  if (!pn532ReadAck(300)) {
+    nfcPulse9Clk();
+    return 0;
+  }
   uint8_t resp[24] = {0};
   int n = pn532ReadFrame(resp, 20, 300);
+  if (n < 11) {
+    nfcPulse9Clk();
+    return 0;
+  }
   if (n < 11) return 0;
   int p = 0;
   if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
@@ -539,11 +551,6 @@ bool NfcReader::hwInit() {
   delay(50);
   pn532Drain();
   logShipf("[NFC] init pre-SAM SCL=%d", digitalRead(scl_));
-  // 先读固件版本探活：比 SAM 更轻，能看出是 I2C 不通还是命令没配好
-  {
-    uint32_t ver0 = pn532GetFwVer();
-    logShipf("[NFC] probe fw=0x%08X SCL=%d", (unsigned)ver0, digitalRead(scl_));
-  }
   bool samOk = false;
   for (int samTry = 0; samTry < 3 && !samOk; samTry++) {
     // 上电/OTA 后 PN532 要多醒一会；立刻 SAM 容易 NACK，重试又把总线卡死

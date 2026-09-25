@@ -46,6 +46,7 @@ void remoteOtaSetBusyHook(OtaBusyFn fn) { s_busyFn = fn; }
 void remoteOtaCheckNow() {
   s_force = true;
   s_nextMs = 0;
+  s_done = false;  // 手动 update 必须能再查：否则本运行一直 up-to-date 后拒升级
 }
 bool remoteOtaActive() { return s_active; }
 const char* remoteOtaLastMsg() { return s_lastMsg; }
