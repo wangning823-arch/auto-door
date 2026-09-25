@@ -154,6 +154,7 @@ static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   }
   packet[6 + cmdlen] = (uint8_t)(~sum + 1);
   packet[7 + cmdlen] = 0x00;
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);  // 写也不许 1s 级阻塞
   Wire.beginTransmission(addr);
   Wire.write(packet, (uint8_t)(8 + cmdlen));
   Wire.endTransmission();
@@ -247,23 +248,41 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
   }
   // 收到完整帧 = 片上 InList 已结束（出卡或 0 tags），下一轮才可重发
   s_inlistOpen = false;
-  int p = 0;
-  if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
-  if (p >= n || resp[p] != 0xD5) {
-    Serial.printf("[NFC] inlist parse n=%d %02X %02X %02X\n", n, resp[0],
-                  resp[1], resp[2]);
+  // PN532 帧：00 00 FF LEN LCS TFI ... | 扩展 00 00 FF FF LENm LENl LCS TFI ...
+  // 以前写死 p=5，扩展帧/错位会当成「非 D5」→ 永远无 UID、不发 RF
+  int p = -1;
+  if (n >= 5 && resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) {
+    if (resp[3] != 0xFF) {
+      p = 5;  // 短帧 TFI
+    } else if (n >= 8) {
+      p = 7;  // 扩展帧 TFI
+    }
+  }
+  if (p < 0 || p >= n) {
+    // 兜底：直接找 D5 4B（InListPassiveTarget 应答）
+    for (int i = 0; i + 1 < n && i < 16; i++) {
+      if (resp[i] == 0xD5 && resp[i + 1] == 0x4B) {
+        p = i;
+        break;
+      }
+    }
+  }
+  if (p < 0 || p + 1 >= n || resp[p] != 0xD5) {
+    Serial.printf("[NFC] inlist parse n=%d", n);
+    for (int i = 0; i < n && i < 16; i++) Serial.printf(" %02X", resp[i]);
+    Serial.println();
     return -1;
   }
-  p++;
+  p++;  // D5
   if (p >= n || resp[p] != 0x4B) return -1;
-  p++;
+  p++;  // 4B
   if (p >= n) return -1;
   uint8_t nb = resp[p++];
   if (nb == 0) return 0;
   if (p + 3 >= n) return -1;
-  p++;
-  p += 2;
-  p++;
+  p++;     // Tg
+  p += 2;  // ATQA
+  p++;     // SAK
   if (p >= n) return -1;
   uint8_t idLen = resp[p++];
   if (idLen < 4 || idLen > 7 || p + idLen > n) {
@@ -878,14 +897,15 @@ bool NfcReader::poll(String& uid) {
     lastPollSlow_ = false;
   }
 
-  // 仅「连续空轮询够多」且无进行中 InList 才刷 RF 场
-  // （RFConfiguration 会打断 InList → 手机 ATR 重置）
-  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS && !s_inlistOpen) {
+  // listen 期间禁止刷 RF：RFConfiguration 会打断 InList → 贴卡变慢/丢卡
+  // 只有长时间空窗（>20s）才补一次场，避免每 30 次空轮询就把 ATR 打掉
+  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS && !s_inlistOpen &&
+      (now - lastFieldMs_) > 20000UL) {
     Serial.printf("[NFC] 空轮询 %u → 刷新 RF field\n", (unsigned)emptyPolls_);
     pn532RfFieldOn(sda_, scl_);
     emptyPolls_ = 0;
     lastFieldMs_ = now;
-    nextPollMs_ = millis() + 200;  // rewire 后多等一会再 InList
+    nextPollMs_ = millis() + 200;
     return false;
   }
 

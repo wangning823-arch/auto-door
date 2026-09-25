@@ -1166,6 +1166,7 @@ void setup() {
     } else {
       logShipf("[NFC] card: %s unauthorized", uid.c_str());
     }
+    Serial.printf("[NFC] card cb uid=%s auth=%d\n", uid.c_str(), (int)auth);
   });
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
