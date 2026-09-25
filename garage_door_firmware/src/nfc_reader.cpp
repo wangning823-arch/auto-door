@@ -55,16 +55,18 @@ static bool busIdle(int sda, int scl) {
 
 // SCL 被从机/半截传输按死时：Wire.end 还脚 + 推挽 9-clock。
 // 关键：时钟必须是推挽 OUTPUT；开漏 HIGH 只是松手，从机仍可按住 SCL。
+// 注意：ESP32 pinMode(OUTPUT) 会按输出寄存器（默认 0）驱动 → 必须先写 1 再改模式，
+// 否则会先打出一个 SCL 低毛刺，把空闲 PN532 弄成一直拉 SCL。
 static void i2cBusRecover(int sda, int scl) {
   Wire.end();
   delay(2);
   gpio_reset_pin((gpio_num_t)scl);
   gpio_reset_pin((gpio_num_t)sda);
-  pinMode(scl, OUTPUT);
-  digitalWrite(scl, HIGH);
+  digitalWrite(scl, HIGH);  // 先设输出寄存器
+  pinMode(scl, OUTPUT);     // 再使能输出，避免低毛刺
   delay(50);
-  pinMode(sda, OUTPUT);
   digitalWrite(sda, HIGH);
+  pinMode(sda, OUTPUT);
   delay(2);
   int pushScl = digitalRead(scl);
   for (int round = 0; round < 5; round++) {
@@ -407,12 +409,15 @@ bool NfcReader::recoverBusAndResync() {
   Serial.println("[NFC] resync bus + SAMConfig");
 
   releaseBus(sda_, scl_);
-  i2cBusRecover(sda_, scl_);
+  // 只有总线不空闲才 recover，避免毛刺弄死空闲 PN532
   if (!busIdle(sda_, scl_)) {
-    failRelease("resync idle", sda_, scl_, &failStreak_);
-    ok_ = false;
-    deferred_ = true;
-    return false;
+    i2cBusRecover(sda_, scl_);
+    if (!busIdle(sda_, scl_)) {
+      failRelease("resync idle", sda_, scl_, &failStreak_);
+      ok_ = false;
+      deferred_ = true;
+      return false;
+    }
   }
   Wire.begin(sda_, scl_, (uint32_t)100000);
   // init 可以宽一点，结束前必须收回短超时，否则 isready NACK 会拖成 1s 级慢 ACK
@@ -503,8 +508,8 @@ bool NfcReader::hwInit() {
   }
   absent_ = false;
 
-  // 全裸 init：OTA 软重启不会给 PN532 断电，必须唤醒 + 清残留后再 SAM
-  i2cBusRecover(sda_, scl_);
+  // 总线已空闲时禁止 i2cBusRecover：推挽时钟毛刺会把空闲 PN532 弄成拉死 SCL
+  // （只在 probe 后仍乱、或 SAM 失败时才 recover）
   Wire.begin(sda_, scl_, (uint32_t)100000);
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda_, scl_);
@@ -858,8 +863,8 @@ void NfcReader::holdSclHigh() {
   int sda = sda_ >= 0 ? sda_ : PIN_NFC_SDA;
   int scl = scl_ >= 0 ? scl_ : PIN_NFC_SCL;
   releaseBus(sda, scl);  // 只松 Wire；SDA 保持上拉，只推 SCL
-  pinMode(scl, OUTPUT);
   digitalWrite(scl, HIGH);
+  pinMode(scl, OUTPUT);
   Serial.printf("[NFC] SCL hold HIGH pin=%d (SDA 保持上拉)\n", scl);
 }
 

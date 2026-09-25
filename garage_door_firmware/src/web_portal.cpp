@@ -320,13 +320,16 @@ void WebPortal::setupRoutes() {
       server.send(200, "text/html", "garage-door");
       return;
     }
-    String html =
-        F("<!DOCTYPE html><html><head><meta charset=utf-8>"
-          "<meta http-equiv=refresh content=\"0;url=http://192.168.4.1/\">"
-          "<title>GarageDoor</title></head><body>"
-          "<p>正在打开车库门配置页… <a href=http://192.168.4.1/>192.168.4.1</a></p>"
-          "</body></html>");
-    server.sendHeader("Location", "http://192.168.4.1/", true);
+    // 用请求 Host，STA 访问时不要跳去 192.168.4.1
+    String host = server.hostHeader();
+    if (!host.length()) host = WiFi.softAPIP().toString();
+    String url = "http://" + host + "/";
+    String html = String(F("<!DOCTYPE html><html><head><meta charset=utf-8>"
+                           "<meta http-equiv=refresh content=\"0;url=")) +
+                  url + F("\"><title>GarageDoor</title></head><body>"
+                          "<p>正在打开车库门配置页… <a href=") +
+                  url + ">" + host + F("</a></p></body></html>");
+    server.sendHeader("Location", url, true);
     server.send(302, "text/html", html);
   };
 
@@ -434,7 +437,15 @@ void WebPortal::setupRoutes() {
     Serial.printf("[WEB] GET / from %s\n",
                   server.client().remoteIP().toString().c_str());
     String html = gPortal->pageHtml();
-    server.send(200, "text/html; charset=utf-8", html);
+    // 8KB 整包 send 在 BT Inquiry 忙时只发出响应头、正文卡死
+    // → 分块 sendContent，块间 yield
+    server.setContentLength(html.length());
+    server.send(200, "text/html; charset=utf-8", "");
+    const unsigned chunk = 1024;
+    for (unsigned i = 0; i < html.length(); i += chunk) {
+      server.sendContent(html.substring(i, i + chunk));
+      yield();
+    }
     Serial.printf("[WEB] GET / bytes=%u gen=%ums clients=%d\n",
                   (unsigned)html.length(), (unsigned)(millis() - t0),
                   WiFi.softAPgetStationNum());
@@ -802,9 +813,11 @@ void WebPortal::setupRoutes() {
     String uri = server.uri();
     Serial.printf("[WEB] 404 %s from %s\n", uri.c_str(),
                   server.client().remoteIP().toString().c_str());
-    // 任意域名（手机连 AP 后乱跳）都导到配置页
-    server.sendHeader("Location", "http://192.168.4.1/", true);
-    server.send(302, "text/plain", "redirect http://192.168.4.1/");
+    // 跟请求 Host 走：STA(192.168.31.x) 访问时不能再跳到热点 192.168.4.1
+    String host = server.hostHeader();
+    if (!host.length()) host = WiFi.softAPIP().toString();
+    server.sendHeader("Location", "http://" + host + "/", true);
+    server.send(302, "text/plain", "redirect http://" + host + "/");
   });
 }
 

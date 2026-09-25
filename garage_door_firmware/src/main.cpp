@@ -1039,6 +1039,7 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   delay(50);
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
+  logShipBegin();  // 必须在 early SCL 日志前，否则 s_len=0 会冲掉
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
   gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
@@ -1053,6 +1054,9 @@ void setup() {
     // 软件尚未碰 Wire：仍为 0 则是外部（PN532/短路），不是 I2C 矩阵
     Serial.printf("[BOOT] early SCL=0 → 脚已 gpio_reset+pullup，外部拉住 t=%ums\n",
                   (unsigned)millis());
+    logShipf("[BOOT] early SCL=0 t=%ums", (unsigned)millis());
+  } else {
+    logShipf("[BOOT] early SCL=1 t=%ums", (unsigned)millis());
   }
 
   gDoor.begin();
@@ -1063,7 +1067,7 @@ void setup() {
   remoteCmdSetMemTrim([]() { gBleScan.releaseMemory(); });
   gCfg.begin();
   remoteCmdBegin(&gCfg);
-  logShipBegin();
+  // logShipBegin 已在 early SCL 日志前调用，此处再 begin 会清掉已入队日志
   statusReportBegin();
   remoteOtaBegin(&gCfg);
   remoteOtaSetBusyHook([](bool on) {
