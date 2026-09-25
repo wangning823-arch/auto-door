@@ -247,6 +247,7 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
     s_inlistOpen = true;
     s_inlistOpenAt = millis();
     if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
+      nfcPulse9Clk();
       return -1;
     }
   } else if (millis() - s_inlistOpenAt > NFC_INLIST_STUCK_MS) {
@@ -263,7 +264,10 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
   if (n < 8) {
     // 超时：芯片可能仍在寻卡。禁止 drain/重发（会重置手机 ATR → 弹窗无 UID）
     if (!digitalRead(PIN_NFC_SCL) || !digitalRead(PIN_NFC_SDA)) {
-      i2cBusRecover(PIN_NFC_SDA, PIN_NFC_SCL);
+      // 先 9-clock，仍死才 full recover（recover 毛刺更容易锁死）
+      nfcPulse9Clk();
+      if (!digitalRead(PIN_NFC_SCL) || !digitalRead(PIN_NFC_SDA))
+        i2cBusRecover(PIN_NFC_SDA, PIN_NFC_SCL);
       s_inlistOpen = false;
       return -1;
     }
@@ -535,13 +539,23 @@ bool NfcReader::hwInit() {
   delay(50);
   pn532Drain();
   logShipf("[NFC] init pre-SAM SCL=%d", digitalRead(scl_));
+  // 先读固件版本探活：比 SAM 更轻，能看出是 I2C 不通还是命令没配好
+  {
+    uint32_t ver0 = pn532GetFwVer();
+    logShipf("[NFC] probe fw=0x%08X SCL=%d", (unsigned)ver0, digitalRead(scl_));
+  }
   bool samOk = false;
   for (int samTry = 0; samTry < 3 && !samOk; samTry++) {
+    // 上电/OTA 后 PN532 要多醒一会；立刻 SAM 容易 NACK，重试又把总线卡死
+    pn532Wakeup();
+    delay(80);
+    pn532Drain();
+    delay(20);
     samOk = pn532SamConfig();
     logShipf("[NFC] SAM try=%d ok=%d SCL=%d", samTry, (int)samOk,
              digitalRead(scl_));
     if (samOk) break;
-    // 失败但总线仍空闲：只 wakeup+drain 重试，禁止 recover（会打毛刺）
+    // 失败但总线仍空闲：只松手拉长间隔，禁止 recover（毛刺会把 SCL 打死）
     releaseBus(sda_, scl_);
     if (!digitalRead(scl_) || !digitalRead(sda_)) {
       logShipf("[NFC] SAM fail bus low → recover SCL=%d", digitalRead(scl_));
@@ -549,11 +563,11 @@ bool NfcReader::hwInit() {
     }
     Wire.begin(sda_, scl_, (uint32_t)100000);
     Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
-    delay(30);
+    delay(200);
     pn532Wakeup();
-    delay(50);
+    delay(100);
     pn532Drain();
-    delay(20);
+    delay(50);
   }
   if (!samOk) {
     logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
