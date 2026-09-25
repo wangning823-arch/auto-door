@@ -97,6 +97,7 @@ static void releaseBus(int sda, int scl) {
   if (sda >= 0) gpio_reset_pin((gpio_num_t)sda);
   forceIdlePullups(sda, scl);
   delay(2);
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);  // 禁止把 1000ms 超时泄漏到下一轮
 }
 
 // init 失败统一收尾：松手 + 计失败（禁止后台自动再撞，只允许手动 nfcinit）
@@ -162,8 +163,7 @@ static void i2cBusRecover(int sda, int scl);
 
 static bool pn532WaitRdy(uint32_t budgetMs) {
   uint32_t start = millis();
-  uint16_t oldTo = (uint16_t)Wire.getTimeOut();
-  Wire.setTimeOut(15);  // 仅状态轮询要快失败；结束后必须恢复
+  Wire.setTimeOut(15);  // 仅状态轮询要快失败
   bool ready = false;
   while ((millis() - start) < budgetMs) {
     uint8_t rdy = 0;
@@ -175,7 +175,8 @@ static bool pn532WaitRdy(uint32_t budgetMs) {
     }
     delay(2);
   }
-  Wire.setTimeOut(oldTo ? oldTo : NFC_WIRE_TIMEOUT_MS);
+  // 不恢复 oldTo：init 期 1000ms 泄漏会让 isready NACK 卡成 cost≈1007ms
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   return ready;
 }
 
@@ -214,15 +215,16 @@ static uint32_t s_inlistOpenAt = 0;
 // 等当前 InList 的出卡帧。s_inlistOpen 时只读不写，保护手机 HCE ATR。
 // 返回 1=卡 0=本轮窗口未出卡（芯片可能仍在搜） -1=帧/总线错（才允许重发）
 static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   if (!s_inlistOpen) {
     uint8_t cmd[3] = {0x4A, 0x01, 0x04};  // InList, 1 tg, ISO14443A
     pn532WriteCmd(cmd, 3);
-    if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
-      pn532Drain();
-      return -1;
-    }
+    // 写出去就算片上可能已开搜：ACK 失败也不许立刻叠发（芯片忙会 NACK→cost≈1s）
     s_inlistOpen = true;
     s_inlistOpenAt = millis();
+    if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
+      return -1;
+    }
   } else if (millis() - s_inlistOpenAt > NFC_INLIST_STUCK_MS) {
     // 粘滞过久仍无 ready：打断片上 InList，下一轮重发
     Serial.println("[NFC] inlist stuck → abort + resend");
@@ -914,13 +916,18 @@ bool NfcReader::poll(String& uid) {
       Serial.printf("[NFC] inlist err ir=%d cost=%ums streak=%u open=%d\n", ir,
                     (unsigned)cost, (unsigned)(slowAckStreak_ + 1),
                     (int)s_inlistOpen);
-      pn532Drain();
-      s_inlistOpen = false;
-      lastPollSlow_ = true;
-      if (slowAckStreak_ < 255) slowAckStreak_++;
-      if (slowAckStreak_ >= 3) {
-        Serial.println("[NFC] 连续 inlist 错误 → setRetries");
-        pn532SetRetries(NFC_INLIST_RETRIES);
+      // 粘滞中：不 drain、不清 open，下一轮只 ReadFrame（叠发会把芯片打成 1s NACK）
+      if (!s_inlistOpen) {
+        pn532Drain();
+        lastPollSlow_ = true;
+        if (slowAckStreak_ < 255) slowAckStreak_++;
+        if (slowAckStreak_ >= 3) {
+          Serial.println("[NFC] 连续 inlist 错误 → setRetries");
+          pn532SetRetries(NFC_INLIST_RETRIES);
+          slowAckStreak_ = 0;
+        }
+      } else {
+        lastPollSlow_ = false;
         slowAckStreak_ = 0;
       }
       nextPollMs_ = millis();
