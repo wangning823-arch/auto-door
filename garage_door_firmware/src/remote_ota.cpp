@@ -56,11 +56,13 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
   IPAddress addr;
   if (!WiFi.hostByName(host.c_str(), addr)) return false;
   if (!client->connect(addr, port, OTA_HTTP_TIMEOUT_MS)) return false;
+  client->setTimeout(30000);  // 大固件读包慢，别被默认超时掐断
   String req;
   req.reserve(128);
+  // HTTP/1.0：避免 chunked；无 Content-Length 时也能按连接关闭读完
   req += "GET ";
   req += path;
-  req += " HTTP/1.1\r\nHost: ";
+  req += " HTTP/1.0\r\nHost: ";
   req += host;
   req += "\r\nUser-Agent: garage-esp32\r\nConnection: close\r\n\r\n";
   if (client->print(req) != (int)req.length()) {
@@ -76,6 +78,10 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
       char c = (char)client->read();
       head += c;
       if (head.indexOf("\r\n\r\n") >= 0) break;
+      if (head.length() > 2048) {
+        client->stop();
+        return false;
+      }
     }
     if (head.indexOf("\r\n\r\n") >= 0) break;
     delay(1);
@@ -190,7 +196,8 @@ static void doOta() {
 
   long fsize = -1;
   String bpath = withId("/ota/firmware.bin");
-  if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize <= 0) {
+  // fsize<0 = 无 Content-Length，仍可按连接关闭收完（UPDATE_SIZE_UNKNOWN）
+  if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize == 0) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     setMsg("bin fetch fail");
@@ -238,7 +245,8 @@ static void doOta() {
     start = millis();
     // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
     yield();
-    if ((written & 0x7FFF) == 0) {
+    delay(0);
+    if ((written & 0x1FFFF) == 0) {
       logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
     }
   }

@@ -161,7 +161,7 @@ static void nfcPulse9Clk() {
   delay(2);
 }
 
-static bool pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
+static void pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   const uint8_t addr = PN532_I2C_ADDRESS;
   uint8_t packet[32];
   uint8_t len = (uint8_t)(cmdlen + 1);
@@ -178,16 +178,9 @@ static bool pn532WriteCmd(const uint8_t* cmd, uint8_t cmdlen) {
   }
   packet[6 + cmdlen] = (uint8_t)(~sum + 1);
   packet[7 + cmdlen] = 0x00;
-  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   Wire.beginTransmission(addr);
   Wire.write(packet, (uint8_t)(8 + cmdlen));
-  uint8_t e = Wire.endTransmission();
-  if (e != 0) {
-    // 写中断会把从机停在半字节 → 必须补时钟，否则 SCL 被锁死
-    nfcPulse9Clk();
-    return false;
-  }
-  return true;
+  Wire.endTransmission();
 }
 
 static void i2cBusRecover(int sda, int scl);
@@ -330,18 +323,11 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
 
 // 裸发命令并吃掉响应：setRetries/SAMConfig 不再走 Adafruit waitready
 static bool pn532Xfer(const uint8_t* cmd, uint8_t cmdlen, uint32_t waitMs) {
-  if (!pn532WriteCmd(cmd, cmdlen)) return false;
-  if (!pn532ReadAck(300)) {
-    nfcPulse9Clk();
-    return false;
-  }
+  pn532WriteCmd(cmd, cmdlen);
+  if (!pn532ReadAck(200)) return false;
   uint8_t resp[24] = {0};
   int n = pn532ReadFrame(resp, 20, waitMs);
-  if (n < 3) {
-    nfcPulse9Clk();
-    return false;
-  }
-  return resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF;
+  return n >= 3 && resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF;
 }
 
 // RFConfiguration item5：MxRtyPassiveActivation = retries
@@ -368,17 +354,10 @@ static bool pn532SamConfig() {
 // GetFirmwareVersion
 static uint32_t pn532GetFwVer() {
   uint8_t cmd[1] = {0x02};
-  if (!pn532WriteCmd(cmd, 1)) return 0;
-  if (!pn532ReadAck(300)) {
-    nfcPulse9Clk();
-    return 0;
-  }
+  pn532WriteCmd(cmd, 1);
+  if (!pn532ReadAck(100)) return 0;
   uint8_t resp[24] = {0};
   int n = pn532ReadFrame(resp, 20, 300);
-  if (n < 11) {
-    nfcPulse9Clk();
-    return 0;
-  }
   if (n < 11) return 0;
   int p = 0;
   if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
