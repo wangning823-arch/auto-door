@@ -140,7 +140,8 @@ bool NfcReader::probePresent() {
 // ===== 裸 PN532 I2C：绕开 Adafruit waitready（假时钟会把贴卡拖成 1.3s 超时）=====
 static void pn532Drain();
 static void nfcPulse9Clk() {
-  // 从机可能卡在半字节：补 9 个时钟 + STOP，常比整段 recover 温和
+  // 只有总线被拉低才补时钟；空闲时乱打 9-clock 会把 PN532 弄乱，下条命令反而锁死 SCL
+  if (digitalRead(PIN_NFC_SCL) && digitalRead(PIN_NFC_SDA)) return;
   Wire.end();
   digitalWrite(PIN_NFC_SCL, HIGH);
   pinMode(PIN_NFC_SCL, OUTPUT);
@@ -330,7 +331,7 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
 // 裸发命令并吃掉响应：setRetries/SAMConfig 不再走 Adafruit waitready
 static bool pn532Xfer(const uint8_t* cmd, uint8_t cmdlen, uint32_t waitMs) {
   if (!pn532WriteCmd(cmd, cmdlen)) return false;
-  if (!pn532ReadAck(200)) {
+  if (!pn532ReadAck(300)) {
     nfcPulse9Clk();
     return false;
   }
