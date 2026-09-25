@@ -85,7 +85,8 @@ bool RfCapture::ensureRmt() {
     Serial.println("[RF] RMT init fail → 回退软件 bit-bang");
     return false;
   }
-  rmtSetTick(s_rmtTx, 1.0f);  // 1µs / tick
+  // rmtSetTick 参数单位是 ns（见 esp32-hal-rmt.h）；1000ns = 1µs/tick，码表按 µs 存
+  rmtSetTick(s_rmtTx, 1000.0f);
   Serial.printf("[RF] RMT TX ready GPIO%d (async)\n", txPin_);
   return true;
 }
