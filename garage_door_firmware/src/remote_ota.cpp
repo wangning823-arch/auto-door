@@ -184,7 +184,7 @@ static void doOta() {
            deviceId().c_str());
 
   s_active = true;
-  s_done = true;  // 禁止 service 再进 doOta 造成刷屏/重复下载
+  // 不在这里 s_done：下载失败还要允许按间隔重试；只有「已是最新」才钉死
   if (s_busyFn) s_busyFn(true);
 
   long fsize = -1;

@@ -535,26 +535,32 @@ bool NfcReader::hwInit() {
   delay(50);
   pn532Drain();
   logShipf("[NFC] init pre-SAM SCL=%d", digitalRead(scl_));
-  if (!pn532SamConfig()) {
-    // 再救一轮：残余 InList 会让第一条 SAM 失败
-    logShipf("[NFC] SAM1 fail SCL=%d", digitalRead(scl_));
+  bool samOk = false;
+  for (int samTry = 0; samTry < 3 && !samOk; samTry++) {
+    samOk = pn532SamConfig();
+    logShipf("[NFC] SAM try=%d ok=%d SCL=%d", samTry, (int)samOk,
+             digitalRead(scl_));
+    if (samOk) break;
+    // 失败但总线仍空闲：只 wakeup+drain 重试，禁止 recover（会打毛刺）
     releaseBus(sda_, scl_);
-    i2cBusRecover(sda_, scl_);
+    if (!digitalRead(scl_) || !digitalRead(sda_)) {
+      logShipf("[NFC] SAM fail bus low → recover SCL=%d", digitalRead(scl_));
+      i2cBusRecover(sda_, scl_);
+    }
     Wire.begin(sda_, scl_, (uint32_t)100000);
     Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
+    delay(30);
     pn532Wakeup();
-    delay(20);
+    delay(50);
     pn532Drain();
-    if (!pn532SamConfig()) {
-      logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
-      failRelease("raw SAM", sda_, scl_, &failStreak_);
-      ok_ = false;
-      deferred_ = true;
-      return false;
-    }
-    logShipf("[NFC] SAM2 OK SCL=%d", digitalRead(scl_));
-  } else {
-    logShipf("[NFC] SAM1 OK SCL=%d", digitalRead(scl_));
+    delay(20);
+  }
+  if (!samOk) {
+    logShipf("[NFC] FAIL raw SAM SCL=%d", digitalRead(scl_));
+    failRelease("raw SAM", sda_, scl_, &failStreak_);
+    ok_ = false;
+    deferred_ = true;
+    return false;
   }
   delay(20);
   // 版本号仅诊断：SAM 已过就不要因 ver=0 砍掉 NFC
