@@ -14,4 +14,7 @@ void logShipPrintln(const String& line);
 void logShipService(bool btBusy, bool wifiOk);
 // 同步 flush：立刻 HTTP POST（OTA 重启前 / 串口 logs flush）
 void logShipFlushNow();
+// 预解析日志服务器 IP 并缓存（OTA 开始时网络正常时调用）：
+// 下载停滞期网络黑洞中 DNS 可阻塞 >5s → TWT 崩溃，flush 必须走缓存 IP 直连
+void logShipResolve();
 size_t logShipPending();

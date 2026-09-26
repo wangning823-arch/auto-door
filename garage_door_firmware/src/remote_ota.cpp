@@ -3,6 +3,7 @@
 #include "device_id.h"
 #include "http_client.h"
 #include "log_ship.h"
+#include "ble_tracker.h"
 #include <Update.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -26,6 +27,7 @@ static bool s_active = false;
 static bool s_done = false;
 static char s_lastMsg[64] = "idle";
 static char s_httpWhy[48] = "";  // httpGetStream 最近一次失败原因
+static bool s_radioDown = false;  // BT已停+省电已关：所有退出路径需重启恢复
 
 static void setMsg(const char* m) {
   strncpy(s_lastMsg, m, sizeof(s_lastMsg) - 1);
@@ -92,6 +94,8 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
   }
   uint32_t start = millis();
   String head;
+  // 逐字节读是刻意的：块读会把 \r\n\r\n 之后的 body 开头一并吞进 head
+  // （version JSON / bin 正文前缀），调用方从 socket 再读就缺了一段
   while (client->connected() || client->available()) {
     if (millis() - start > OTA_HTTP_TIMEOUT_MS) break;
     while (client->available()) {
@@ -249,157 +253,188 @@ static void otaAttempt() {
            remoteSha.length() ? remoteSha.substring(0, 12).c_str() : "-",
            deviceId().c_str());
 
-  // 先 Update.begin 再开下载连接：begin 内部要 malloc(4KB)，
-  // 下载 socket 打开后服务端持续推正文，TCP 窗口 pbuf 会把最大连续块
-  // 切到 4KB 以下 → begin 必失败（err=0）。UPDATE_SIZE_UNKNOWN =
-  // 分区大小 0x1F0000，足以容纳本次 bin；partial/sha 校验仍在。
-  Update.abort();
-  disableLoopWDT();
-  bool began = Update.begin(UPDATE_SIZE_UNKNOWN);
-  uint8_t err1 = Update.getError();  // 第一次的真实错误（abort 会覆盖）
-  if (!began) {
-    Update.abort();
-    began = Update.begin(UPDATE_SIZE_UNKNOWN);
+  // 版本确有更新，才动射频：先停 BT 再关省电（BT 开着关省电 → wifi 断言
+  // abort 必崩）。关掉省电后 AP 不再小缓冲排队，大流下行不再溢出丢包。
+  // BT 栈已拆，之后任何退出路径都靠 ESP.restart 恢复（doOta 收尾处理）
+  bool btDown = btRadioPowerDown();
+  if (btDown) {
+    WiFi.setSleep(false);
+    s_radioDown = true;
   }
-  enableLoopWDT();
-  if (!began) {
-    setMsg("update begin fail");
-    logShipf("[OTA] Update.begin fail err1=%u err2=%u heap=%u maxblk=%u",
-             (unsigned)err1, (unsigned)Update.getError(),
-             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-    return;
-  }
-
-  long fsize = -1;
-  String bpath;
-  parseHttpUrl(bpathUrl, &host, &port, &bpath, "/ota/firmware.bin");
-  bpath = withId(bpath);
-  if (!fetchWithRetry(host, port, bpath, &client, &fsize, 3, "bin") ||
-      fsize == 0) {
-    Update.abort();
-    setMsg("bin fetch fail");
-    logShipf("[OTA] bin fetch fail id=%s why=%s fsize=%ld", deviceId().c_str(),
-             s_httpWhy[0] ? s_httpWhy : "?", fsize);
-    return;
-  }
-  logShipf("[OTA] bin ok size=%ld heap=%u maxblk=%u rssi=%d sleep=%d", fsize,
-           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
-           (int)WiFi.RSSI(), (int)WiFi.getSleep());
-
-  mbedtls_sha256_context sha;
-  mbedtls_sha256_init(&sha);
-#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
-  mbedtls_sha256_starts(&sha, 0);
-#else
-  mbedtls_sha256_starts_ret(&sha, 0);
-#endif
-
-  uint8_t buf[1024];
-  size_t written = 0;
-  size_t nextLogAt = 0x20000;
-  start = millis();
-  uint32_t lastReport = millis();
-  while ((client.connected() || client.available()) &&
-         (fsize < 0 || (long)written < fsize)) {
-    if (millis() - start > 120000UL) break;
-    int n = client.available();
-    if (n <= 0) {
-      // 服务端推流慢时这里会空转 >5s → loopTask 触发 TWT abort（升级中途崩）
-      delay(1);
+  logShipf("[OTA] radio btStop=%d sleep=%d", (int)btDown,
+           (int)WiFi.getSleep());
+  // BT 下电会引发 WiFi 射频重配，刚断开的 socket 全部作废：等链路稳定
+  // 再开下载连接，否则下到一半 read 出错 → partial
+  {
+    uint32_t tw = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - tw < 8000) {
+      delay(100);
       esp_task_wdt_reset();
-      // 停滞每 5s 直推一条到 VPS：远程就能看到"卡在哪、信号/睡眠状态"
-      if (millis() - lastReport >= 5000) {
-        logShipf("[OTA] stall %u/%ld avail=%d conn=%d rssi=%d sleep=%d heap=%u",
-                 (unsigned)written, fsize, client.available(),
-                 (int)client.connected(), (int)WiFi.RSSI(),
-                 (int)WiFi.getSleep(), (unsigned)ESP.getFreeHeap());
-        logShipFlushNow();
-        lastReport = millis();
+    }
+    delay(1500);
+    esp_task_wdt_reset();
+    logShipf("[OTA] wifi settle st=%d rssi=%d", (int)WiFi.status(),
+             (int)WiFi.RSSI());
+  }
+
+  // 下载+校验+激活整段最多 3 轮：BT 下电瞬断、链路抖动都可能断流
+  for (int round = 1; round <= 3; round++) {
+    if (round > 1) {
+      logShipf("[OTA] dl retry round=%d/3", round);
+      delay(2000);
+      esp_task_wdt_reset();
+      Update.abort();
+      disableLoopWDT();
+      bool again = Update.begin(UPDATE_SIZE_UNKNOWN);
+      enableLoopWDT();
+      if (!again) {
+        logShipf("[OTA] retry begin fail heap=%u maxblk=%u",
+                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+        break;
       }
+    }
+
+    long fsize = -1;
+    String bpath;
+    parseHttpUrl(bpathUrl, &host, &port, &bpath, "/ota/firmware.bin");
+    bpath = withId(bpath);
+    if (!fetchWithRetry(host, port, bpath, &client, &fsize, 3, "bin") ||
+        fsize == 0) {
+      Update.abort();
+      setMsg("bin fetch fail");
+      logShipf("[OTA] bin fetch fail round=%d why=%s fsize=%ld", round,
+               s_httpWhy[0] ? s_httpWhy : "?", fsize);
       continue;
     }
-    if (n > (int)sizeof(buf)) n = sizeof(buf);
-    int r = client.read(buf, n);
-    if (r <= 0) break;
-    if (Update.write(buf, (size_t)r) != (size_t)r) {
+    logShipf("[OTA] bin ok size=%ld round=%d heap=%u maxblk=%u rssi=%d sleep=%d",
+             fsize, round, (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.RSSI(),
+             (int)WiFi.getSleep());
+
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+    mbedtls_sha256_starts(&sha, 0);
+#else
+    mbedtls_sha256_starts_ret(&sha, 0);
+#endif
+
+    uint8_t buf[1024];
+    size_t written = 0;
+    size_t nextLogAt = 0x20000;
+    uint32_t dlStart = millis();
+    uint32_t lastReport = millis();
+    bool writeAborted = false;
+    while ((client.connected() || client.available()) &&
+           (fsize < 0 || (long)written < fsize)) {
+      if (millis() - dlStart > 120000UL) break;
+      int n = client.available();
+      if (n <= 0) {
+        delay(1);
+        esp_task_wdt_reset();
+        // 停滞每 5s 直推一条到 VPS：远程就能看到"卡在哪、信号/睡眠状态"
+        if (millis() - lastReport >= 5000) {
+          logShipf(
+              "[OTA] stall %u/%ld for=%ums t=%u avail=%d conn=%d rssi=%d "
+              "sleep=%d heap=%u",
+              (unsigned)written, fsize, (unsigned)(millis() - dlStart),
+              (unsigned)millis(), client.available(), (int)client.connected(),
+              (int)WiFi.RSSI(), (int)WiFi.getSleep(),
+              (unsigned)ESP.getFreeHeap());
+          // 下载期间严禁同步 flush：flush 的 WiFiClient::stop() 是不关 fd 的
+          // 空壳，高频 flush 泄漏 socket，与下载连接在 lwIP 冲突 → 设备侧
+          // FIN 断连（实测每次 flush 后 <1s 断；注释后一次跑完全程）。
+          // 日志只入环，下载结束/重启前统一 flush
+          // logShipFlushNow();
+          lastReport = millis();
+        }
+        continue;
+      }
+      if (n > (int)sizeof(buf)) n = sizeof(buf);
+      int r = client.read(buf, n);
+      if (r <= 0) break;
+      if (Update.write(buf, (size_t)r) != (size_t)r) {
+        Update.abort();
+        mbedtls_sha256_free(&sha);
+        client.stop();
+        setMsg("write fail");
+        logShipf("[OTA] write fail at %u round=%d err=%s", (unsigned)written,
+                 round, Update.errorString());
+        writeAborted = true;
+        break;
+      }
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+      mbedtls_sha256_update(&sha, buf, (size_t)r);
+#else
+      mbedtls_sha256_update_ret(&sha, buf, (size_t)r);
+#endif
+      written += (size_t)r;
+      dlStart = millis();
+      // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
+      yield();
+      delay(0);
+      esp_task_wdt_reset();
+      if (written >= nextLogAt && fsize > 0) {
+        logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
+        nextLogAt += 0x20000;
+        // 下载中 flush 会断连（见 stall 分支注释），只入环
+        // logShipFlushNow();
+        lastReport = millis();
+      } else if (millis() - lastReport >= 10000) {
+        logShipf("[OTA] dl %u/%ld", (unsigned)written, fsize);
+        // logShipFlushNow();  // 同上：下载中禁 flush
+        lastReport = millis();
+      }
+    }
+    client.stop();
+    if (writeAborted) continue;
+
+    if (fsize > 0 && (long)written < fsize) {
       Update.abort();
       mbedtls_sha256_free(&sha);
-      client.stop();
-      setMsg("write fail");
-      logShipf("[OTA] write fail at %u err=%s", (unsigned)written,
-               Update.errorString());
-      return;
+      setMsg("partial write");
+      logShipf("[OTA] partial %u/%ld round=%d → retry", (unsigned)written,
+               fsize, round);
+      continue;
     }
-#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
-    mbedtls_sha256_update(&sha, buf, (size_t)r);
-#else
-    mbedtls_sha256_update_ret(&sha, buf, (size_t)r);
-#endif
-    written += (size_t)r;
-    start = millis();
-    // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
-    yield();
-    delay(0);
-    esp_task_wdt_reset();
-    if (written >= nextLogAt && fsize > 0) {
-      logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
-      nextLogAt += 0x20000;
-      logShipFlushNow();
-      lastReport = millis();
-    } else if (millis() - lastReport >= 10000) {
-      // 每 10s 汇报一次进度（爬行时 128KB 里程碑遥不可及）
-      logShipf("[OTA] dl %u/%ld", (unsigned)written, fsize);
-      logShipFlushNow();
-      lastReport = millis();
-    }
-  }
-  client.stop();
 
-  // 半截镜像不能激活
-  if (fsize > 0 && (long)written < fsize) {
-    Update.abort();
+    uint8_t raw[32];
+    char hex[65];
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+    mbedtls_sha256_finish(&sha, raw);
+#else
+    mbedtls_sha256_finish_ret(&sha, raw);
+#endif
     mbedtls_sha256_free(&sha);
-    setMsg("partial write");
-    logShipf("[OTA] partial %u/%ld → abort", (unsigned)written, fsize);
-    return;
-  }
+    sha256ToHex(raw, hex);
 
-  uint8_t raw[32];
-  char hex[65];
-#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
-  mbedtls_sha256_finish(&sha, raw);
-#else
-  mbedtls_sha256_finish_ret(&sha, raw);
-#endif
-  mbedtls_sha256_free(&sha);
-  sha256ToHex(raw, hex);
+    if (remoteSha.length() == 64 && strcmp(hex, remoteSha.c_str()) != 0) {
+      Update.abort();
+      setMsg("sha mismatch");
+      logShipf("[OTA] sha mismatch got=%s want=%s wrote=%u", hex,
+               remoteSha.c_str(), (unsigned)written);
+      continue;
+    }
 
-  if (remoteSha.length() == 64 && strcmp(hex, remoteSha.c_str()) != 0) {
-    Update.abort();
-    setMsg("sha mismatch");
-    logShipf("[OTA] sha mismatch got=%s want=%s wrote=%u", hex,
-             remoteSha.c_str(), (unsigned)written);
-    return;
+    disableLoopWDT();
+    bool ended = Update.end(true);
+    enableLoopWDT();
+    if (!ended) {
+      setMsg("end fail");
+      logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld round=%d sha=%s",
+               Update.errorString(), (unsigned)written, fsize, round, hex);
+      continue;
+    }
+    setMsg("rebooting");
+    logShipf("[OTA] OK bytes=%u sha=%s id=%s -> reboot", (unsigned)written,
+             hex, deviceId().c_str());
+    // 真正 POST 出去再重启，否则日志全丢
+    logShipFlushNow();
+    if (s_busyFn) s_busyFn(true);
+    delay(300);
+    ESP.restart();
   }
-
-  disableLoopWDT();
-  bool ended = Update.end(true);
-  enableLoopWDT();
-  if (!ended) {
-    setMsg("end fail");
-    logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld sha=%s",
-             Update.errorString(), (unsigned)written, fsize, hex);
-    return;
-  }
-  setMsg("rebooting");
-  logShipf("[OTA] OK bytes=%u sha=%s id=%s -> reboot", (unsigned)written, hex,
-           deviceId().c_str());
-  // 真正 POST 出去再重启，否则日志全丢
-  logShipFlushNow();
-  // 软重启前再收一次 NFC：避免踩在 InList 半截 → PN532 拉死 SCL
-  if (s_busyFn) s_busyFn(true);
-  delay(300);
-  ESP.restart();
+  logShipf("[OTA] 3 rounds failed -> give up");
 }
 
 static void doOta() {
@@ -414,11 +449,49 @@ static void doOta() {
            (int)httpIdle, (unsigned)ESP.getFreeHeap(),
            (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.getSleep(),
            (int)WiFi.RSSI());
+  // 此刻网络还正常：预解析日志服务器 IP，下载停滞期的实时日志走 IP 直连
+  // （停滞时 DNS 可阻塞 >5s → loopTask TWT 崩溃）
+  logShipResolve();
+
+  // Update.begin 必须在任何 HTTP 连接（含 version fetch）之前：短连接的
+  // netconn/pbuf 会把最大连续块切到 4KB 以下 → begin 内部 malloc(4KB) 必失败
+  //（err=0，malloc 失败路径不设 error）。失败/已最新由 otaAttempt 里 abort。
+  Update.abort();
+  disableLoopWDT();
+  bool began = Update.begin(UPDATE_SIZE_UNKNOWN);
+  uint8_t err1 = Update.getError();  // 第一次的真实错误（abort 会覆盖）
+  if (!began) {
+    Update.abort();
+    began = Update.begin(UPDATE_SIZE_UNKNOWN);
+  }
+  enableLoopWDT();
+  if (!began) {
+    setMsg("update begin fail");
+    logShipf("[OTA] Update.begin fail err1=%u err2=%u heap=%u maxblk=%u",
+             (unsigned)err1, (unsigned)Update.getError(),
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    httpResume();
+    return;
+  }
+
   otaAttempt();
-  // 失败/已最新 → 恢复 NFC/Inquiry、放行 http、允许下次触发
+  // 失败/已最新 → 恢复 NFC/Inquiry、省电、放行 http、允许下次触发
+  //（成功路径不返回：ESP.restart）
+  Update.abort();
+  WiFi.setSleep(true);
   s_active = false;
   if (s_busyFn) s_busyFn(false);
   httpResume();
+  if (s_radioDown) {
+    // BT 栈已在 otaAttempt 里拆除，不重启则蓝牙跟踪永久失效
+    s_radioDown = false;
+    logShipf("[OTA] bt down -> reboot to restore");
+    logShipFlushNow();
+    delay(300);
+    ESP.restart();
+  }
 }
 
 // 仅手动/指令触发：无定时自动检查，防止升到不想升的版本

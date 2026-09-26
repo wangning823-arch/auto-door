@@ -118,3 +118,8 @@ class BleTracker {
   uint8_t missCount_ = 0;
   bool ready_ = false;
 };
+
+// OTA 专用：彻底关 BT 射频（SerialBT.end + btStop，bluedroid/controller 全拆）。
+// 关掉后才能安全 WiFi.setSleep(false)（BT 开着关省电 → wifi 断言 abort）。
+// 拆栈后必须 ESP.restart 才能恢复蓝牙功能。成功返回 true
+bool btRadioPowerDown();

@@ -4,6 +4,9 @@
 #include "http_client.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <esp_task_wdt.h>
+#include <lwip/sockets.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -28,6 +31,8 @@ static int s_failStreak = 0;
 static bool s_inFlight = false;      // 快照已提交、结果未收
 static String s_snap;                 // 在飞的请求快照（失败时塞回）
 static SemaphoreHandle_t s_mtx = nullptr;  // NFC 任务写 / loop 读写
+static IPAddress s_shipIp;             // 预解析缓存：flush 走 IP 直连，跳过 DNS
+static bool s_shipIpOk = false;
 
 static void ringLock() {
   if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -148,8 +153,29 @@ static void buildPath(String* path) {
   }
 }
 
+// 预解析日志服务器 IP：必须在网络正常、非停滞上下文调用（如 OTA 入口）。
+// 之后 logShipFlushNow 全程用缓存 IP 直连，避开"黑洞期 DNS 阻塞 >5s → TWT"。
+void logShipResolve() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  IPAddress addr;
+  esp_task_wdt_reset();
+  if (WiFi.hostByName(LOG_SHIP_HOST, addr)) {
+    s_shipIp = addr;
+    s_shipIpOk = true;
+    Serial.printf("[LOGSHIP] resolve %s -> %s\n", LOG_SHIP_HOST,
+                  addr.toString().c_str());
+  } else {
+    s_shipIpOk = false;
+    Serial.printf("[LOGSHIP] resolve failed host=%s\n", LOG_SHIP_HOST);
+  }
+  esp_task_wdt_reset();
+}
+
 // 同步刷出（OTA 重启前专用）：worker 可能还有在飞，重复发一遍无害（幂等追加）
+// [FLUSH] 打点用于定位 TWT：崩溃时串口最后一条 FLUSH 行 = 卡住的段
 void logShipFlushNow() {
+  uint32_t t0 = millis();
+  Serial.printf("[FLUSH] enter t=%u\n", (unsigned)t0);
   s_nextMs = 0;
   String host, path;
   uint16_t port = 80;
@@ -161,12 +187,25 @@ void logShipFlushNow() {
   body.reserve(s_len);
   body.concat(s_ring, s_len);
   ringUnlock();
-  if (body.length() == 0 || WiFi.status() != WL_CONNECTED) return;
+  if (body.length() == 0 || WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[FLUSH] early skip dt=%u\n", (unsigned)(millis() - t0));
+    return;
+  }
 
-  IPAddress addr;
-  if (!WiFi.hostByName(host.c_str(), addr)) return;
+  // 预解析缓存 IP 直连（见 logShipResolve）：网络黑洞期 DNS 可阻塞 >5s
+  // → loopTask TWT 崩溃；无缓存且 resolve 失败则跳过本次 flush，
+  // 日志留在环里，网络恢复后由 logShipService 补发
+  if (!s_shipIpOk) logShipResolve();
+  if (!s_shipIpOk) {
+    Serial.printf("[FLUSH] no ip dt=%u\n", (unsigned)(millis() - t0));
+    return;
+  }
+  esp_task_wdt_reset();
   WiFiClient client;
-  if (!client.connect(addr, port, LOG_SHIP_TIMEOUT_MS)) return;
+  bool conn = client.connect(s_shipIp, port, LOG_SHIP_TIMEOUT_MS);
+  Serial.printf("[FLUSH] conn=%d dt=%u\n", (int)conn, (unsigned)(millis() - t0));
+  if (!conn) return;
+  esp_task_wdt_reset();
   String req;
   req.reserve(160 + body.length());
   req += "POST ";
@@ -178,7 +217,40 @@ void logShipFlushNow() {
   req += String((unsigned)body.length());
   req += "\r\nConnection: close\r\n\r\n";
   req += body;
-  client.print(req);
+  // WiFiClient::write 内部是 1s select × 10 轮，网络卡顿时最坏阻塞 10s
+  // ＞ TWT 5s → loopTask 崩溃。自写受控发送：200ms 一片、每片喂狗，
+  // 总预算 3s；发不完就放弃（日志留在环里，恢复后补发）
+  {
+    const char* p = req.c_str();
+    size_t total = req.length();
+    size_t sent = 0;
+    uint32_t st0 = millis();
+    int sfd = client.fd();
+    while (sent < total) {
+      esp_task_wdt_reset();
+      if (millis() - st0 > 3000) break;
+      fd_set wset;
+      FD_ZERO(&wset);
+      FD_SET(sfd, &wset);
+      struct timeval tv = {0, 200000};
+      int r = select(sfd + 1, nullptr, &wset, nullptr, &tv);
+      if (r < 0) break;
+      if (r > 0 && FD_ISSET(sfd, &wset)) {
+        int n = send(sfd, p + sent, total - sent, MSG_DONTWAIT);
+        if (n > 0) {
+          sent += (size_t)n;
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+          break;
+        }
+      }
+    }
+    Serial.printf("[FLUSH] sent %u/%u dt=%u\n", (unsigned)sent,
+                  (unsigned)total, (unsigned)(millis() - t0));
+    if (sent < total) {
+      client.stop();
+      return;
+    }
+  }
   uint32_t start = millis();
   String raw;
   while (client.connected() || client.available()) {
@@ -186,12 +258,15 @@ void logShipFlushNow() {
     while (client.available()) raw += (char)client.read();
     if (raw.indexOf("\r\n\r\n") >= 0 && !client.connected()) break;
     delay(1);
+    esp_task_wdt_reset();
     if (raw.length() > 512) break;
   }
   client.stop();
   int sp1 = raw.indexOf(' ');
   int sp2 = raw.indexOf(' ', sp1 + 1);
-  if (sp1 >= 0 && sp2 >= 0 && raw.substring(sp1 + 1, sp2).toInt() == 200) {
+  int code = (sp1 >= 0 && sp2 >= 0) ? raw.substring(sp1 + 1, sp2).toInt() : -1;
+  Serial.printf("[FLUSH] done code=%d dt=%u\n", code, (unsigned)(millis() - t0));
+  if (code == 200) {
     ringLock();
     s_len = 0;
     ringUnlock();

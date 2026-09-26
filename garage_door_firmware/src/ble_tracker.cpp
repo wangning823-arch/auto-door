@@ -469,3 +469,11 @@ String BleTracker::debugLine() const {
            (unsigned long)lastSeenMs_, (int)autoTrack_, (int)inquirySlow_);
   return String(buf);
 }
+
+bool btRadioPowerDown() {
+  SerialBT.end();  // bluedroid disable+deinit（_stop_bt）
+  delay(50);
+  bool ok = btStop();  // controller disable+deinit → IDLE
+  Serial.printf("[BT] radio power down: %s\n", ok ? "OK" : "FAIL");
+  return ok;
+}
