@@ -336,16 +336,25 @@ bool Adafruit_PN532::sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
   if (i2c_dev || spi_dev) // SPI and I2C need 1ms slow for page reads
     SLOWDOWN = 1;
 
+  dbgRdTimeout = timeout;
+  dbgWireTo = Wire.getTimeOut();
+  uint32_t t0 = millis();
   // write the command
   writecommand(cmd, cmdlen);
+  uint32_t t1 = millis();
 
   // I2C TUNING
   delay(SLOWDOWN);
 
   // Wait for chip to say its ready!
   if (!waitready(timeout)) {
+    dbgWriteMs = (uint16_t)(t1 - t0);
+    dbgAckWaitMs = (uint16_t)(millis() - t1);
+    dbgAckReadMs = 0;
+    dbgRespWaitMs = 0;
     return false;
   }
+  uint32_t t2 = millis();
 
 #ifdef PN532DEBUG
   if (spi_dev == NULL) {
@@ -355,20 +364,32 @@ bool Adafruit_PN532::sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
 
   // read acknowledgement
   if (!readack()) {
+    dbgWriteMs = (uint16_t)(t1 - t0);
+    dbgAckWaitMs = (uint16_t)(t2 - t1);
+    dbgAckReadMs = (uint16_t)(millis() - t2);
+    dbgRespWaitMs = 0;
 #ifdef PN532DEBUG
     PN532DEBUGPRINT.println(F("No ACK frame received!"));
 #endif
     return false;
   }
+  uint32_t t3 = millis();
 
   // I2C TUNING
   delay(SLOWDOWN);
 
   // Wait for chip to say its ready!
   if (!waitready(timeout)) {
+    dbgWriteMs = (uint16_t)(t1 - t0);
+    dbgAckWaitMs = (uint16_t)(t2 - t1);
+    dbgAckReadMs = (uint16_t)(t3 - t2);
+    dbgRespWaitMs = (uint16_t)(millis() - t3);
     return false;
   }
-
+  dbgWriteMs = (uint16_t)(t1 - t0);
+  dbgAckWaitMs = (uint16_t)(t2 - t1);
+  dbgAckReadMs = (uint16_t)(t3 - t2);
+  dbgRespWaitMs = (uint16_t)(millis() - t3);
   return true; // ack'd command
 }
 

@@ -340,6 +340,25 @@ static bool pn532SetRetries(uint8_t retries) {
   return pn532Xfer(cmd, 5, 200);
 }
 
+// 读回 RFConfiguration item5：MxRtyATR / MxRtyPSL / MxRtyPassiveActivation
+// 返回 true 并填 out[0..2]；失败 out 保持 0
+static bool pn532GetRetries(uint8_t out[3]) {
+  uint8_t cmd[2] = {0x32, 0x05};
+  pn532WriteCmd(cmd, 2);
+  if (!pn532ReadAck(200)) return false;
+  uint8_t resp[24] = {0};
+  int n = pn532ReadFrame(resp, 16, 300);
+  if (n < 8) return false;
+  // 00 00 FF len … D7 05 atr psl pass …
+  int p = 0;
+  if (resp[0] == 0x00 && resp[1] == 0x00 && resp[2] == 0xFF) p = 5;
+  if (p + 4 >= n || resp[p] != 0xD7 || resp[p + 1] != 0x05) return false;
+  out[0] = resp[p + 2];
+  out[1] = resp[p + 3];
+  out[2] = resp[p + 4];
+  return true;
+}
+
 // 上电/掉线后 PN532 可能睡死：先发 dummy 地址字节唤醒
 static void pn532Wakeup() {
   Wire.beginTransmission(PN532_I2C_ADDRESS);
@@ -1011,12 +1030,21 @@ bool NfcReader::poll(String& uid) {
     if (cost > 800) {
       lastSlowAckMs_ = now;
       if (slowAckStreak_ < 255) slowAckStreak_++;
-      // VPS 限流：慢/快交替时 streak 会反复到 1，不能每次上送（30s 环形缓冲会被刷爆）
+      // 诊断：每 30s 拆一次 1.2s 分段 + 读回芯片 retries（只测不改）
       static uint32_t lastSlowShipMs = 0;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC ||
           lastSlowShipMs == 0 || (now - lastSlowShipMs) > 30000UL) {
-        logShipf("[NFC] slow ACK %ums streak=%u", (unsigned)cost,
-                 (unsigned)slowAckStreak_);
+        uint8_t rt[3] = {0, 0, 0};
+        bool rtOk = pn532GetRetries(rt);
+        logShipf(
+            "[NFC] slow %ums st=%u tmo=%u wireTo=%u w=%u ackW=%u ackR=%u "
+            "respW=%u rd=%u/%u/%u%s",
+            (unsigned)cost, (unsigned)slowAckStreak_,
+            (unsigned)nfc.dbgRdTimeout, (unsigned)nfc.dbgWireTo,
+            (unsigned)nfc.dbgWriteMs, (unsigned)nfc.dbgAckWaitMs,
+            (unsigned)nfc.dbgAckReadMs, (unsigned)nfc.dbgRespWaitMs,
+            (unsigned)rt[0], (unsigned)rt[1], (unsigned)rt[2],
+            rtOk ? "" : " RETRYFAIL");
         lastSlowShipMs = now;
       }
       if (slowAckStreak_ == 1 || slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
