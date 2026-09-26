@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <atomic>
+#include <esp_task_wdt.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -207,6 +208,7 @@ bool httpPause(uint32_t waitMs) {
   while (uxQueueMessagesWaiting(s_jobs) > 0 || s_workerBusy.load()) {
     if (millis() - t0 > waitMs) return false;
     vTaskDelay(pdMS_TO_TICKS(50));
+    esp_task_wdt_reset();  // 在 loop 上下文最长等 4s，喂狗防 TWT
   }
   return true;
 }

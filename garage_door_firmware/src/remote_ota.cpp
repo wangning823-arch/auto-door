@@ -91,6 +91,7 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
     }
     if (head.indexOf("\r\n\r\n") >= 0) break;
     delay(1);
+    esp_task_wdt_reset();  // header 等待最长 8s > TWT 5s，必须喂狗
   }
   int hdrEnd = head.indexOf("\r\n\r\n");
   if (hdrEnd < 0) {
@@ -268,7 +269,9 @@ static void doOta() {
     if (millis() - start > 120000UL) break;
     int n = client.available();
     if (n <= 0) {
+      // 服务端推流慢时这里会空转 >5s → loopTask 触发 TWT abort（升级中途崩）
       delay(1);
+      esp_task_wdt_reset();
       continue;
     }
     if (n > (int)sizeof(buf)) n = sizeof(buf);
