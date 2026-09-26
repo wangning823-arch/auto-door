@@ -206,40 +206,25 @@ static void doOta() {
   s_active = true;
   // 写 flash 前停 NFC/Inquiry（busy 钩子），避免 I2C 弄脏镜像
   if (s_busyFn) s_busyFn(true);
-  // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来，
-  // 否则 Update.begin 内部 4KB malloc 在低堆下必失败
+  // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来
   bool httpIdle = httpPause(4000);
   logShipf("[OTA] http paused idle=%d heap=%u maxblk=%u", (int)httpIdle,
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
-  long fsize = -1;
-  String bpath;
-  parseHttpUrl(bpathUrl, &host, &port, &bpath, "/ota/firmware.bin");
-  bpath = withId(bpath);
-  if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize == 0) {
-    s_active = false;
-    if (s_busyFn) s_busyFn(false);
-    httpResume();
-    setMsg("bin fetch fail");
-    logShipf("[OTA] bin fetch fail id=%s", deviceId().c_str());
-    return;
-  }
-  logShipf("[OTA] bin ok size=%ld heap=%u maxblk=%u", fsize,
-           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-
-  // 清掉可能残留的 Update 状态
+  // 先 Update.begin 再开下载连接：begin 内部要 malloc(4KB)，
+  // 下载 socket 打开后服务端持续推正文，TCP 窗口 pbuf 会把最大连续块
+  // 切到 4KB 以下 → begin 必失败（err=0）。UPDATE_SIZE_UNKNOWN =
+  // 分区大小 0x1F0000，足以容纳本次 bin；partial/sha 校验仍在。
   Update.abort();
-  // 擦 2MB OTA 槽可能踩 loop WDT，先摘掉
   disableLoopWDT();
-  bool began = Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN);
+  bool began = Update.begin(UPDATE_SIZE_UNKNOWN);
   uint8_t err1 = Update.getError();  // 第一次的真实错误（abort 会覆盖）
   if (!began) {
     Update.abort();
-    began = Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN);
+    began = Update.begin(UPDATE_SIZE_UNKNOWN);
   }
   enableLoopWDT();
   if (!began) {
-    client.stop();
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     httpResume();
@@ -249,6 +234,22 @@ static void doOta() {
              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     return;
   }
+
+  long fsize = -1;
+  String bpath;
+  parseHttpUrl(bpathUrl, &host, &port, &bpath, "/ota/firmware.bin");
+  bpath = withId(bpath);
+  if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize == 0) {
+    Update.abort();
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    httpResume();
+    setMsg("bin fetch fail");
+    logShipf("[OTA] bin fetch fail id=%s", deviceId().c_str());
+    return;
+  }
+  logShipf("[OTA] bin ok size=%ld heap=%u maxblk=%u", fsize,
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   mbedtls_sha256_context sha;
   mbedtls_sha256_init(&sha);
