@@ -634,6 +634,7 @@ bool NfcReader::hwInit() {
   lastFieldMs_ = millis();
   emptyPolls_ = 0;
   slowAckStreak_ = 0;
+  lastSlowAckMs_ = 0;
   lastPollSlow_ = false;
   logShipf("[NFC] PN532 ready 0x%08X", ver);
   return true;
@@ -1008,16 +1009,23 @@ bool NfcReader::poll(String& uid) {
   if (!ret || len < 4) {
     // 慢 ACK：rewire + drain，并短间隔再试（卡可能还贴着）
     if (cost > 800) {
-      Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
-                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
-      // 只在 streak 首次/进 resync 时上送，避免刷屏
-      if (slowAckStreak_ == 0 || slowAckStreak_ + 1 >= NFC_SLOW_STREAK_RESYNC)
+      lastSlowAckMs_ = now;
+      if (slowAckStreak_ < 255) slowAckStreak_++;
+      // VPS 限流：慢/快交替时 streak 会反复到 1，不能每次上送（30s 环形缓冲会被刷爆）
+      static uint32_t lastSlowShipMs = 0;
+      if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC ||
+          lastSlowShipMs == 0 || (now - lastSlowShipMs) > 30000UL) {
         logShipf("[NFC] slow ACK %ums streak=%u", (unsigned)cost,
-                 (unsigned)(slowAckStreak_ + 1));
+                 (unsigned)slowAckStreak_);
+        lastSlowShipMs = now;
+      }
+      if (slowAckStreak_ == 1 || slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
+        Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
+                      (unsigned)cost, (unsigned)slowAckStreak_);
+      }
       nfcRewire(sda_, scl_);
       pn532Drain();
       lastPollSlow_ = true;
-      if (slowAckStreak_ < 255) slowAckStreak_++;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
         Serial.println("[NFC] 连续慢 ACK → resync");
         logShipf("[NFC] slow ACK x%u → resync", (unsigned)slowAckStreak_);
@@ -1029,7 +1037,11 @@ bool NfcReader::poll(String& uid) {
     }
     // 正常无卡：不要例行 drain（会刷 Error 263 并可能打乱总线）
     lastPollSlow_ = false;
-    slowAckStreak_ = 0;
+    // 不可在此清 slowAckStreak_：慢/快交替会每次清零 → resync 永不触发。
+    // 仅超过 15s 无慢 ACK 才视为恢复。
+    if (slowAckStreak_ && lastSlowAckMs_ && (now - lastSlowAckMs_) > 15000UL) {
+      slowAckStreak_ = 0;
+    }
     if (emptyPolls_ < 100000) emptyPolls_++;
     static uint32_t lastQuietLog = 0;
     if (listen_ && millis() - lastQuietLog > 5000) {
