@@ -1,5 +1,6 @@
 #include "web_portal.h"
 #include "config.h"
+#include "http_client.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include "ble_bond.h"
@@ -380,6 +381,7 @@ void WebPortal::setupRoutes() {
   });
 
   server.on("/rssi", HTTP_GET, []() {
+    httpSetWebBusy(true);
     String h;
     h.reserve(3200);
     h += F(
@@ -426,6 +428,7 @@ void WebPortal::setupRoutes() {
         "document.getElementById('bar').textContent='fetch error';});}"
         "tick();setInterval(tick,2000);</script></body></html>");
     server.send(200, "text/html; charset=utf-8", h);
+    httpSetWebBusy(false);
   });
 
   server.on("/", HTTP_GET, []() {
@@ -436,6 +439,8 @@ void WebPortal::setupRoutes() {
     uint32_t t0 = millis();
     Serial.printf("[WEB] GET / from %s\n",
                   server.client().remoteIP().toString().c_str());
+    // 网页优先：整个响应期间 http worker 不发 VPS（发完立即恢复）
+    httpSetWebBusy(true);
     String html = gPortal->pageHtml();
     // WebServer::send 对 8KB 页面只发出响应头、正文卡死
     // → 直接用 WiFiClient 分片写，块间 yield，避免 TCP 发送缓冲卡死
@@ -456,6 +461,7 @@ void WebPortal::setupRoutes() {
       yield();
     }
     c.stop();
+    httpSetWebBusy(false);
     Serial.printf("[WEB] GET / sent=%u/%u gen=%ums\n", (unsigned)off,
                   (unsigned)total, (unsigned)(millis() - t0));
   });

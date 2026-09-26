@@ -20,6 +20,10 @@
 #ifndef HTTP_BT_WAIT_MAX_MS
 #define HTTP_BT_WAIT_MAX_MS 4000
 #endif
+// 等本地网页发完的上限：页面最坏 ~10s，留余量；超时强制发（防 VPS 饿死）
+#ifndef HTTP_WEB_WAIT_MAX_MS
+#define HTTP_WEB_WAIT_MAX_MS 15000
+#endif
 
 struct HttpJob {
   int owner;
@@ -41,6 +45,7 @@ static QueueHandle_t s_jobs = nullptr;
 static HttpSlot s_slots[HTTP_OWNER_COUNT];
 static std::atomic<bool> s_ownerBusy[HTTP_OWNER_COUNT];
 static std::atomic<bool> s_radioBusy{false};
+static std::atomic<bool> s_webBusy{false};  // 本地网页响应中
 static HttpBtBusyFn s_btBusy = nullptr;
 
 static int httpExchange(const HttpJob& j, String* respOut) {
@@ -116,11 +121,12 @@ static void httpWorker(void*) {
       continue;
     }
 
-    // 先占射频标志（BleTracker 见状推迟新 inquiry），再等正在跑的让路
+    // 先占射频标志（BleTracker 见状推迟新 inquiry），再等空隙：
+    //  本地网页响应优先（最长 15s，覆盖整页发送），其次等蓝牙 inquiry 让路
     s_radioBusy.store(true);
     uint32_t t0 = millis();
-    while (s_btBusy && s_btBusy()) {
-      if (millis() - t0 > HTTP_BT_WAIT_MAX_MS) break;
+    while (s_webBusy.load() || (s_btBusy && s_btBusy())) {
+      if (millis() - t0 > HTTP_WEB_WAIT_MAX_MS) break;
       vTaskDelay(pdMS_TO_TICKS(50));
     }
 
@@ -186,3 +192,5 @@ bool httpTryResult(int owner, int* code, String* body) {
 }
 
 bool httpClientBusy() { return s_radioBusy.load(); }
+
+void httpSetWebBusy(bool busy) { s_webBusy.store(busy); }

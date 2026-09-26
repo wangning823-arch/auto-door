@@ -28,3 +28,5 @@ bool httpSubmitPost(int owner, const String& host, uint16_t port,
 bool httpTryResult(int owner, int* code, String* body);
 // HTTP 占用射频中（发送/等蓝牙）→ 新一轮 inquiry 让路
 bool httpClientBusy();
+// 本地网页正在响应（loop 在发页面）→ worker 让路，等页面发完再发 VPS
+void httpSetWebBusy(bool busy);
