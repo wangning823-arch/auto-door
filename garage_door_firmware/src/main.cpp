@@ -393,13 +393,14 @@ static void observeSignal(bool hasSignal, int rssi) {
   }
 }
 
-// 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 信号消失/变很远
+// 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 已偏远（isFar）
+// 不看「信号消失」：进库熄火后蓝牙也会消失，那时人还在车库，关门会把人关在里面
 static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
   // 真无后重新出现应走开门，绝不关
   if (gTrueNo) return false;
   if (!gLeaveQual || !gStrongAfterOpen) return false;
-  if (!hasSignal || isFar) return true;
-  return false;
+  // 只凭连续偏远关；单纯消失（熄火/闪断）不关，人出车库后手动/远程关
+  return isFar;
 }
 
 // isFar 防抖：-90 凹点/跳动一次不算离场，须连续 RSSI_FAR_MIN_STREAK 次
