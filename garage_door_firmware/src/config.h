@@ -196,6 +196,10 @@
 // 首见就 ≥ 此值：视为库内突变（开关蓝牙），不自动开；与 RSSI_STRONG 同为 -80
 #define RSSI_SUDDEN_STRONG    -80
 #define RSSI_FAR_CLOSE        -90     // 离场关门：≤此约走出 10m（开门时可略调 -88~-92）
+// 单次 ≤-90 只是多径凹点，须连续 N 次 far 才算离场（锯齿 -75/-90 不会触发）
+#ifndef RSSI_FAR_MIN_STREAK
+#define RSSI_FAR_MIN_STREAK 2
+#endif
 #define BLE_CLOSE_FAR_SCANS   2       // 连续 N 次 ≤ FAR 才关（防抖）
 #define BLE_SILENT_GAP_MS     8000    // 多久没匹配算「无」（原 15s，偏晚）
 #define BLE_MISS_FOR_LOST     2       // 连续 N 次未匹配算「丢」（原 3）
@@ -206,7 +210,7 @@
 #define LEAVING_CLOSE_MS      10000
 // ===== 关门：至少 3 个有效 RSSI 且单调变弱才「离开合格」=====
 // 例：-60,-70,-80 可关；-60,-80,-60 视为跳动，否决关门
-#define RSSI_TREND_MIN_N      3     // 最少样本
+#define RSSI_TREND_MIN_N      4     // 最少样本（3 点锯齿易误判，日志回放 4 点挡掉 ~97%）
 #define RSSI_TREND_DROP_DB    15    // 首末至少弱这么多 dB
 #define RSSI_TREND_TOL_DB     3     // 相邻允许的小反弹（多径）
 // 连续无信号这么久才算「真无」，之后再出现才允许无→有开（抖动 miss 不算无）

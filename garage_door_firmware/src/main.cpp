@@ -380,6 +380,9 @@ static void observeSignal(bool hasSignal, int rssi) {
     if (gNoSigSince == 0) gNoSigSince = now;
     if (millisReached(now, gNoSigSince + RSSI_TRUE_SILENT_MS) && !gTrueNo) {
       gTrueNo = true;
+      // 长静默=新的一次出现，旧离场资格/旧趋势作废；否则 -127→弱信号会误关
+      clearLeaveQual("真无确认");
+      gRssiTrend.clear();
       Serial.println("[FSM] 真无确认（连续无信号满，之后有信号才再开）");
     }
     if (!gStrongAfterOpen && gLeaveQual) {
@@ -390,9 +393,26 @@ static void observeSignal(bool hasSignal, int rssi) {
 
 // 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 信号消失/变很远
 static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
+  // 真无后重新出现应走开门，绝不关
+  if (gTrueNo) return false;
   if (!gLeaveQual || !gStrongAfterOpen) return false;
   if (!hasSignal || isFar) return true;
   return false;
+}
+
+// isFar 防抖：-90 凹点/跳动一次不算离场，须连续 RSSI_FAR_MIN_STREAK 次
+static uint8_t gFarStreak = 0;
+static bool debounceFar(bool hasSignal, int rssi) {
+  if (!hasSignal) {
+    gFarStreak = 0;
+    return false;
+  }
+  if (rssi <= RSSI_FAR_CLOSE) {
+    if (gFarStreak < 255) gFarStreak++;
+  } else {
+    gFarStreak = 0;
+  }
+  return gFarStreak >= RSSI_FAR_MIN_STREAK;
 }
 
 static int rfKeyIndexFromArg(const String& s) {
@@ -1405,9 +1425,12 @@ void loop() {
                   (millis() - gBleScan.lastMatchMs()) < BLE_SILENT_GAP_MS;
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
       bool isStrong = hasSignal && r >= RSSI_STRONG;
-      bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
+      bool isFar = false;
 
-      if (scanJustFinished) observeSignal(hasSignal, hasSignal ? r : 0);
+      if (scanJustFinished) {
+        isFar = debounceFar(hasSignal, hasSignal ? r : 0);
+        observeSignal(hasSignal, hasSignal ? r : 0);
+      }
 
       if (scanJustFinished) {
         Serial.printf(
@@ -1474,7 +1497,12 @@ void loop() {
               phase = BlePhase::WAIT_SIGNAL;
               break;
             }
-            if (hasSignal) phase = BlePhase::STRONG;
+            // 丢信号=离开中断/新的一次出现，回 WAIT 以便真无→有开门
+            if (!hasSignal) {
+              phase = BlePhase::WAIT_SIGNAL;
+              break;
+            }
+            // 弱信号保持 LEAVING，不再跳回 STRONG（否则 STRONG↔LEAVING 来回）
             break;
         }
       }
@@ -1504,14 +1532,18 @@ void loop() {
       bool seen = gBt.seenRecently(BLE_SILENT_GAP_MS);
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
       bool isStrong = hasSignal && r >= RSSI_STRONG;
-      bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
+      bool isFar = false;
       bool lost = !seen;
 
       if (!clInited || seen != clPrevSeen || (seen && abs(r - clPrevRssi) >= 3) ||
           (!seen && clPrevSeen)) {
         observeSignal(hasSignal, hasSignal ? r : 0);
+        isFar = debounceFar(hasSignal, hasSignal ? r : 0);
       }
-      if (!seen) observeSignal(false, 0);
+      if (!seen) {
+        observeSignal(false, 0);
+        isFar = debounceFar(false, 0);
+      }
 
       const bool closeDue = shouldCloseBySignal(hasSignal, isFar);
 
@@ -1585,7 +1617,10 @@ void loop() {
             clPhase = ClPhase::WAIT_SIGNAL;
             break;
           }
-          if (hasSignal) clPhase = ClPhase::STRONG;
+          if (!hasSignal) {
+            clPhase = ClPhase::WAIT_SIGNAL;
+            break;
+          }
           break;
       }
     }
