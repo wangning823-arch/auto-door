@@ -436,7 +436,8 @@ static void nfcRewire(int sda, int scl) {
   delay(15);
 }
 
-// 持续开 RF 场：必须走裸命令；库 sendCommandCheckAck 的 waitready 会把总线弄脏
+// RF 场开/关：必须走裸命令；场开着时主机 I2C 写会 endTransmission≈1s 超时
+// （werr=5），因此主机写总线前场必须是 OFF，InList 自己会在寻卡时开场
 static bool pn532RfFieldOn(int sda, int scl) {
   (void)sda;
   (void)scl;
@@ -446,6 +447,19 @@ static bool pn532RfFieldOn(int sda, int scl) {
   bool ok = pn532Xfer(rfOn, 3, 200);
   Serial.printf("[NFC] RF field raw ack=%d\n", (int)ok);
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
+  return ok;
+}
+
+// 关场：InList 返回后 / 主机下一条写之前调用。失败只记日志（可能已超时）
+static bool pn532RfFieldOff() {
+  pn532Drain();
+  delay(5);
+  uint8_t rfOff[3] = {0x32, 0x01, 0x00};
+  bool ok = pn532Xfer(rfOff, 3, 200);
+  Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
+  if (!ok) {
+    Serial.println("[NFC] RF field OFF fail");
+  }
   return ok;
 }
 
@@ -495,10 +509,7 @@ bool NfcReader::recoverBusAndResync() {
     }
   }
   delay(30);
-  bool rfOk = pn532RfFieldOn(sda_, scl_);
-  if (!rfOk) {
-    Serial.println("[NFC] resync RF field 仍失败，继续（靠 InList 开场）");
-  }
+  // 不开 RF 场、也不再发 FIELDOFF（实测 RFConfiguration 本身会把总线拖死）
   if (!busIdle(sda_, scl_)) {
     failRelease("resync after RF", sda_, scl_, &failStreak_);
     ok_ = false;
@@ -511,8 +522,8 @@ bool NfcReader::recoverBusAndResync() {
   s_inlistOpen = false;
   lastFieldMs_ = millis();
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
-  Serial.printf("[NFC] resync OK rf=%d\n", (int)rfOk);
-  logShipf("[NFC] resync OK rf=%d", (int)rfOk);
+  Serial.println("[NFC] resync OK (no field cmds)");
+  logShipf("[NFC] resync OK (no field cmds)");
   return true;
 }
 
@@ -617,22 +628,8 @@ bool NfcReader::hwInit() {
   }
   delay(50);
 
-  // 持续 RF 场：手机贴卡靠场常开；失败非致命但必须 rewire，否则 poll 卡 1.3s
-  {
-    bool rf = pn532RfFieldOn(sda_, scl_);
-    Serial.printf("[NFC] RF field on ack=%d SCL=%d\n", (int)rf,
-                  digitalRead(scl_));
-    if (!busIdle(sda_, scl_)) {
-      failRelease("RF field bus", sda_, scl_, &failStreak_);
-      ok_ = false;
-      deferred_ = true;
-      return false;
-    }
-    if (!rf) {
-      Serial.println("[NFC] RF field 单独失败，继续 ready（poll 会开）");
-    }
-  }
-
+  // 不做 RFConfiguration 开/关场：实测场 ON 后主机写 1s 超时；
+  // 关场命令本身也会把总线弄到 SCL=0。交给 InListPassiveTarget 自己管场。
   if (!busIdle(sda_, scl_)) {
     failRelease("post-init", sda_, scl_, &failStreak_);
     ok_ = false;
@@ -640,16 +637,14 @@ bool NfcReader::hwInit() {
     return false;
   }
 
-  // 100ms 太短：readPassiveTargetID 等待时会先撞 I2C 超时（Error263）
-  // 500ms 会把 poll 拖到 1.3s；RF 常开后 InList 应很快返回
   Wire.setTimeOut(200);
-  // 关键对照：RF 场已开、刚 ready 后立刻读 ver——若这里就 1s，说明场开后写总线即坏
+  // 对照：init 后立刻再读一次 ver（走与 getFirmwareVersion 相同的库路径）
   {
     uint32_t t0 = millis();
-    uint32_t v2 = pn532GetFwVer();
+    uint32_t v2 = nfc.getFirmwareVersion();
     uint32_t dt = millis() - t0;
-    logShipf("[NFC] post-RF ver=%08lx %ums wrErr=%u", (unsigned long)v2,
-             (unsigned)dt, (unsigned)nfc.dbgWrErr);
+    logShipf("[NFC] post-init ver=%08lx %ums", (unsigned long)v2,
+             (unsigned)dt);
   }
   ok_ = true;
   deferred_ = false;
@@ -742,25 +737,12 @@ void NfcReader::unlockBus() {
 }
 
 void NfcReader::stopForOta() {
+  // 只挂起，绝不做 I2C：总线异常/场状态怪异时，这里写命令会 1s 超时，
+  // 与 NFC 任务抢 Wire 锁还可能把 loop 卡死在 OTA 下载之前。
   suspended_ = true;
   listen_ = false;
-  if (lockBus(300)) {
-    // 1) 把片上寻卡收到短重试，让进行中的 InList 尽快自己结束
-    pn532SetRetries(0x01);
-    // 2) 等一条 InList 窗口走完（有限 retries 会在数百 ms 内回 0 tags/出卡）
-    uint32_t t0 = millis();
-    while (s_inlistOpen && millis() - t0 < 800) {
-      uint8_t tmp[32] = {0};
-      int n = pn532ReadFrame(tmp, 28, 100);
-      if (n >= 8) break;
-      if (!digitalRead(PIN_NFC_SCL) || !digitalRead(PIN_NFC_SDA)) break;
-    }
-    pn532Drain();
-    s_inlistOpen = false;
-    releaseBus(sda_, scl_);
-    unlockBus();
-  }
-  Serial.println("[NFC] stopForOta: InList aborted, bus released");
+  s_inlistOpen = false;
+  Serial.println("[NFC] stopForOta: suspend only (no I2C)");
 }
 
 void NfcReader::pushCard(const String& uid) {
@@ -994,22 +976,6 @@ bool NfcReader::poll(String& uid) {
   if (lastPollSlow_) {
     pn532Drain();
     lastPollSlow_ = false;
-  }
-
-  // 空闲刷 RF：绝不能 empty 到 N 就刷（约 16s 一次）。
-  // 场 on 后立刻 InList 会打出慢 ACK → 连续 3 次 resync → 失败进 deferred，
-  // 空闲 20～60 分钟后 NFC 永久假死（远程只能看到 auto-retry）。
-  // 改为「空闲且距上次开 场 ≥5 分钟」才补场；InList 本身会开场，实体卡不依赖常开场。
-  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS &&
-      (now - lastFieldMs_) >= NFC_FIELD_REFRESH_MS) {
-    Serial.printf("[NFC] 空闲 %u 拍且 %ums → 刷 RF field\n",
-                  (unsigned)emptyPolls_, (unsigned)(now - lastFieldMs_));
-    logShipf("[NFC] idle %u → RF refresh", (unsigned)emptyPolls_);
-    pn532RfFieldOn(sda_, scl_);
-    emptyPolls_ = 0;
-    lastFieldMs_ = now;
-    nextPollMs_ = millis() + 200;
-    return false;
   }
 
   uint8_t buf[16];

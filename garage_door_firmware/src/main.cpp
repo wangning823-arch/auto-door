@@ -1128,12 +1128,12 @@ void setup() {
     gOtaActive = on;
     if (on) {
       gOtaActiveAtMs = millis();
-      gNfc.stopForOta();
+      gNfc.setSuspended(true);  // 不碰 I2C，避免 OTA 启动时卡死
       if (gBtStackInited) {
-        gBt.setInquiryPaused(true);
-        gBt.cancelActiveInquiry();
+        gBt.setInquiryPaused(true);  // 内部会 cancel discovery，非阻塞
       }
     } else {
+      gNfc.setSuspended(false);
       if (gBtStackInited) gBt.setInquiryPaused(false);
       if (gNfc.ok()) gNfc.setListen(true);
       else gNfc.kickRecover();
