@@ -11,7 +11,7 @@
 // 射频仲裁：发送前等蓝牙空隙（有上限），发送中置 radioBusy 给 inquiry 让路。
 
 #ifndef HTTP_TASK_STACK
-#define HTTP_TASK_STACK 8192
+#define HTTP_TASK_STACK 6144
 #endif
 #ifndef HTTP_TASK_PRIO
 #define HTTP_TASK_PRIO 1
@@ -45,7 +45,9 @@ static QueueHandle_t s_jobs = nullptr;
 static HttpSlot s_slots[HTTP_OWNER_COUNT];
 static std::atomic<bool> s_ownerBusy[HTTP_OWNER_COUNT];
 static std::atomic<bool> s_radioBusy{false};
-static std::atomic<bool> s_webBusy{false};  // 本地网页响应中
+static std::atomic<bool> s_webBusy{false};   // 本地网页响应中
+static std::atomic<bool> s_paused{false};    // OTA 排空期：拒新提交
+static std::atomic<bool> s_workerBusy{false};  // worker 正在处理一个 job
 static HttpBtBusyFn s_btBusy = nullptr;
 
 static int httpExchange(const HttpJob& j, String* respOut) {
@@ -112,12 +114,14 @@ static void httpWorker(void*) {
   HttpJob* j = nullptr;
   for (;;) {
     if (xQueueReceive(s_jobs, &j, portMAX_DELAY) != pdTRUE || !j) continue;
+    s_workerBusy.store(true);
 
     if (WiFi.status() != WL_CONNECTED) {
       s_slots[j->owner].code = -10;
       s_slots[j->owner].body = "";
       s_slots[j->owner].ready.store(true);  // ownerBusy 由消费方收结果时清
       delete j;
+      s_workerBusy.store(false);
       continue;
     }
 
@@ -139,6 +143,7 @@ static void httpWorker(void*) {
     s_slots[j->owner].ready.store(true);  // 数据先写，ready 后置
     delete j;
     j = nullptr;
+    s_workerBusy.store(false);
   }
 }
 
@@ -157,6 +162,7 @@ static bool submit(int owner, bool isPost, const String& host, uint16_t port,
                    const String& path, const String& body,
                    uint32_t timeoutMs) {
   if (!s_jobs || owner < 0 || owner >= HTTP_OWNER_COUNT) return false;
+  if (s_paused.load()) return false;  // OTA 排空期拒新单
   if (s_ownerBusy[owner].load()) return false;  // 该 owner 已有在飞请求
   s_ownerBusy[owner].store(true);
   HttpJob* j = new HttpJob{owner, isPost, host, port, path, body, timeoutMs};
@@ -194,3 +200,15 @@ bool httpTryResult(int owner, int* code, String* body) {
 bool httpClientBusy() { return s_radioBusy.load(); }
 
 void httpSetWebBusy(bool busy) { s_webBusy.store(busy); }
+
+bool httpPause(uint32_t waitMs) {
+  s_paused.store(true);
+  uint32_t t0 = millis();
+  while (uxQueueMessagesWaiting(s_jobs) > 0 || s_workerBusy.load()) {
+    if (millis() - t0 > waitMs) return false;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  return true;
+}
+
+void httpResume() { s_paused.store(false); }

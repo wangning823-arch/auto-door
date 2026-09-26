@@ -1,6 +1,7 @@
 #include "remote_ota.h"
 #include "config.h"
 #include "device_id.h"
+#include "http_client.h"
 #include "log_ship.h"
 #include <Update.h>
 #include <WiFi.h>
@@ -205,6 +206,11 @@ static void doOta() {
   s_active = true;
   // 写 flash 前停 NFC/Inquiry（busy 钩子），避免 I2C 弄脏镜像
   if (s_busyFn) s_busyFn(true);
+  // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来，
+  // 否则 Update.begin 内部 4KB malloc 在低堆下必失败
+  bool httpIdle = httpPause(4000);
+  logShipf("[OTA] http paused idle=%d heap=%u maxblk=%u", (int)httpIdle,
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   long fsize = -1;
   String bpath;
@@ -213,6 +219,7 @@ static void doOta() {
   if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize == 0) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
+    httpResume();
     setMsg("bin fetch fail");
     logShipf("[OTA] bin fetch fail id=%s", deviceId().c_str());
     return;
@@ -225,6 +232,7 @@ static void doOta() {
   // 擦 2MB OTA 槽可能踩 loop WDT，先摘掉
   disableLoopWDT();
   bool began = Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN);
+  uint8_t err1 = Update.getError();  // 第一次的真实错误（abort 会覆盖）
   if (!began) {
     Update.abort();
     began = Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN);
@@ -234,10 +242,11 @@ static void doOta() {
     client.stop();
     s_active = false;
     if (s_busyFn) s_busyFn(false);
+    httpResume();
     setMsg("update begin fail");
-    logShipf("[OTA] Update.begin fail err=%s heap=%u maxblk=%u",
-             Update.errorString(), (unsigned)ESP.getFreeHeap(),
-             (unsigned)ESP.getMaxAllocHeap());
+    logShipf("[OTA] Update.begin fail err1=%u err2=%u heap=%u maxblk=%u",
+             (unsigned)err1, (unsigned)Update.getError(),
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     return;
   }
 
@@ -270,6 +279,7 @@ static void doOta() {
       client.stop();
       s_active = false;
       if (s_busyFn) s_busyFn(false);
+      httpResume();
       setMsg("write fail");
       logShipf("[OTA] write fail at %u err=%s", (unsigned)written,
                Update.errorString());
@@ -299,6 +309,7 @@ static void doOta() {
     mbedtls_sha256_free(&sha);
     s_active = false;
     if (s_busyFn) s_busyFn(false);
+    httpResume();
     setMsg("partial write");
     logShipf("[OTA] partial %u/%ld → abort", (unsigned)written, fsize);
     return;
@@ -318,6 +329,7 @@ static void doOta() {
     Update.abort();
     s_active = false;
     if (s_busyFn) s_busyFn(false);
+    httpResume();
     setMsg("sha mismatch");
     logShipf("[OTA] sha mismatch got=%s want=%s wrote=%u", hex,
              remoteSha.c_str(), (unsigned)written);
@@ -330,6 +342,7 @@ static void doOta() {
   if (!ended) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
+    httpResume();
     setMsg("end fail");
     logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld sha=%s",
              Update.errorString(), (unsigned)written, fsize, hex);

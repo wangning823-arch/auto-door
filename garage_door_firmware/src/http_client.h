@@ -30,3 +30,8 @@ bool httpTryResult(int owner, int* code, String* body);
 bool httpClientBusy();
 // 本地网页正在响应（loop 在发页面）→ worker 让路，等页面发完再发 VPS
 void httpSetWebBusy(bool busy);
+// OTA 前调用：暂停新提交并排空在飞请求（等 worker 空闲，最多 waitMs）
+// 返回 true=已空闲；失败也会保持暂停，调用方无需重试
+bool httpPause(uint32_t waitMs);
+// 恢复接受提交
+void httpResume();
