@@ -1561,12 +1561,13 @@ bool Adafruit_PN532::isready() {
     spi_dev->write_then_read(&cmd, 1, &reply, 1);
     return reply == PN532_SPI_READY;
   } else if (i2c_dev) {
-    // 本板空读会 NACK：一次 isready 可能卡满 Wire 超时，必须 15ms 快失败
+    // 15ms 会在 InList 时钟拉伸时掐断事务，跑几小时把 PN532 锁死 SCL。
+    // 60ms：NACK 空读仍很快失败，但允许芯片正常 stretch。
     uint8_t rdy[1] = {0};
     bool ok = false;
 #if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
     uint16_t oldTo = (uint16_t)Wire.getTimeOut();
-    Wire.setTimeOut(15);
+    Wire.setTimeOut(60);
     ok = i2c_dev->read(rdy, 1);
     Wire.setTimeOut(oldTo ? oldTo : 50);
 #else

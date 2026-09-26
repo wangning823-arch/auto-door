@@ -187,7 +187,7 @@ static void i2cBusRecover(int sda, int scl);
 
 static bool pn532WaitRdy(uint32_t budgetMs) {
   uint32_t start = millis();
-  Wire.setTimeOut(15);  // 仅状态轮询要快失败
+  Wire.setTimeOut(60);  // 与 isready 同：15ms 会掐断 InList 时钟拉伸
   bool ready = false;
   while ((millis() - start) < budgetMs) {
     uint8_t rdy = 0;
@@ -929,6 +929,26 @@ bool NfcReader::poll(String& uid) {
   }
   if (!millisReached(now, nextPollMs_)) return false;
 
+  // 总线被按住就先复活：ok_ 为真时若不处理，会反复 InList 把芯片锁死到只能断电
+  if (!digitalRead(sda_) || !digitalRead(scl_)) {
+    Serial.printf("[NFC] poll bus stuck SDA=%d SCL=%d → recover\n",
+                  digitalRead(sda_), digitalRead(scl_));
+    nfcRewire(sda_, scl_);
+    if (!busIdle(sda_, scl_)) {
+      i2cBusRecover(sda_, scl_);
+      if (!busIdle(sda_, scl_)) {
+        ok_ = false;
+        deferred_ = true;
+        lastAutoRetryMs_ = now;
+        logShipf("[NFC] poll bus hard-stuck → deferred");
+        return false;
+      }
+    }
+    s_inlistOpen = false;
+    nextPollMs_ = now + 200;
+    return false;
+  }
+
   // 上一次慢 ACK：先丢残留 RDY，再发 InList（避免交替 1.3s 脏 ACK）
   if (lastPollSlow_) {
     pn532Drain();
@@ -949,9 +969,8 @@ bool NfcReader::poll(String& uid) {
   uint8_t buf[16];
   uint8_t len = 0;
   uint32_t tPoll = millis();
-  // 固定足够贴卡窗口：不再随 pollGap 缩到 80ms（跟踪期曾导致漏刷）
-  uint16_t to = NFC_READ_TIMEOUT_MS;
-  uint8_t ret = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, buf, &len, to);
+  // 用 raw InList：片上搜卡未结束时不叠发新命令（Adafruit 路径 200ms 超时后会连撞）
+  int got = pn532InListRaw(buf, &len);
   uint32_t gap = pollGapMs_ ? pollGapMs_ : NFC_POLL_GAP_BT_TRACK_MS;
   nextPollMs_ = millis() + gap;
   uint32_t cost = millis() - tPoll;
@@ -966,17 +985,13 @@ bool NfcReader::poll(String& uid) {
     return false;
   }
 
-  if (!ret || len < 4) {
-    // 慢 ACK：rewire + drain，并 80ms 内立刻再试一次（卡可能还贴着）
-    if (cost > 800) {
-      Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
-                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
-      nfcRewire(sda_, scl_);
-      pn532Drain();
+  if (got <= 0) {
+    // got=-1：总线/帧错（raw 路径已尝试 9-clock）；got=0：本轮未出卡（芯片可能仍在搜）
+    if (got < 0) {
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
-        Serial.println("[NFC] 连续慢 ACK → resync");
+        Serial.println("[NFC] 连续 InList 错 → resync");
         recoverBusAndResync();
         slowAckStreak_ = 0;
       }
@@ -990,9 +1005,8 @@ bool NfcReader::poll(String& uid) {
     static uint32_t lastQuietLog = 0;
     if (listen_ && millis() - lastQuietLog > 5000) {
       lastQuietLog = millis();
-      Serial.printf("[NFC] poll 无卡 ret=%d len=%u cost=%ums SCL=%d empty=%u\n",
-                    (int)ret, (unsigned)len, (unsigned)cost,
-                    digitalRead(scl_), (unsigned)emptyPolls_);
+      Serial.printf("[NFC] poll 无卡 cost=%ums SCL=%d empty=%u\n",
+                    (unsigned)cost, digitalRead(scl_), (unsigned)emptyPolls_);
     }
     return false;
   }
