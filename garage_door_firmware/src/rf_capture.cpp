@@ -697,18 +697,22 @@ bool RfCapture::playFrameSoftware(const uint16_t* p, uint16_t n, uint8_t repeats
 bool RfCapture::playFrame(const uint16_t* p, uint16_t n, uint8_t repeats) {
   if (txPin_ < 0 || !p || n < 5) return false;
   if (repeats == 0) repeats = 1;
+  // 连刷：上一帧异步还在发 → 禁止重入，更禁止退回软件 bit-bang（会堵死 loop）
+  if (txBusy_) return true;
   if (!ensureRmt()) return playFrameSoftware(p, n, repeats);
 
   size_t items = 0;
   uint32_t totalUs = 0;
   if (!rmtPack(p, n, repeats, s_rmtBuf,
                sizeof(s_rmtBuf) / sizeof(s_rmtBuf[0]), &items, &totalUs)) {
-    // 超长：退回软件路径（阻塞，但功能不丢）
+    // 超长：软件路径会关中断很久，busy 时宁可放弃本次
+    if (txBusy_) return true;
     return playFrameSoftware(p, n, repeats);
   }
 
   // rmtWrite 非阻塞：波形由 RMT 硬件发出，loop 立刻继续
   if (!rmtWrite(s_rmtTx, s_rmtBuf, items)) {
+    if (txBusy_) return true;
     return playFrameSoftware(p, n, repeats);
   }
   txBusy_ = true;

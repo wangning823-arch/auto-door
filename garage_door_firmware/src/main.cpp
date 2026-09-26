@@ -1307,7 +1307,8 @@ void setup() {
 }
 
 void loop() {
-  // SCL 掉压监视：边沿必打；热点调试期降低稳态心跳频率，少占串口/loop
+  // SCL/SDA 心跳：边沿必须限流。NFC 任务在 I2C 时脚位高速翻转，
+  // loop 每轮 digitalRead 都会当成「边沿」打串口 → Serial 堵死 → poll/状态 45s 离线。
   {
     static int lastSda = -1, lastScl = -1;
     static uint32_t lastBusLog = 0;
@@ -1315,12 +1316,17 @@ void loop() {
     int scl = digitalRead(PIN_NFC_SCL);
     uint32_t now = millis();
     uint32_t busPeriod = gWeb.apActive() ? 5000 : 2000;
-    if (sda != lastSda || scl != lastScl) {
-      Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d%s\n", (unsigned)now, sda,
-                    scl, (scl ? " (idle high)" : " (SCL LOW)"));
+    bool edge = (sda != lastSda || scl != lastScl);
+    if (edge) {
       lastSda = sda;
       lastScl = scl;
-      lastBusLog = now;
+      // 异常（脚被拉低）稍密；正常跳变最多 1s 一条
+      uint32_t edgeGap = (sda == 0 || scl == 0) ? 300UL : 1000UL;
+      if (now - lastBusLog >= edgeGap) {
+        Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d%s\n", (unsigned)now, sda,
+                      scl, (scl ? " (idle high)" : " (SCL LOW)"));
+        lastBusLog = now;
+      }
     } else if (now - lastBusLog >= busPeriod) {
       Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d\n", (unsigned)now, sda,
                     scl);
