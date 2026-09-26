@@ -247,7 +247,8 @@ static int pn532InListRaw(uint8_t* uid, uint8_t* uidLen) {
     s_inlistOpen = true;
     s_inlistOpenAt = millis();
     if (!pn532ReadAck(NFC_INLIST_ACK_MS)) {
-      nfcPulse9Clk();
+      // 只有总线被按住才补时钟；空闲总线 9-clock 会把 PN532 弄乱
+      if (!digitalRead(PIN_NFC_SCL) || !digitalRead(PIN_NFC_SDA)) nfcPulse9Clk();
       return -1;
     }
   } else if (millis() - s_inlistOpenAt > NFC_INLIST_STUCK_MS) {
@@ -969,8 +970,10 @@ bool NfcReader::poll(String& uid) {
   uint8_t buf[16];
   uint8_t len = 0;
   uint32_t tPoll = millis();
-  // 用 raw InList：片上搜卡未结束时不叠发新命令（Adafruit 路径 200ms 超时后会连撞）
-  int got = pn532InListRaw(buf, &len);
+  // 实体卡走 Adafruit 同步路径（09:33 已验证可出 UID）。
+  // raw InList 在出卡时 ACK/解析易误判并触发 resync，把卡会话打断 → 表现为「刷卡变 NFC 重启」
+  uint8_t ret = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, buf, &len,
+                                        NFC_READ_TIMEOUT_MS);
   uint32_t gap = pollGapMs_ ? pollGapMs_ : NFC_POLL_GAP_BT_TRACK_MS;
   nextPollMs_ = millis() + gap;
   uint32_t cost = millis() - tPoll;
@@ -985,13 +988,17 @@ bool NfcReader::poll(String& uid) {
     return false;
   }
 
-  if (got <= 0) {
-    // got=-1：总线/帧错（raw 路径已尝试 9-clock）；got=0：本轮未出卡（芯片可能仍在搜）
-    if (got < 0) {
+  if (!ret || len < 4) {
+    // 慢 ACK：rewire + drain，并短间隔再试（卡可能还贴着）
+    if (cost > 800) {
+      Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
+                    (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
+      nfcRewire(sda_, scl_);
+      pn532Drain();
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
-        Serial.println("[NFC] 连续 InList 错 → resync");
+        Serial.println("[NFC] 连续慢 ACK → resync");
         recoverBusAndResync();
         slowAckStreak_ = 0;
       }
@@ -1005,8 +1012,9 @@ bool NfcReader::poll(String& uid) {
     static uint32_t lastQuietLog = 0;
     if (listen_ && millis() - lastQuietLog > 5000) {
       lastQuietLog = millis();
-      Serial.printf("[NFC] poll 无卡 cost=%ums SCL=%d empty=%u\n",
-                    (unsigned)cost, digitalRead(scl_), (unsigned)emptyPolls_);
+      Serial.printf("[NFC] poll 无卡 ret=%d len=%u cost=%ums SCL=%d empty=%u\n",
+                    (int)ret, (unsigned)len, (unsigned)cost,
+                    digitalRead(scl_), (unsigned)emptyPolls_);
     }
     return false;
   }
