@@ -165,6 +165,9 @@ public:
   // 诊断：上一次 sendCommandCheckAck 分段耗时（ms），给 poll 拆 1.2s 用
   uint16_t dbgWriteMs = 0, dbgAckWaitMs = 0, dbgAckReadMs = 0,
            dbgRespWaitMs = 0, dbgRdTimeout = 0, dbgWireTo = 0;
+  // writecommand 内部拆分：begin 锁等待 vs I2C 事务；err=Wire.endTransmission 返回码
+  uint16_t dbgWrBeginMs = 0, dbgWrEndMs = 0;
+  uint8_t dbgWrErr = 0xFF, dbgWrOk = 0;
 
   // ISO14443A functions
   bool readPassiveTargetID(

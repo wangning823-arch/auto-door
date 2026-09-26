@@ -643,6 +643,14 @@ bool NfcReader::hwInit() {
   // 100ms 太短：readPassiveTargetID 等待时会先撞 I2C 超时（Error263）
   // 500ms 会把 poll 拖到 1.3s；RF 常开后 InList 应很快返回
   Wire.setTimeOut(200);
+  // 关键对照：RF 场已开、刚 ready 后立刻读 ver——若这里就 1s，说明场开后写总线即坏
+  {
+    uint32_t t0 = millis();
+    uint32_t v2 = pn532GetFwVer();
+    uint32_t dt = millis() - t0;
+    logShipf("[NFC] post-RF ver=%08lx %ums wrErr=%u", (unsigned long)v2,
+             (unsigned)dt, (unsigned)nfc.dbgWrErr);
+  }
   ok_ = true;
   deferred_ = false;
   listen_ = true;
@@ -1034,15 +1042,20 @@ bool NfcReader::poll(String& uid) {
       static uint32_t lastSlowShipMs = 0;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC ||
           lastSlowShipMs == 0 || (now - lastSlowShipMs) > 30000UL) {
+        int sclPre = digitalRead(sda_ >= 0 ? sda_ : PIN_NFC_SDA);  // SDA
+        int sclLvl = digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL);
+        // 写失败后再试一条极短命令（GetFirmwareVersion）：区分「仅 InList 卡」还是「总线全死」
+        uint32_t tf0 = millis();
+        uint32_t ver = pn532GetFwVer();
+        uint32_t tfMs = millis() - tf0;
         uint8_t rt[3] = {0, 0, 0};
         bool rtOk = pn532GetRetries(rt);
         logShipf(
-            "[NFC] slow %ums st=%u tmo=%u wireTo=%u w=%u ackW=%u ackR=%u "
-            "respW=%u rd=%u/%u/%u%s",
+            "[NFC] slow %ums st=%u e=%u werr=%u scl=%d/%d ver=%08lx/%ums "
+            "ackW=%u rd=%u/%u/%u%s",
             (unsigned)cost, (unsigned)slowAckStreak_,
-            (unsigned)nfc.dbgRdTimeout, (unsigned)nfc.dbgWireTo,
-            (unsigned)nfc.dbgWriteMs, (unsigned)nfc.dbgAckWaitMs,
-            (unsigned)nfc.dbgAckReadMs, (unsigned)nfc.dbgRespWaitMs,
+            (unsigned)nfc.dbgWrEndMs, (unsigned)nfc.dbgWrErr, sclPre, sclLvl,
+            (unsigned long)ver, (unsigned)tfMs, (unsigned)nfc.dbgAckWaitMs,
             (unsigned)rt[0], (unsigned)rt[1], (unsigned)rt[2],
             rtOk ? "" : " RETRYFAIL");
         lastSlowShipMs = now;

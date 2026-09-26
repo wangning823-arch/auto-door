@@ -1852,7 +1852,16 @@ void Adafruit_PN532::writecommand(uint8_t *cmd, uint8_t cmdlen) {
 #endif
 
     if (i2c_dev) {
-      i2c_dev->write(packet, 8 + cmdlen);
+      // 与 Adafruit_I2CDevice::write 等价，但拆出 begin（锁）/end（I2C 事务）
+      uint32_t t0 = millis();
+      Wire.beginTransmission((uint8_t)PN532_I2C_ADDRESS);
+      Wire.write(packet, (size_t)(8 + cmdlen));
+      uint32_t t1 = millis();
+      dbgWrErr = Wire.endTransmission(true);
+      uint32_t t2 = millis();
+      dbgWrBeginMs = (uint16_t)(t1 - t0);
+      dbgWrEndMs = (uint16_t)(t2 - t1);
+      dbgWrOk = (dbgWrErr == 0) ? 1 : 0;
     } else {
       ser_dev->write(packet, 8 + cmdlen);
     }
