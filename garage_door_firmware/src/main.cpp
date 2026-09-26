@@ -283,6 +283,8 @@ static bool autoOpenThenArm(const char* why) {
     gCloseArmed = true;
     gStrongAfterOpen = false;  // 必须再进库变强才允许离场关
     clearLeaveQual("开门重置");
+    // 与关码对称：开码也带上最近 RSSI 窗，否则 VPS 只见 RF TX 不知信号背景
+    sigLogShip("autoOpen", gLastSigRssi);
   }
   return ok;
 }

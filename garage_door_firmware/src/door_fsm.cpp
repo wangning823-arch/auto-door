@@ -62,7 +62,8 @@ void DoorFsm::emitOpen() {
   if (rfEmit_ && rfEmit_(true)) {
     lastAnyActionTs_ = millis();
     // 串口 + VPS 都要有：网页点开关时才能看到是否真发射频
-    logShipf("[FSM] RF TX open/up");
+    // t= 毫秒：30s 批次上报会把多次发码压成同一秒，靠 t 区分双开间隔
+    logShipf("[FSM] RF TX open/up t=%ums", (unsigned)millis());
     return;
   }
   logShipf("[FSM] RF emit fail → relay");
@@ -72,7 +73,7 @@ void DoorFsm::emitOpen() {
 void DoorFsm::emitClose() {
   if (rfEmit_ && rfEmit_(false)) {
     lastAnyActionTs_ = millis();
-    logShipf("[FSM] RF TX close/down");
+    logShipf("[FSM] RF TX close/down t=%ums", (unsigned)millis());
     return;
   }
   logShipf("[FSM] RF emit fail → relay");
@@ -97,15 +98,16 @@ bool DoorFsm::canAutoCloseNow() const {
 
 bool DoorFsm::tryAutoOpen(const char* why) {
   if (!canAutoOpenNow()) {
-    Serial.printf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d suppress=%d\n",
-                  why ? why : "?", holdOpen_ ? 1 : 0,
-                  suppressAutoOpenUntil_ &&
-                          !millisReached(millis(), suppressAutoOpenUntil_)
-                      ? 1
-                      : 0);
+    // 上送 VPS：否则远程只见 RF TX，看不出是谁在开
+    logShipf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d suppress=%d",
+             why ? why : "?", holdOpen_ ? 1 : 0,
+             suppressAutoOpenUntil_ &&
+                     !millisReached(millis(), suppressAutoOpenUntil_)
+                 ? 1
+                 : 0);
     return false;
   }
-  Serial.printf("[FSM] AUTO OPEN (%s)\n", why ? why : "");
+  logShipf("[FSM] AUTO OPEN (%s)", why ? why : "");
   pending_ = DoorAction::PULSE_OPEN;
   openSource_ = OpenSource::AUTO;
   doorState_ = DoorState::OPEN;
@@ -119,11 +121,11 @@ bool DoorFsm::tryAutoOpen(const char* why) {
 
 bool DoorFsm::tryAutoClose(const char* why) {
   if (!canAutoCloseNow()) {
-    Serial.printf("[FSM] AUTO CLOSE 拒绝 (%s) hold=%d\n", why ? why : "?",
-                  holdOpen_ ? 1 : 0);
+    logShipf("[FSM] AUTO CLOSE 拒绝 (%s) hold=%d", why ? why : "?",
+             holdOpen_ ? 1 : 0);
     return false;
   }
-  Serial.printf("[FSM] AUTO CLOSE (%s)\n", why ? why : "");
+  logShipf("[FSM] AUTO CLOSE (%s)", why ? why : "");
   pending_ = DoorAction::PULSE_CLOSE;
   emitClose();
   doorState_ = DoorState::CLOSED;
