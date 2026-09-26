@@ -1,10 +1,10 @@
 #include "remote_cmd.h"
 #include "config.h"
 #include "device_id.h"
+#include "http_client.h"
 #include "log_ship.h"
 
 #include <WiFi.h>
-#include <WiFiClient.h>
 
 // 仅明文 HTTP：WiFiClientSecure / mbedTLS 已删除（TLS 堆起不来，留着白占 flash）
 
@@ -42,10 +42,10 @@ static RemoteMemTrimFn s_memTrim = nullptr;
 static ConfigStore* s_cfg = nullptr;
 static bool s_enabled = REMOTE_CMD_ENABLE_DEFAULT;
 static uint32_t s_nextMs = 0;
-static uint32_t s_btBusyUntilMs = 0;
 static uint32_t s_lastPollMs = 0;
 static int s_failStreak = 0;
 static int s_okStreak = 0;
+static bool s_inFlight = false;  // 已提交、结果未收
 
 void remoteCmdSetHandler(RemoteCmdFn fn) { s_fn = fn; }
 void remoteCmdSetMemTrim(RemoteMemTrimFn fn) { s_memTrim = fn; }
@@ -66,6 +66,7 @@ void remoteCmdBegin(ConfigStore* cfg) {
   s_lastPollMs = 0;
   s_failStreak = 0;
   s_okStreak = 0;
+  s_inFlight = false;
   Serial.printf(
       "[REMOTE] begin enable=%d interval=%ums timeout=%ums http=%s:%u%s\n",
       s_enabled ? 1 : 0, (unsigned)REMOTE_POLL_INTERVAL_MS,
@@ -90,76 +91,8 @@ static bool parseCmd(const String& body, char* out, size_t outLen) {
   return true;
 }
 
-// 手写 HTTP GET：绕开 ESP32 HTTPClient 被 nginx 判 400 的问题
-static int httpGetRaw(Client& client, const String& host, const String& path,
-                      String* bodyOut) {
-  String req;
-  req.reserve(160);
-  req += "GET ";
-  req += path;
-  req += " HTTP/1.1\r\nHost: ";
-  req += host;
-  req += "\r\nUser-Agent: garage-esp32\r\nAccept: application/json\r\n";
-  req += "Connection: close\r\n\r\n";
-  if (client.print(req) != (int)req.length()) {
-    client.stop();
-    Serial.println("[REMOTE] send fail");
-    return -2;
-  }
+// 手写 HTTP 已移至 http_client（独立任务异步执行，loop 不阻塞）
 
-  uint32_t start = millis();
-  String raw;
-  raw.reserve(512);
-  while (client.connected() || client.available()) {
-    if (millis() - start > REMOTE_POLL_TIMEOUT_MS) {
-      client.stop();
-      Serial.println("[REMOTE] read timeout");
-      return -3;
-    }
-    while (client.available()) {
-      raw += (char)client.read();
-    }
-    if (raw.indexOf("\r\n\r\n") >= 0 && !client.connected()) break;
-    delay(1);
-    if (raw.length() > 4096) break;
-  }
-  uint32_t tail = millis();
-  while (client.available() && millis() - tail < 500) {
-    raw += (char)client.read();
-  }
-  client.stop();
-
-  int hdrEnd = raw.indexOf("\r\n\r\n");
-  if (hdrEnd < 0) {
-    Serial.printf("[REMOTE] no http header len=%u\n", (unsigned)raw.length());
-    return -4;
-  }
-  String head = raw.substring(0, hdrEnd);
-  String body = raw.substring(hdrEnd + 4);
-  if (bodyOut) *bodyOut = body;
-
-  int sp1 = head.indexOf(' ');
-  int sp2 = head.indexOf(' ', sp1 + 1);
-  if (sp1 < 0 || sp2 < 0) return -5;
-  return head.substring(sp1 + 1, sp2).toInt();
-}
-
-static int httpGetPlain(const String& host, uint16_t port, const String& path,
-                        String* bodyOut) {
-  IPAddress addr;
-  if (!WiFi.hostByName(host.c_str(), addr)) {
-    Serial.println("[REMOTE] dns fail");
-    return -11;
-  }
-  WiFiClient client;
-  if (!client.connect(addr, port, REMOTE_POLL_TIMEOUT_MS)) {
-    Serial.println("[REMOTE] http connect fail");
-    return -1;
-  }
-  return httpGetRaw(client, host, path, bodyOut);
-}
-
-// 仅支持 http://（https 已随 TLS 一并删除）
 static bool parseUrl(const String& url, String* host, uint16_t* port,
                      String* path) {
   String u = url;
@@ -183,17 +116,51 @@ static bool parseUrl(const String& url, String* host, uint16_t* port,
 }
 
 void remoteCmdService(bool btBusy, bool wifiOk) {
+  (void)btBusy;  // 射频仲裁移到 http_client：worker 发送前自己等蓝牙空隙
   const uint32_t now = millis();
-  if (!s_enabled || !wifiOk) return;
 
-  // 蓝牙忙默认让路；超过 6s 没轮询成功则插队，避免 8s TTL 过期
-  const bool stale = (s_lastPollMs == 0) || ((now - s_lastPollMs) > 6000);
-  if (btBusy && !stale) {
-    s_btBusyUntilMs = now;
+  // 在飞：只收结果，不发新请求（收结果零成本；wifi 断了也要收，防 owner 卡死）
+  if (s_inFlight) {
+    int code = 0;
+    String body;
+    if (!httpTryResult(HTTP_OWNER_POLL, &code, &body)) return;
+    s_inFlight = false;
+    s_lastPollMs = millis();
+    // 失败退避：连挂时不要每 3s 再撞网络
+    if (code == 200) {
+      s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
+    } else if (s_failStreak >= 2) {
+      s_nextMs = millis() + REMOTE_FAIL_BACKOFF_MS;
+    } else {
+      s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
+    }
+
+    if (code != 200) {
+      s_failStreak++;
+      if (s_failStreak <= 5 || (s_failStreak % 10) == 0) {
+        Serial.printf("[REMOTE] HTTP %d streak=%d heap=%u next=+%ums\n", code,
+                      s_failStreak, (unsigned)ESP.getFreeHeap(),
+                      (unsigned)(s_nextMs - millis()));
+      }
+      return;
+    }
+
+    s_failStreak = 0;
+    s_okStreak++;
+    char cmd[16] = {0};
+    if (!parseCmd(body, cmd, sizeof(cmd))) {
+      if (s_okStreak == 1 || (s_okStreak % 20) == 0) {
+        Serial.printf("[REMOTE] poll ok x%d (idle)\n", s_okStreak);
+      }
+      return;
+    }
+
+    logShipf("[REMOTE] cmd=%s", cmd);
+    if (s_fn) s_fn(cmd);
     return;
   }
-  if (!btBusy && (now - s_btBusyUntilMs) < REMOTE_BT_GAP_MIN_MS) return;
 
+  if (!s_enabled || !wifiOk) return;
   if (!millisReached(now, s_nextMs)) return;
   if (s_lastPollMs != 0 && (now - s_lastPollMs) < REMOTE_POLL_INTERVAL_MS) {
     return;
@@ -201,8 +168,6 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
 
   if (s_memTrim) s_memTrim();
 
-  String body;
-  int code = -1;
   String host;
   uint16_t port = 80;
   String path = REMOTE_HTTP_PATH;
@@ -222,37 +187,11 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
     path = q;
   }
 
-  code = httpGetPlain(host, port, path, &body);
-  s_lastPollMs = millis();
-  // 失败退避：连挂时不要每 3s 再撞网络（会饿死 Web handleClient / NFC）
-  if (code == 200) {
-    s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
-  } else if (s_failStreak >= 2) {
-    s_nextMs = millis() + REMOTE_FAIL_BACKOFF_MS;
+  // 提交即返回；结果下一轮 loop 来收（loop 永不等网络）
+  if (httpSubmitGet(HTTP_OWNER_POLL, host, port, path,
+                    REMOTE_POLL_TIMEOUT_MS)) {
+    s_inFlight = true;
   } else {
-    s_nextMs = millis() + REMOTE_POLL_INTERVAL_MS;
+    s_nextMs = now + 1000;  // 队列忙，1s 后再试
   }
-
-  if (code != 200) {
-    s_failStreak++;
-    if (s_failStreak <= 5 || (s_failStreak % 10) == 0) {
-      Serial.printf("[REMOTE] HTTP %d streak=%d heap=%u next=+%ums\n", code,
-                    s_failStreak, (unsigned)ESP.getFreeHeap(),
-                    (unsigned)(s_nextMs - millis()));
-    }
-    return;
-  }
-
-  s_failStreak = 0;
-  s_okStreak++;
-  char cmd[16] = {0};
-  if (!parseCmd(body, cmd, sizeof(cmd))) {
-    if (s_okStreak == 1 || (s_okStreak % 20) == 0) {
-      Serial.printf("[REMOTE] poll ok x%d (idle)\n", s_okStreak);
-    }
-    return;
-  }
-
-  logShipf("[REMOTE] cmd=%s", cmd);
-  if (s_fn) s_fn(cmd);
 }

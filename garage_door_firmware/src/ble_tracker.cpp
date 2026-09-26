@@ -1,5 +1,6 @@
 #include "ble_tracker.h"
 #include "config.h"
+#include "http_client.h"
 #include "BluetoothSerial.h"
 #include <esp_bt.h>
 #include <esp_bt_main.h>
@@ -432,6 +433,12 @@ void BleTracker::loop() {
     return;
   }
   if (millisReached(now, nextInquiryMs_)) {
+    // 射频交替：HTTP worker 正在发送（或等空隙后即将发送）→ 推迟一轮，
+    // 两边都不打断对方，避免 Inquiry 抢包导致 DNS/连接失败
+    if (httpClientBusy()) {
+      nextInquiryMs_ = now + 300;
+      return;
+    }
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
     uint32_t gap = inquirySlow_ ? 15000 : 3000;

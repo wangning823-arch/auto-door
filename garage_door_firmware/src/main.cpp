@@ -17,6 +17,7 @@
 #include "log_ship.h"
 #include "remote_ota.h"
 #include "status_report.h"
+#include "http_client.h"
 #include "device_id.h"
 
 // ===== 车库门智能控制器 P0.1 =====
@@ -36,6 +37,12 @@ static bool gOtaBegun = false;
 // OTA 写 flash 期间禁止碰 I2C/NFC（否则易把 PN532/总线拖死，升级后刷卡失效）
 static volatile bool gOtaActive = false;
 static volatile uint32_t gOtaActiveAtMs = 0;
+
+// http worker 发送前查询：蓝牙正在占射频（Inquiry/BLE 扫描）就等空隙
+static bool httpBtRadioBusy() {
+  if (!gBtStackInited) return false;
+  return gBt.inquiryBusy() || gBleScan.busy();
+}
 
 static void otaDisarm(const char* why) {
   if (!gOtaActive) return;
@@ -1119,6 +1126,7 @@ void setup() {
   digitalWrite(PIN_RF_TX, LOW);
   remoteCmdSetHandler(onRemoteCmd);
   remoteCmdSetMemTrim([]() { gBleScan.releaseMemory(); });
+  httpClientBegin(httpBtRadioBusy);  // 异步 HTTP 任务（loop 不再阻塞等网络）
   gCfg.begin();
   remoteCmdBegin(&gCfg);
   // logShipBegin 已在 early SCL 日志前调用，此处再 begin 会清掉已入队日志

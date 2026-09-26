@@ -1,8 +1,8 @@
 #include "status_report.h"
 #include "device_id.h"
+#include "http_client.h"
 #include "log_ship.h"
 #include <WiFi.h>
-#include <WiFiClient.h>
 
 #ifndef STATUS_REPORT_URL
 #define STATUS_REPORT_URL "http://door.wzx.homes/dev/status"
@@ -17,6 +17,7 @@
 static StatusBits gBits;
 static uint32_t s_nextMs = 0;
 static bool s_force = false;
+static bool s_inFlight = false;
 
 void statusReportSetBits(const StatusBits& b) { gBits = b; }
 
@@ -47,46 +48,10 @@ static String buildJson() {
   return j;
 }
 
-static bool httpPostStatus(const String& host, uint16_t port, const String& path,
-                           const String& body) {
-  IPAddress addr;
-  if (!WiFi.hostByName(host.c_str(), addr)) return false;
-  WiFiClient client;
-  if (!client.connect(addr, port, STATUS_REPORT_TIMEOUT_MS)) return false;
-  String req;
-  req.reserve(160 + body.length());
-  req += "POST ";
-  req += path;
-  req += " HTTP/1.1\r\nHost: ";
-  req += host;
-  req += "\r\nUser-Agent: garage-esp32\r\nContent-Type: application/json\r\n";
-  req += "Content-Length: ";
-  req += String((unsigned)body.length());
-  req += "\r\nConnection: close\r\n\r\n";
-  req += body;
-  if (client.print(req) != (int)req.length()) {
-    client.stop();
-    return false;
-  }
-  uint32_t start = millis();
-  String raw;
-  while (client.connected() || client.available()) {
-    if (millis() - start > STATUS_REPORT_TIMEOUT_MS) break;
-    while (client.available()) raw += (char)client.read();
-    if (raw.indexOf("\r\n\r\n") >= 0 && !client.connected()) break;
-    delay(1);
-    if (raw.length() > 256) break;
-  }
-  client.stop();
-  int sp1 = raw.indexOf(' ');
-  int sp2 = raw.indexOf(' ', sp1 + 1);
-  if (sp1 < 0 || sp2 < 0) return false;
-  return raw.substring(sp1 + 1, sp2).toInt() == 200;
-}
-
 void statusReportBegin() {
   s_nextMs = millis() + 5000;
   s_force = false;
+  s_inFlight = false;
   Serial.println("[STATUS] begin url=" STATUS_REPORT_URL);
 }
 
@@ -96,18 +61,29 @@ void statusReportNow() {
 }
 
 void statusReportService(bool btBusy, bool wifiOk) {
-  if (!wifiOk) return;
-  const uint32_t now = millis();
-  if (!s_force && (int32_t)(now - s_nextMs) < 0) return;
-  if (btBusy && !s_force) {
-    s_nextMs = now + 3000;
+  (void)btBusy;  // 射频仲裁在 http_client worker
+
+  if (s_inFlight) {
+    int code = 0;
+    if (!httpTryResult(HTTP_OWNER_STATUS, &code, nullptr)) return;
+    s_inFlight = false;
+    s_force = false;
+    if (code == 200) {
+      s_nextMs = millis() + STATUS_REPORT_INTERVAL_MS;
+    } else {
+      s_nextMs = millis() + 30000UL;
+    }
     return;
   }
 
+  if (!wifiOk) return;
+  const uint32_t now = millis();
+  if (!s_force && (int32_t)(now - s_nextMs) < 0) return;
+
+  String url = STATUS_REPORT_URL;
   String host = "door.wzx.homes";
   uint16_t port = 80;
   String path = "/dev/status";
-  String url = STATUS_REPORT_URL;
   if (url.startsWith("http://")) {
     String rest = url.substring(7);
     int slash = rest.indexOf('/');
@@ -121,15 +97,16 @@ void statusReportService(bool btBusy, bool wifiOk) {
       host = hp;
     }
   }
-  path += (path.indexOf('?') >= 0 ? '&' : '?');
+  path += (path.indexOf('?') >= 0) ? '&' : '?';
   path += "id=";
   path += deviceId();
 
-  const bool ok = httpPostStatus(host, port, path, buildJson());
-  s_force = false;
-  if (ok) {
-    s_nextMs = millis() + STATUS_REPORT_INTERVAL_MS;
+  if (httpSubmitPost(HTTP_OWNER_STATUS, host, port, path, buildJson(),
+                     STATUS_REPORT_TIMEOUT_MS)) {
+    s_inFlight = true;
+    s_force = false;
   } else {
-    s_nextMs = millis() + 30000UL;
+    s_force = false;
+    s_nextMs = now + 3000;
   }
 }
