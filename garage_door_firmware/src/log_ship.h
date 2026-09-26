@@ -12,6 +12,6 @@ void logShipPrintln(const String& line);
 // btBusy: Inquiry/BLE 扫描中 → 不发网络
 // wifiOk: STA 已连
 void logShipService(bool btBusy, bool wifiOk);
-// 强制 flush（串口命令 logs flush）
+// 同步 flush：立刻 HTTP POST（OTA 重启前 / 串口 logs flush）
 void logShipFlushNow();
 size_t logShipPending();

@@ -58,8 +58,9 @@
 #ifndef STATUS_REPORT_URL
 #define STATUS_REPORT_URL "http://door.wzx.homes/dev/status"
 #endif
+// OTA 无自动定时检查；仅 poll 收到 update 令 / 串口 ota check 时才升级
 #ifndef OTA_CHECK_INTERVAL_MS
-#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 正式每天一次；开发用 poll 的 update 令
+#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 保留宏，不再用于自动触发
 #endif
 // 轮询周期须明显小于服务端 TTL（8s），留出蓝牙空隙
 #ifndef REMOTE_POLL_INTERVAL_MS
@@ -259,13 +260,13 @@
 #ifndef NFC_SLOW_STREAK_RESYNC
 #define NFC_SLOW_STREAK_RESYNC 3
 #endif
-// 连续无卡 N 次才刷新 RF 场（过勤会打出慢 ACK 死循环）
+// 连续无卡 N 次才「考虑」刷 RF 场（还须满足 NFC_FIELD_REFRESH_MS）
 #ifndef NFC_FIELD_REFRESH_POLLS
 #define NFC_FIELD_REFRESH_POLLS 30
 #endif
-// （保留宏兼容；场刷新不再按短时间触发）
+// 空闲补场最短间隔：过勤（曾约 16s）会慢 ACK→resync→deferred 假死
 #ifndef NFC_FIELD_REFRESH_MS
-#define NFC_FIELD_REFRESH_MS 30000
+#define NFC_FIELD_REFRESH_MS 300000UL
 #endif
 // 自动关码最小间隔：防 leaveQual 卡住后每 4s 连发关码堵死门机
 #ifndef AUTO_CLOSE_MIN_INTERVAL_MS

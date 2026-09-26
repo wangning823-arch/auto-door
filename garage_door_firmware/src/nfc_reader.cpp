@@ -102,9 +102,12 @@ static void releaseBus(int sda, int scl) {
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);  // 禁止把 1000ms 超时泄漏到下一轮
 }
 
-// init 失败统一收尾：松手 + 计失败（禁止后台自动再撞，只允许手动 nfcinit）
+// init 失败统一收尾：松手 + 计失败
+// 必须上送 VPS：原先只打串口，远程只见 auto-retry 看不到第一现场
 static void failRelease(const char* why, int sda, int scl, uint16_t* streak) {
-  Serial.printf("[NFC] FAIL %s SCL=%d → Wire.end\n", why, digitalRead(scl));
+  int sclLv = digitalRead(scl);
+  Serial.printf("[NFC] FAIL %s SCL=%d → Wire.end\n", why, sclLv);
+  logShipf("[NFC] FAIL %s SCL=%d", why, sclLv);
   releaseBus(sda, scl);
   if (*streak < 60000) (*streak)++;
 }
@@ -433,6 +436,7 @@ bool NfcReader::recoverBusAndResync() {
   if (now - lastResyncMs_ < 3000) return false;
   lastResyncMs_ = now;
   Serial.println("[NFC] resync bus + SAMConfig");
+  logShipf("[NFC] resync start");
 
   releaseBus(sda_, scl_);
   // 只有总线不空闲才 recover，避免毛刺弄死空闲 PN532
@@ -489,6 +493,7 @@ bool NfcReader::recoverBusAndResync() {
   lastFieldMs_ = millis();
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   Serial.printf("[NFC] resync OK rf=%d\n", (int)rfOk);
+  logShipf("[NFC] resync OK rf=%d", (int)rfOk);
   return true;
 }
 
@@ -825,14 +830,21 @@ void NfcReader::maybeRecover() {
     return;
   }
 
-  // 2) deferred：慢速重试。超过 MAX 仍按 30min 保活再试，禁止永久放弃
+  // 2) deferred：重试。芯片还在（absent=0）必须持续短间隔打，
+  // 不准 10min/30min 保活——那等于刷卡功能关掉几小时。
   if (deferred_) {
-    // 总线被按住时不要 3s 连撞（i2cBusRecover/Wire.begin 会再占 I2C 矩阵）
-    // 前几次快速重试：OTA 重启后 PN532 可能 1-2s 内还忙，30s 太久
-    uint32_t gap = (failStreak_ > 0 && !digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL))
-                       ? 30000UL
-                       : ((autoRetryCount_ < 5) ? 3000UL : NFC_AUTO_RETRY_GAP_MS);
-    if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX) gap = NFC_SLOW_KEEPALIVE_MS;
+    int sclLv = digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL);
+    uint32_t gap;
+    if (failStreak_ > 0 && !sclLv) {
+      gap = 30000UL;  // 总线被按住：别 3s 连撞
+    } else if (!absent_) {
+      gap = 8000UL;  // 芯片 ACK 在：8s 一次直到救活
+    } else if (autoRetryCount_ < 5) {
+      gap = 3000UL;
+    } else {
+      gap = 20000UL;  // 疑似未接芯片：20s 保活，不再 10/30 分钟
+    }
+    if (autoRetryCount_ >= NFC_AUTO_RETRY_MAX && absent_) gap = 60000UL;
     if (!millisReached(now, lastAutoRetryMs_ + gap)) return;
     lastAutoRetryMs_ = now;
     if (autoRetryCount_ < 255) autoRetryCount_++;
@@ -956,14 +968,19 @@ bool NfcReader::poll(String& uid) {
     lastPollSlow_ = false;
   }
 
-  // 仅「连续空轮询够多」才刷 RF 场；绝不能 empty=1 就刷
-  // （场 on+rewire 后立刻 InList 会打出 1.2s 慢 ACK，形成死循环）
-  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS) {
-    Serial.printf("[NFC] 空轮询 %u → 刷新 RF field\n", (unsigned)emptyPolls_);
+  // 空闲刷 RF：绝不能 empty 到 N 就刷（约 16s 一次）。
+  // 场 on 后立刻 InList 会打出慢 ACK → 连续 3 次 resync → 失败进 deferred，
+  // 空闲 20～60 分钟后 NFC 永久假死（远程只能看到 auto-retry）。
+  // 改为「空闲且距上次开 场 ≥5 分钟」才补场；InList 本身会开场，实体卡不依赖常开场。
+  if (emptyPolls_ >= NFC_FIELD_REFRESH_POLLS &&
+      (now - lastFieldMs_) >= NFC_FIELD_REFRESH_MS) {
+    Serial.printf("[NFC] 空闲 %u 拍且 %ums → 刷 RF field\n",
+                  (unsigned)emptyPolls_, (unsigned)(now - lastFieldMs_));
+    logShipf("[NFC] idle %u → RF refresh", (unsigned)emptyPolls_);
     pn532RfFieldOn(sda_, scl_);
     emptyPolls_ = 0;
     lastFieldMs_ = now;
-    nextPollMs_ = millis() + 200;  // rewire 后多等一会再 InList
+    nextPollMs_ = millis() + 200;
     return false;
   }
 
@@ -993,12 +1010,17 @@ bool NfcReader::poll(String& uid) {
     if (cost > 800) {
       Serial.printf("[NFC] poll ACK 慢 %ums → rewire streak=%u\n",
                     (unsigned)cost, (unsigned)(slowAckStreak_ + 1));
+      // 只在 streak 首次/进 resync 时上送，避免刷屏
+      if (slowAckStreak_ == 0 || slowAckStreak_ + 1 >= NFC_SLOW_STREAK_RESYNC)
+        logShipf("[NFC] slow ACK %ums streak=%u", (unsigned)cost,
+                 (unsigned)(slowAckStreak_ + 1));
       nfcRewire(sda_, scl_);
       pn532Drain();
       lastPollSlow_ = true;
       if (slowAckStreak_ < 255) slowAckStreak_++;
       if (slowAckStreak_ >= NFC_SLOW_STREAK_RESYNC) {
         Serial.println("[NFC] 连续慢 ACK → resync");
+        logShipf("[NFC] slow ACK x%u → resync", (unsigned)slowAckStreak_);
         recoverBusAndResync();
         slowAckStreak_ = 0;
       }

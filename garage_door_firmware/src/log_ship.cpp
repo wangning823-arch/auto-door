@@ -72,10 +72,6 @@ void logShipf(const char* fmt, ...) {
 }
 
 size_t logShipPending() { return s_len; }
-void logShipFlushNow() {
-  s_force = true;
-  s_nextMs = 0;
-}
 
 static bool httpPostLogs(const String& host, uint16_t port, const String& path,
                          const String& body) {
@@ -115,6 +111,52 @@ static bool httpPostLogs(const String& host, uint16_t port, const String& path,
   return raw.substring(sp1 + 1, sp2).toInt() == 200;
 }
 
+// 解析 LOG_SHIP_URL → host/port/path（与 logShipService 共用）
+static void parseLogUrl(String* host, uint16_t* port, String* path) {
+  *host = LOG_SHIP_HOST;
+  *port = 80;
+  *path = "/dev/logs";
+  String url = LOG_SHIP_URL;
+  if (!url.startsWith("http://")) return;
+  String rest = url.substring(7);
+  int slash = rest.indexOf('/');
+  String hp = slash >= 0 ? rest.substring(0, slash) : rest;
+  *path = slash >= 0 ? rest.substring(slash) : String("/dev/logs");
+  int c = hp.indexOf(':');
+  if (c >= 0) {
+    *host = hp.substring(0, c);
+    *port = (uint16_t)atoi(hp.substring(c + 1).c_str());
+  } else {
+    *host = hp;
+  }
+}
+
+// 同步刷出（OTA 重启前必须用）：真正 POST，不依赖 loop 里的 service
+void logShipFlushNow() {
+  s_force = false;
+  s_nextMs = 0;
+  if (s_len == 0 || WiFi.status() != WL_CONNECTED) return;
+  String host, path;
+  uint16_t port = 80;
+  parseLogUrl(&host, &port, &path);
+  if (path.indexOf("id=") < 0) {
+    path += (path.indexOf('?') >= 0 ? '&' : '?');
+    path += "id=";
+    path += deviceId();
+  }
+  String body;
+  body.reserve(s_len);
+  body.concat(s_ring, s_len);
+  if (httpPostLogs(host, port, path, body)) {
+    s_len = 0;
+    s_failStreak = 0;
+    s_nextMs = millis() + LOG_SHIP_INTERVAL_MS;
+  } else {
+    s_failStreak++;
+    s_nextMs = millis() + LOG_SHIP_INTERVAL_MS;
+  }
+}
+
 void logShipService(bool btBusy, bool wifiOk) {
   if (!wifiOk) return;
   const uint32_t now = millis();
@@ -127,24 +169,9 @@ void logShipService(bool btBusy, bool wifiOk) {
   // 蓝牙忙默认不发；积压 >1.2KB 或强制时抢一次（短请求）
   if (btBusy && !s_force && s_len < 1200) return;
 
-  // 解析 URL
-  String host = LOG_SHIP_HOST;
+  String host, path;
   uint16_t port = 80;
-  String path = "/dev/logs";
-  String url = LOG_SHIP_URL;
-  if (url.startsWith("http://")) {
-    String rest = url.substring(7);
-    int slash = rest.indexOf('/');
-    String hp = slash >= 0 ? rest.substring(0, slash) : rest;
-    path = slash >= 0 ? rest.substring(slash) : String("/dev/logs");
-    int c = hp.indexOf(':');
-    if (c >= 0) {
-      host = hp.substring(0, c);
-      port = (uint16_t)atoi(hp.substring(c + 1).c_str());
-    } else {
-      host = hp;
-    }
-  }
+  parseLogUrl(&host, &port, &path);
 
   String body;
   body.reserve(s_len);

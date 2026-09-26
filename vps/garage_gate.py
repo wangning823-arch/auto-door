@@ -48,7 +48,8 @@ WEB_DIR = os.path.join(BASE_DIR, "web")
 OTA_DIR = os.path.join(BASE_DIR, "ota")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 UI_PASSWORD_FILE = os.path.join(BASE_DIR, "ui_password")
-# 灰度：名单内设备不自动 update（sticky /api.../update 仍可手动推）
+# 历史：ota_hold 名单曾用于灰度禁自动 update。自动升级已全局关闭，
+# 名单仅作记录；升级只靠网页「立即更新」/ 显式 update 令。
 OTA_AUTO_HOLD_FILE = os.path.join(BASE_DIR, "ota_hold")
 
 # 调试期关闭网页登录（地址未公开）。上线前改回 True。
@@ -238,27 +239,9 @@ def _ota_auto_hold_ids():
 
 
 def _maybe_auto_update_locked(d, device_fw):
-    if not device_fw:
-        return False
-    if d.get("id") in _ota_auto_hold_ids():
-        return False
-    try:
-        remote = _ota_version_info().get("version") or ""
-    except Exception:
-        remote = ""
-    # 只升级「更旧 → 更新」；相等或本地更新都不动（防降级）
-    if not remote or device_fw == remote or device_fw >= remote:
-        return False
-    now = _now()
-    if d["update_sticky"]:
-        return False
-    if (now - d["update_notify_ts"]) < UPDATE_NOTIFY_GAP_S:
-        return False
-    d["update_sticky"] = True
-    d["update_ts"] = now
-    d["update_notify_ts"] = now
-    _log("[%s] auto update fw=%s -> %s" % (d["id"], device_fw, remote))
-    return True
+    # 自动升级已关闭：只允许网页「立即更新」/ 显式 update 令触发，
+    # 避免板子升到用户不想升的版本。此函数保留占位，恒不触发。
+    return False
 
 
 def take_pending(dev_id=None, device_fw=None):
@@ -830,7 +813,7 @@ class Handler(BaseHTTPRequestHandler):
         dev_id = dev_id or self._q("id") or DEFAULT_DEVICE
         if cmd == "update":
             ok, why = request_update("api", dev_id)
-            msg = "已请求检查更新" if ok else ("已在队列中" if why == "already" else "失败")
+            msg = "已请求立即更新" if ok else ("已在队列中" if why == "already" else "失败")
         else:
             ok, why = set_pending(cmd, dev_id)
             _log("ui %s %s -> pending=%s (%s)" % (dev_id, cmd, ok, why))
@@ -1038,8 +1021,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": 0, "error": "empty or too small"})
                 return
             meta = _save_ota_bin(data, version)
-            # 上传后通知：指定 id 只发一台；默认发给所有已注册设备
-            if self._q("notify") not in ("0", "false", "no"):
+            # 默认不通知设备：只保存固件，升级由网页「立即更新」手动触发
+            if self._q("notify") in ("1", "true", "yes"):
                 only = self._q("id")
                 with _lock:
                     ids = [only] if only else list(_devices.keys())

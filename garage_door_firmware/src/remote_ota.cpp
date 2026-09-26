@@ -5,6 +5,8 @@
 #include <Update.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <mbedtls/sha256.h>
+#include <esp_task_wdt.h>
 
 #ifndef OTA_VERSION_URL
 #define OTA_VERSION_URL "http://door.wzx.homes/ota/version"
@@ -12,16 +14,12 @@
 #ifndef OTA_BIN_URL
 #define OTA_BIN_URL "http://door.wzx.homes/ota/firmware.bin"
 #endif
-#ifndef OTA_CHECK_INTERVAL_MS
-#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 兜底；开发靠 poll update 令
-#endif
 #ifndef OTA_HTTP_TIMEOUT_MS
 #define OTA_HTTP_TIMEOUT_MS 8000
 #endif
 
 static ConfigStore* s_cfg = nullptr;
 static OtaBusyFn s_busyFn = nullptr;
-static uint32_t s_nextMs = 0;
 static bool s_force = false;
 static bool s_active = false;
 static bool s_done = false;
@@ -32,22 +30,30 @@ static void setMsg(const char* m) {
   s_lastMsg[sizeof(s_lastMsg) - 1] = 0;
 }
 
+static void sha256ToHex(const uint8_t raw[32], char out[65]) {
+  static const char* hex = "0123456789abcdef";
+  for (int i = 0; i < 32; i++) {
+    out[i * 2] = hex[(raw[i] >> 4) & 0xF];
+    out[i * 2 + 1] = hex[raw[i] & 0xF];
+  }
+  out[64] = 0;
+}
+
 void remoteOtaBegin(ConfigStore* cfg) {
   s_cfg = cfg;
-  // 上电 90s 后才查，避开 DHCP/BT 初始化
-  s_nextMs = millis() + 90000UL;
   s_force = false;
   s_done = false;
-  logShipf("[OTA] remote check every %umin url=%s",
-           (unsigned)(OTA_CHECK_INTERVAL_MS / 60000UL), OTA_VERSION_URL);
+  s_active = false;
+  logShipf("[OTA] manual-only (no auto check) url=%s", OTA_VERSION_URL);
 }
 
 void remoteOtaSetBusyHook(OtaBusyFn fn) { s_busyFn = fn; }
+
 void remoteOtaCheckNow() {
   s_force = true;
-  s_nextMs = 0;
-  s_done = false;  // 手动 update 必须能再查：否则本运行一直 up-to-date 后拒升级
+  s_done = false;  // 手动 update 必须能再查
 }
+
 bool remoteOtaActive() { return s_active; }
 const char* remoteOtaLastMsg() { return s_lastMsg; }
 
@@ -69,7 +75,6 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
     client->stop();
     return false;
   }
-  // 读响应头
   uint32_t start = millis();
   String head;
   while (client->connected() || client->available()) {
@@ -105,7 +110,6 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
   if (cl >= 0) {
     *contentLen = header.substring(cl + 15).toInt();
   }
-  // 头后残留 body 仍在 socket 里，交给调用方继续 read
   return true;
 }
 
@@ -131,29 +135,33 @@ static String withId(const String& path) {
   return p;
 }
 
+static void parseHttpUrl(const String& url, String* host, uint16_t* port,
+                         String* path, const char* defaultPath) {
+  *host = "door.wzx.homes";
+  *port = 80;
+  *path = defaultPath;
+  if (!url.startsWith("http://")) return;
+  String rest = url.substring(7);
+  int slash = rest.indexOf('/');
+  String hp = slash >= 0 ? rest.substring(0, slash) : rest;
+  *path = slash >= 0 ? rest.substring(slash) : String(defaultPath);
+  int c = hp.indexOf(':');
+  if (c >= 0) {
+    *host = hp.substring(0, c);
+    *port = (uint16_t)atoi(hp.substring(c + 1).c_str());
+  } else {
+    *host = hp;
+  }
+}
+
+// 完整性不过就 abort，绝不 set_boot。停 NFC/BT 由 s_busyFn 在写 flash 前完成。
 static void doOta() {
   s_force = false;
   if (s_active || s_done) return;
 
-  String host = "door.wzx.homes";
+  String host, vpath, bpathUrl = OTA_BIN_URL;
   uint16_t port = 80;
-  String vpath = "/ota/version";
-  {
-    String url = OTA_VERSION_URL;
-    if (url.startsWith("http://")) {
-      String rest = url.substring(7);
-      int slash = rest.indexOf('/');
-      String hp = slash >= 0 ? rest.substring(0, slash) : rest;
-      vpath = slash >= 0 ? rest.substring(slash) : String("/ota/version");
-      int c = hp.indexOf(':');
-      if (c >= 0) {
-        host = hp.substring(0, c);
-        port = (uint16_t)atoi(hp.substring(c + 1).c_str());
-      } else {
-        host = hp;
-      }
-    }
-  }
+  parseHttpUrl(OTA_VERSION_URL, &host, &port, &vpath, "/ota/version");
   vpath = withId(vpath);
 
   WiFiClient client;
@@ -164,7 +172,7 @@ static void doOta() {
     return;
   }
   String body;
-  body.reserve(256);
+  body.reserve(512);
   uint32_t start = millis();
   while (client.connected() || client.available()) {
     if (millis() - start > 2000) break;
@@ -174,29 +182,34 @@ static void doOta() {
   }
   client.stop();
 
-  String remoteVer;
+  String remoteVer, remoteSha;
   if (!parseJsonStr(body, "version", &remoteVer)) {
     setMsg("no version");
     logShipf("[OTA] version.json missing version");
     return;
   }
-  remoteVer.trim();  // 防 \r/空白导致永远判成有新版本
+  remoteVer.trim();
+  parseJsonStr(body, "sha256", &remoteSha);
+  remoteSha.trim();
+  remoteSha.toLowerCase();
   if (remoteVer == FW_VERSION) {
     setMsg("up to date");
-    s_done = true;  // 本次启动不再重复拉固件
+    s_done = true;
     logShipf("[OTA] up to date %s", FW_VERSION);
     return;
   }
-  logShipf("[OTA] new %s -> %s id=%s", FW_VERSION, remoteVer.c_str(),
+  logShipf("[OTA] new %s -> %s sha=%s id=%s", FW_VERSION, remoteVer.c_str(),
+           remoteSha.length() ? remoteSha.substring(0, 12).c_str() : "-",
            deviceId().c_str());
 
   s_active = true;
-  // 不在这里 s_done：下载失败还要允许按间隔重试；只有「已是最新」才钉死
+  // 写 flash 前停 NFC/Inquiry（busy 钩子），避免 I2C 弄脏镜像
   if (s_busyFn) s_busyFn(true);
 
   long fsize = -1;
-  String bpath = withId("/ota/firmware.bin");
-  // fsize<0 = 无 Content-Length，仍可按连接关闭收完（UPDATE_SIZE_UNKNOWN）
+  String bpath;
+  parseHttpUrl(bpathUrl, &host, &port, &bpath, "/ota/firmware.bin");
+  bpath = withId(bpath);
   if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize == 0) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
@@ -207,21 +220,34 @@ static void doOta() {
   logShipf("[OTA] bin ok size=%ld heap=%u maxblk=%u", fsize,
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
-  // 清掉可能残留的 Update 状态（begin 若报 already running 会 err=No Error）
+  // 清掉可能残留的 Update 状态
   Update.abort();
-  if (!Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN)) {
+  // 擦 2MB OTA 槽可能踩 loop WDT，先摘掉
+  disableLoopWDT();
+  bool began = Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN);
+  if (!began) {
     Update.abort();
-    if (!Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN)) {
-      client.stop();
-      s_active = false;
-      if (s_busyFn) s_busyFn(false);
-      setMsg("update begin fail");
-      logShipf("[OTA] Update.begin fail err=%s heap=%u maxblk=%u",
-               Update.errorString(), (unsigned)ESP.getFreeHeap(),
-               (unsigned)ESP.getMaxAllocHeap());
-      return;
-    }
+    began = Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN);
   }
+  enableLoopWDT();
+  if (!began) {
+    client.stop();
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    setMsg("update begin fail");
+    logShipf("[OTA] Update.begin fail err=%s heap=%u maxblk=%u",
+             Update.errorString(), (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getMaxAllocHeap());
+    return;
+  }
+
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+  mbedtls_sha256_starts(&sha, 0);
+#else
+  mbedtls_sha256_starts_ret(&sha, 0);
+#endif
 
   uint8_t buf[1024];
   size_t written = 0;
@@ -240,6 +266,7 @@ static void doOta() {
     if (r <= 0) break;
     if (Update.write(buf, (size_t)r) != (size_t)r) {
       Update.abort();
+      mbedtls_sha256_free(&sha);
       client.stop();
       s_active = false;
       if (s_busyFn) s_busyFn(false);
@@ -248,11 +275,17 @@ static void doOta() {
                Update.errorString());
       return;
     }
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+    mbedtls_sha256_update(&sha, buf, (size_t)r);
+#else
+    mbedtls_sha256_update_ret(&sha, buf, (size_t)r);
+#endif
     written += (size_t)r;
     start = millis();
     // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
     yield();
     delay(0);
+    esp_task_wdt_reset();
     if (written >= nextLogAt && fsize > 0) {
       logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
       nextLogAt += 0x20000;
@@ -260,9 +293,10 @@ static void doOta() {
   }
   client.stop();
 
-  // 半截镜像不能激活：end(true) 会去 set_boot，全镜像校验必失败
+  // 半截镜像不能激活
   if (fsize > 0 && (long)written < fsize) {
     Update.abort();
+    mbedtls_sha256_free(&sha);
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     setMsg("partial write");
@@ -270,17 +304,41 @@ static void doOta() {
     return;
   }
 
-  if (!Update.end(true)) {
+  uint8_t raw[32];
+  char hex[65];
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+  mbedtls_sha256_finish(&sha, raw);
+#else
+  mbedtls_sha256_finish_ret(&sha, raw);
+#endif
+  mbedtls_sha256_free(&sha);
+  sha256ToHex(raw, hex);
+
+  if (remoteSha.length() == 64 && strcmp(hex, remoteSha.c_str()) != 0) {
+    Update.abort();
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    setMsg("sha mismatch");
+    logShipf("[OTA] sha mismatch got=%s want=%s wrote=%u", hex,
+             remoteSha.c_str(), (unsigned)written);
+    return;
+  }
+
+  disableLoopWDT();
+  bool ended = Update.end(true);
+  enableLoopWDT();
+  if (!ended) {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     setMsg("end fail");
-    logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld", Update.errorString(),
-             (unsigned)written, fsize);
+    logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld sha=%s",
+             Update.errorString(), (unsigned)written, fsize, hex);
     return;
   }
   setMsg("rebooting");
-  logShipf("[OTA] OK bytes=%u id=%s -> reboot", (unsigned)written,
+  logShipf("[OTA] OK bytes=%u sha=%s id=%s -> reboot", (unsigned)written, hex,
            deviceId().c_str());
+  // 真正 POST 出去再重启，否则日志全丢
   logShipFlushNow();
   // 软重启前再收一次 NFC：避免踩在 InList 半截 → PN532 拉死 SCL
   if (s_busyFn) s_busyFn(true);
@@ -288,17 +346,11 @@ static void doOta() {
   ESP.restart();
 }
 
+// 仅手动/指令触发：无定时自动检查，防止升到不想升的版本
 void remoteOtaService(bool btBusy, bool wifiOk) {
   if (s_active || s_done || !wifiOk) return;
-  const uint32_t now = millis();
-  if (!s_force && (int32_t)(now - s_nextMs) < 0) return;
-  // 蓝牙忙不写 flash；但 update 令/到点检查等太久则插队（否则 Inquiry 几乎常亮会饿死 OTA）
-  static uint32_t s_waitMs = 0;
-  if (btBusy && !s_force) {
-    if (!s_waitMs) s_waitMs = now;
-    if ((now - s_waitMs) < 15000UL) return;
-  }
-  s_waitMs = 0;
-  s_nextMs = millis() + OTA_CHECK_INTERVAL_MS;
+  if (!s_force) return;
+  // update 令必须能插队，不因 Inquiry 一直饿死
+  (void)btBusy;
   doOta();
 }

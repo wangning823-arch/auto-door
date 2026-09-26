@@ -268,7 +268,8 @@
       return;
     }
     var ver = $("verInput").value.trim();
-    var qs = "?notify=1" + (ver ? "&version=" + encodeURIComponent(ver) : "");
+    // 不带 notify：上传只落服务器，升级靠设备页「立即更新」
+    var qs = "?notify=0" + (ver ? "&version=" + encodeURIComponent(ver) : "");
     $("uploadBtn").disabled = true;
     setTip($("otaMsg"), "上传中…");
     fetch("/api/ota/upload" + qs, {
@@ -287,7 +288,7 @@
       })
       .then(function (j) {
         var o = j.ota || {};
-        setTip($("otaMsg"), "已上传 " + (o.version || "") + " 并通知设备", "ok");
+        setTip($("otaMsg"), "已上传 " + (o.version || "") + "，请到设备页点「立即更新」", "ok");
         $("otaCurrent").textContent = "服务器固件：" + (o.version || "-") + " · " + (o.size || 0) + " bytes";
         loadList();
       })
