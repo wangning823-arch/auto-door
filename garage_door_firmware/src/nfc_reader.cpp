@@ -614,10 +614,12 @@ bool NfcReader::hwInit() {
     return false;
   }
 
-  // begin() 内已 SAMConfig；用库函数设重试（响应长度与官方例程一致）
+  // begin() 内已 SAMConfig；用裸命令设重试：库只 readdata(6)，RFConfiguration
+  // 响应可能更长，残帧会把后续所有主机写拖到 1s 超时（post-init ver / InList 全废）
   {
-    bool ack = nfc.setPassiveActivationRetries(0x04);
-    Serial.printf("[NFC] setRetries ack=%d SCL=%d\n", (int)ack,
+    pn532Drain();
+    bool ack = pn532SetRetries(0x04);
+    Serial.printf("[NFC] setRetries raw ack=%d SCL=%d\n", (int)ack,
                   digitalRead(scl_));
     if (!ack || !busIdle(sda_, scl_)) {
       failRelease("setRetries", sda_, scl_, &failStreak_);
@@ -625,11 +627,14 @@ bool NfcReader::hwInit() {
       deferred_ = true;
       return false;
     }
+    // 收干净再发下一条，避免残 RDY
+    nfcRewire(sda_, scl_);
+    pn532Drain();
+    delay(20);
   }
   delay(50);
 
-  // 不做 RFConfiguration 开/关场：实测场 ON 后主机写 1s 超时；
-  // 关场命令本身也会把总线弄到 SCL=0。交给 InListPassiveTarget 自己管场。
+  // 不做 RFConfiguration 开/关场：交给 InListPassiveTarget 自己管场
   if (!busIdle(sda_, scl_)) {
     failRelease("post-init", sda_, scl_, &failStreak_);
     ok_ = false;
@@ -638,12 +643,12 @@ bool NfcReader::hwInit() {
   }
 
   Wire.setTimeOut(200);
-  // 对照：init 后立刻再读一次 ver（走与 getFirmwareVersion 相同的库路径）
+  // 对照：setRetries 后再读一次 ver，应接近首读（若仍 1.1s 说明还有脏源）
   {
     uint32_t t0 = millis();
     uint32_t v2 = nfc.getFirmwareVersion();
     uint32_t dt = millis() - t0;
-    logShipf("[NFC] post-init ver=%08lx %ums", (unsigned long)v2,
+    logShipf("[NFC] post-setretry ver=%08lx %ums", (unsigned long)v2,
              (unsigned)dt);
   }
   ok_ = true;
@@ -977,6 +982,8 @@ bool NfcReader::poll(String& uid) {
     pn532Drain();
     lastPollSlow_ = false;
   }
+  // 每次 InList 前丢掉可能残留的 RFConfiguration 响应
+  pn532Drain();
 
   uint8_t buf[16];
   uint8_t len = 0;
