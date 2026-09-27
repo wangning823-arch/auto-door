@@ -25,6 +25,7 @@ venv/
 tools/_*.py
 tools/_patch_fsm.py
 diag_bus*.py
+diag_*.ps1
 read_boot.py
 send_nfcinit.py
 test_*.py
