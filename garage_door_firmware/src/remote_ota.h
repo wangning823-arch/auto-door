@@ -9,6 +9,10 @@
 using OtaBusyFn = void (*)(bool active);
 
 void remoteOtaBegin(ConfigStore* cfg = nullptr);
+// 开机即预留 4KB 连续 8BIT 堆，OTA Update.begin 前让出——
+// 运行久后 8BIT 池碎到 max8<4KB，begin 内部 malloc 必败（err=0 实锤，
+// dda0 探针 maxIn=11252 但 max8=2420）
+void remoteOtaHold4k();
 void remoteOtaSetBusyHook(OtaBusyFn fn);
 // btBusy / wifiOk 语义同 remoteCmdService
 void remoteOtaService(bool btBusy, bool wifiOk);
