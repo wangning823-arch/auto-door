@@ -209,11 +209,24 @@
 // 离场关门：进入「强→弱/离开」后，最长等这么久就关（观察期可再调）
 // 另：无→有立刻开门；误开问题后续再收紧
 #define LEAVING_CLOSE_MS      10000
-// ===== 关门：至少 3 个有效 RSSI 且单调变弱才「离开合格」=====
-// 例：-60,-70,-80 可关；-60,-80,-60 视为跳动，否决关门
-#define RSSI_TREND_MIN_N      4     // 最少样本（3 点锯齿易误判，日志回放 4 点挡掉 ~97%）
-#define RSSI_TREND_DROP_DB    15    // 首末至少弱这么多 dB
-#define RSSI_TREND_TOL_DB     3     // 相邻允许的小反弹（多径）
+// ===== 关门：渐离趋势判定（区分「开车离开」与「熄火瞬消」）=====
+// 开走：车移动中 RSSI 连续渐弱 → 窗口内首末落差 ≥DROP 且相邻回弹 ≤TOL → 合格
+// 熄火：车机蓝牙直接消失、不再产生新样本 → 90s 时间窗内永远凑不齐落差 → 不合格
+//        （熄火瞬间 isFar 也因无信号不满足——车上有人在库时绝不触发自动关）
+// 经典蓝牙 inquiry 几秒一轮、多径噪声 ±10dB：原「4点严格单调+容差3dB+落差15dB」
+// 实测全天 0 次合格（dda0 20260927 日志）→ 放宽为 首末落差+回弹上限+时间窗 三条件
+#ifndef RSSI_TREND_MIN_N
+#define RSSI_TREND_MIN_N      4      // 窗口最少样本（3 点锯齿易误判）
+#endif
+#ifndef RSSI_TREND_DROP_DB
+#define RSSI_TREND_DROP_DB    12     // 首末至少弱这么多 dB（原 15）
+#endif
+#ifndef RSSI_TREND_TOL_DB
+#define RSSI_TREND_TOL_DB     10     // 相邻允许回弹上限 dB（原 3：-82→-95→-85 一步否决）
+#endif
+#ifndef RSSI_TREND_WINDOW_MS
+#define RSSI_TREND_WINDOW_MS  90000UL  // 渐离须发生在 90s 内：防停车后环境慢漂移误判
+#endif
 // 连续无信号这么久才算「真无」，之后再出现才允许无→有开（抖动 miss 不算无）
 // 注意：仅用于开门门槛；不再用于「无信号 35s 兜底关门」（车熄火会突然消失）
 #define RSSI_TRUE_SILENT_MS   20000

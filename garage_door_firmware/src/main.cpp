@@ -320,32 +320,47 @@ static bool tryCloseIfOpen(const char* why) {
 // ===== 真无 + 离场 RSSI 趋势（开/关门共用）=====
 // 开：仅「连续真无」之后再出现（含很弱）才开；短 miss 回来不算无→有
 // 关：≥RSSI_TREND_MIN_N 个有效 RSSI 单调变弱且首末够弱；反弹否决；或长时间真无兜底
+// 关门资格：渐离趋势 + 开门后见过强信号（进过库）+ 已偏远（isFar）
+// 渐离判定语义（见 config.h）：开走=移动中连续渐弱，90s 内首末落差≥DROP；
+// 熄火=瞬消无新样本，时间窗内凑不齐落差 → 永不合格（不误关库内的人）
 struct RssiTrendWin {
   int8_t buf[6];
+  uint32_t ts[6];  // 采样时刻（时间窗淘汰用）
   uint8_t n = 0;
   uint8_t head = 0;
   void clear() {
     n = 0;
     head = 0;
   }
-  void push(int r) {
-    if (r > 0 || r < -127) return;
+  void push(int r, uint32_t now) {
+    if (r > 0 || r < -127 || r >= RSSI_STRONG) return;  // 强样本不参与渐离
     buf[head] = (int8_t)r;
+    ts[head] = now;
     head = (uint8_t)((head + 1) % 6);
     if (n < 6) n++;
+    // 淘汰时间窗外的旧样本：熄火后样本停更，旧数据过期即失效
+    while (n > 0) {
+      uint8_t oldest = (uint8_t)((head - n + 12) % 6);
+      if ((now - ts[oldest]) <= RSSI_TREND_WINDOW_MS) break;
+      n--;
+    }
   }
   bool gradualLeave() const {
     if (n < RSSI_TREND_MIN_N) return false;
-    int s[6];
     uint8_t start = (uint8_t)((head - n + 12) % 6);
-    for (uint8_t i = 0; i < n; i++) s[i] = buf[(start + i) % 6];
-    const uint8_t k = RSSI_TREND_MIN_N;
-    const int* p = s + (n - k);
-    for (uint8_t i = 0; i + 1 < k; i++) {
-      // 只允许小幅上翘；像 -60,-80,-60 会在第二步被否决
-      if (p[i + 1] > p[i] + RSSI_TREND_TOL_DB) return false;
+    // 相邻回弹上限：停车多径锯齿（-85→-99→-83）在此否决；真开走每步变弱或小抖
+    for (uint8_t i = 0; i + 1 < n; i++) {
+      int a = buf[(start + i) % 6];
+      int b = buf[(start + i + 1) % 6];
+      if (b > a + RSSI_TREND_TOL_DB) return false;
     }
-    if (p[0] - p[k - 1] < RSSI_TREND_DROP_DB) return false;
+    // 首末落差：整体渐离幅度
+    int first = buf[start];
+    int last = buf[(start + n - 1) % 6];
+    if (first - last < RSSI_TREND_DROP_DB) return false;
+    // 时间窗双保险：整段落差必须发生在窗口内
+    if ((ts[(start + n - 1) % 6] - ts[start]) > RSSI_TREND_WINDOW_MS)
+      return false;
     return true;
   }
   void dump() const {
@@ -370,10 +385,11 @@ static void observeSignal(bool hasSignal, int rssi) {
   if (hasSignal) {
     gNoSigSince = 0;
     gEverHadSignal = true;
-    gRssiTrend.push(rssi);
+    gRssiTrend.push(rssi, now);
     if (rssi >= RSSI_STRONG) {
       gStrongAfterOpen = true;
       clearLeaveQual("回到强信号");
+      gRssiTrend.clear();  // 渐离窗口从强信号之后重算：防到达段旧弱样本污染开走判定
       return;  // 强信号不参与离场趋势
     }
     if (gRssiTrend.gradualLeave()) {
@@ -1156,6 +1172,7 @@ void setup() {
   delay(50);
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
   logShipBegin();  // 必须在 early SCL 日志前，否则 s_len=0 会冲掉
+  remoteOtaHold4k();  // 堆还干净时预留 4KB 连续块，OTA begin 前让出（防8BIT碎片）
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
   gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
@@ -1516,8 +1533,11 @@ void loop() {
             if (hasSignal && gTrueNo) {
               Serial.printf("[FSM] 真无→有 rssi=%d，发开码\n", r);
               gTrueNo = false;
-              autoOpenThenArm("真无→有");
-              phase = BlePhase::APPEARING;
+              // 首见即强直接进 STRONG：否则下轮「有→强」会重复开一次（双开）
+              // 开失败仍进 APPEARING，保留有→强作为重试
+              phase = (autoOpenThenArm("真无→有") && isStrong)
+                          ? BlePhase::STRONG
+                          : BlePhase::APPEARING;
               break;
             }
             if (shouldCloseBySignal(hasSignal, isFar)) {
@@ -1630,6 +1650,17 @@ void loop() {
             "[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d\n",
             r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
             (int)gLeaveQual, (int)clPhase);
+        // 关键变化进日志环（VPS 可回放开车离开的 RSSI 曲线）；稳态不刷环
+        static int lastShipRssi = -999;
+        static int lastShipSeen = -1;
+        if ((int)seen != lastShipSeen ||
+            (seen && abs(r - lastShipRssi) >= 5)) {
+          lastShipSeen = (int)seen;
+          lastShipRssi = seen ? r : -999;
+          logShipf("[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d",
+                   r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
+                   (int)gLeaveQual, (int)clPhase);
+        }
       }
 
       switch (clPhase) {
@@ -1637,8 +1668,11 @@ void loop() {
           if (hasSignal && gTrueNo) {
             Serial.printf("[FSM] C 真无→有 rssi=%d，发开码\n", r);
             gTrueNo = false;
-            autoOpenThenArm("经典真无→有");
-            clPhase = ClPhase::APPEARING;
+            // 首见即强（实测 -65~-78）直接进 STRONG：否则下轮「有→强」再开一次
+            // （20260927 日志每次到达都双开 RF）。开失败仍进 APPEARING 重试
+            clPhase = (autoOpenThenArm("经典真无→有") && isStrong)
+                          ? ClPhase::STRONG
+                          : ClPhase::APPEARING;
             break;
           }
           if (closeDue) {

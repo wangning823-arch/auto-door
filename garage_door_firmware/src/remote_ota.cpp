@@ -30,6 +30,19 @@ static char s_lastMsg[64] = "idle";
 static char s_httpWhy[48] = "";  // httpGetStream 最近一次失败原因
 static bool s_radioDown = false;  // BT已停+省电已关：所有退出路径需重启恢复
 
+// 开机预留的 4KB 连续 8BIT 堆：Update.begin 内部 malloc(4KB) 要的是 8BIT 池，
+// getMaxAllocHeap 报的 INTERNAL 最大块（11252）malloc 用不了——dda0 实测
+// max8=2420 → probe 必败。开机时堆干净，此时切一块放着，begin 前让出。
+static void* s_otaRes4k = nullptr;
+
+void remoteOtaHold4k() {
+  if (s_otaRes4k) return;
+  s_otaRes4k = malloc(4096);
+  logShipf("[OTA] hold4k %s free=%u max8=%u",
+           s_otaRes4k ? "ok" : "FAIL", (unsigned)ESP.getFreeHeap(),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+
 static void setMsg(const char* m) {
   strncpy(s_lastMsg, m, sizeof(s_lastMsg) - 1);
   s_lastMsg[sizeof(s_lastMsg) - 1] = 0;
@@ -485,15 +498,20 @@ static void doOta() {
         esp_task_wdt_reset();
       }
     }
-    void* probe = malloc(4096);
-    bool have4k = (probe != NULL);
-    if (probe) free(probe);
+    // 让出开机预留的 4KB 整块给 begin 的 malloc：运行久后 8BIT 池碎成
+    // max8<4KB（探针实锤 maxIn=11252 但 max8=2420），只有这块从干净堆
+    // 切出的连续内存能救。抢在 tcpip 拆分前的微秒级窗口里完成 malloc
+    if (s_otaRes4k) {
+      free(s_otaRes4k);
+      s_otaRes4k = nullptr;
+    }
     began = Update.begin(UPDATE_SIZE_UNKNOWN);
     if (t == 0) err1 = Update.getError();
     if (!began) {
+      s_otaRes4k = malloc(4096);  // 抢回留作下一轮（被吃则后续裸试）
       logShipf(
-          "[OTA] begin try=%d err=%u probe4k=%d free=%u maxIn=%u max8=%u",
-          t, (unsigned)Update.getError(), (int)have4k,
+          "[OTA] begin try=%d err=%u res4k=%d free=%u maxIn=%u max8=%u",
+          t, (unsigned)Update.getError(), (int)(s_otaRes4k != nullptr),
           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
@@ -518,6 +536,7 @@ static void doOta() {
   s_active = false;
   if (s_busyFn) s_busyFn(false);
   httpResume();
+  if (!s_otaRes4k) s_otaRes4k = malloc(4096);  // 本轮没重启 → 重新压住 4KB
   if (s_radioDown) {
     // BT 栈已在 otaAttempt 里拆除，不重启则蓝牙跟踪永久失效
     s_radioDown = false;
