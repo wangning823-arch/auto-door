@@ -6,7 +6,7 @@
 // 收到 {"cmd":"open"} 等 → 通过回调走与 TRIG 相同的 MIAO 动作
 
 using RemoteCmdFn = void (*)(const char* cmd);
-// TLS/大块分配前的堆回收（如清 BLE 广播表）
+// 大块网络分配前的堆回收（如清 BLE 广播表）
 using RemoteMemTrimFn = void (*)();
 
 void remoteCmdBegin(ConfigStore* cfg = nullptr);

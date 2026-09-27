@@ -58,6 +58,9 @@
 /**************************************************************************/
 
 #include "Adafruit_PN532.h"
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+#include <Wire.h>
+#endif
 
 byte pn532ack[] = {0x00, 0x00, 0xFF,
                    0x00, 0xFF, 0x00}; ///< ACK message from PN532
@@ -107,8 +110,12 @@ Adafruit_PN532::Adafruit_PN532(uint8_t clk, uint8_t miso, uint8_t mosi,
 /**************************************************************************/
 Adafruit_PN532::Adafruit_PN532(uint8_t irq, uint8_t reset, TwoWire *theWire)
     : _irq(irq), _reset(reset) {
-  pinMode(_irq, INPUT);
-  pinMode(_reset, OUTPUT);
+  // 0xFF/-1 表示未接线；pinMode(255) 虽被 core 拒绝，仍不要碰
+  if (_irq >= 0 && _irq < 40) pinMode(_irq, INPUT);
+  if (_reset >= 0 && _reset < 40) {
+    digitalWrite(_reset, HIGH);
+    pinMode(_reset, OUTPUT);
+  }
   i2c_dev = new Adafruit_I2CDevice(PN532_I2C_ADDRESS, theWire);
 }
 
@@ -329,16 +336,25 @@ bool Adafruit_PN532::sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
   if (i2c_dev || spi_dev) // SPI and I2C need 1ms slow for page reads
     SLOWDOWN = 1;
 
+  dbgRdTimeout = timeout;
+  dbgWireTo = Wire.getTimeOut();
+  uint32_t t0 = millis();
   // write the command
   writecommand(cmd, cmdlen);
+  uint32_t t1 = millis();
 
   // I2C TUNING
   delay(SLOWDOWN);
 
   // Wait for chip to say its ready!
   if (!waitready(timeout)) {
+    dbgWriteMs = (uint16_t)(t1 - t0);
+    dbgAckWaitMs = (uint16_t)(millis() - t1);
+    dbgAckReadMs = 0;
+    dbgRespWaitMs = 0;
     return false;
   }
+  uint32_t t2 = millis();
 
 #ifdef PN532DEBUG
   if (spi_dev == NULL) {
@@ -348,20 +364,32 @@ bool Adafruit_PN532::sendCommandCheckAck(uint8_t *cmd, uint8_t cmdlen,
 
   // read acknowledgement
   if (!readack()) {
+    dbgWriteMs = (uint16_t)(t1 - t0);
+    dbgAckWaitMs = (uint16_t)(t2 - t1);
+    dbgAckReadMs = (uint16_t)(millis() - t2);
+    dbgRespWaitMs = 0;
 #ifdef PN532DEBUG
     PN532DEBUGPRINT.println(F("No ACK frame received!"));
 #endif
     return false;
   }
+  uint32_t t3 = millis();
 
   // I2C TUNING
   delay(SLOWDOWN);
 
   // Wait for chip to say its ready!
   if (!waitready(timeout)) {
+    dbgWriteMs = (uint16_t)(t1 - t0);
+    dbgAckWaitMs = (uint16_t)(t2 - t1);
+    dbgAckReadMs = (uint16_t)(t3 - t2);
+    dbgRespWaitMs = (uint16_t)(millis() - t3);
     return false;
   }
-
+  dbgWriteMs = (uint16_t)(t1 - t0);
+  dbgAckWaitMs = (uint16_t)(t2 - t1);
+  dbgAckReadMs = (uint16_t)(t3 - t2);
+  dbgRespWaitMs = (uint16_t)(millis() - t3);
   return true; // ack'd command
 }
 
@@ -1554,10 +1582,19 @@ bool Adafruit_PN532::isready() {
     spi_dev->write_then_read(&cmd, 1, &reply, 1);
     return reply == PN532_SPI_READY;
   } else if (i2c_dev) {
-    // I2C ready check via reading RDY byte
-    uint8_t rdy[1];
-    i2c_dev->read(rdy, 1);
-    return rdy[0] == PN532_I2C_READY;
+    // 15ms 会在 InList 时钟拉伸时掐断事务，跑几小时把 PN532 锁死 SCL。
+    // 60ms：NACK 空读仍很快失败，但允许芯片正常 stretch。
+    uint8_t rdy[1] = {0};
+    bool ok = false;
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+    uint16_t oldTo = (uint16_t)Wire.getTimeOut();
+    Wire.setTimeOut(60);
+    ok = i2c_dev->read(rdy, 1);
+    Wire.setTimeOut(oldTo ? oldTo : 50);
+#else
+    ok = i2c_dev->read(rdy, 1);
+#endif
+    return ok && rdy[0] == PN532_I2C_READY;
   } else if (ser_dev) {
     // Serial ready check based on non-zero read buffer
     return (ser_dev->available() != 0);
@@ -1576,20 +1613,22 @@ bool Adafruit_PN532::isready() {
 */
 /**************************************************************************/
 bool Adafruit_PN532::waitready(uint16_t timeout) {
-  uint16_t timer = 0;
-  while (!isready()) {
-    if (timeout != 0) {
-      timer += 10;
-      if (timer > timeout) {
+  // 墙钟超时 + 先看表再 isready：原 +10ms 虚拟时钟在本板会把 200ms 拖成 1.2s
+  uint32_t start = millis();
+  for (;;) {
+    if (timeout != 0 && (millis() - start) >= timeout) {
 #ifdef PN532DEBUG
-        PN532DEBUGPRINT.println("TIMEOUT!");
+      PN532DEBUGPRINT.println("TIMEOUT!");
 #endif
-        return false;
-      }
+      return false;
     }
-    delay(10);
+    if (isready()) return true;
+    if (timeout == 0) {
+      delay(2);
+      continue;
+    }
+    delay(2);
   }
-  return true;
 }
 
 /**************************************************************************/
@@ -1813,7 +1852,16 @@ void Adafruit_PN532::writecommand(uint8_t *cmd, uint8_t cmdlen) {
 #endif
 
     if (i2c_dev) {
-      i2c_dev->write(packet, 8 + cmdlen);
+      // 与 Adafruit_I2CDevice::write 等价，但拆出 begin（锁）/end（I2C 事务）
+      uint32_t t0 = millis();
+      Wire.beginTransmission((uint8_t)PN532_I2C_ADDRESS);
+      Wire.write(packet, (size_t)(8 + cmdlen));
+      uint32_t t1 = millis();
+      dbgWrErr = Wire.endTransmission(true);
+      uint32_t t2 = millis();
+      dbgWrBeginMs = (uint16_t)(t1 - t0);
+      dbgWrEndMs = (uint16_t)(t2 - t1);
+      dbgWrOk = (dbgWrErr == 0) ? 1 : 0;
     } else {
       ser_dev->write(packet, 8 + cmdlen);
     }

@@ -16,7 +16,7 @@
   管理（HTTPS + token）：
     POST /api/login
     GET  /api/devices | /api/devices/{id} | /api/devices/{id}/logs
-    POST /api/devices/{id}/open|close|update
+    POST /api/devices/{id}/open|close|update|logs/clear
     POST /api/open|close|update          # 不带 id → 主门
     GET  /api/ota
     POST /api/ota/upload?version=        # raw firmware.bin
@@ -48,6 +48,18 @@ WEB_DIR = os.path.join(BASE_DIR, "web")
 OTA_DIR = os.path.join(BASE_DIR, "ota")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 UI_PASSWORD_FILE = os.path.join(BASE_DIR, "ui_password")
+# 历史：ota_hold 名单曾用于灰度禁自动 update。自动升级已全局关闭，
+# 名单仅作记录；升级只靠网页「立即更新」/ 显式 update 令。
+OTA_AUTO_HOLD_FILE = os.path.join(BASE_DIR, "ota_hold")
+
+# 调试期关闭网页登录（地址未公开）。上线前改回 True。
+# 也可用环境变量 GARAGE_UI_AUTH=0/1 覆盖。
+def _auth_required():
+    v = os.environ.get("GARAGE_UI_AUTH")
+    if v is not None:
+        return v not in ("0", "off", "false", "no")
+    return False
+
 
 _ui_tokens = set()
 _ui_lock = threading.Lock()
@@ -57,12 +69,15 @@ MCP_SERVER_VERSION = "0.2.0"
 MCP_PROTOCOL_DEFAULT = "2024-11-05"
 MCP_PROTOCOL_KNOWN = ("2025-03-26", "2024-11-05", "2024-10-07")
 
-PENDING_TTL_S = 8.0
+# 蓝牙 Inquiry 忙时设备可能 >6s 才 poll 一次；TTL 过短会把指令扔掉
+PENDING_TTL_S = 25.0
 UPDATE_TTL_S = 600.0
 UPDATE_NOTIFY_GAP_S = 300.0
 MIN_SET_GAP = 2.0
 ONLINE_S = 45.0  # 超过则列表显示离线
 DEFAULT_DEVICE = "default"  # 兼容旧固件 / 不带 id 的主门
+# 小爱/MCP 不传 id 时的真实主门（必须是设备 poll 的 id，不能是 legacy default）
+MAIN_DEVICE = os.environ.get("GARAGE_MAIN_DEVICE", "garage-dda0")
 
 LOG_LINES = []
 _lock = threading.Lock()
@@ -97,6 +112,8 @@ def _ui_password():
 
 
 def _check_ui_token(token):
+    if not _auth_required():
+        return True
     if not token:
         return False
     with _ui_lock:
@@ -155,10 +172,28 @@ def _expire_pending_locked(d):
     return None
 
 
+def _target_device(dev_id=None):
+    """解析指令目标：显式 id > 主门 > 在线非测试板 > legacy default。"""
+    if dev_id:
+        return dev_id
+    with _lock:
+        main = _devices.get(MAIN_DEVICE)
+        if main and _is_online(main):
+            return MAIN_DEVICE
+        for i, d in _devices.items():
+            if i in (DEFAULT_DEVICE, MAIN_DEVICE) or i.endswith("-lab"):
+                continue
+            if _is_online(d):
+                return i
+        if main:
+            return MAIN_DEVICE
+    return DEFAULT_DEVICE
+
+
 def set_pending(cmd, dev_id=None):
     if cmd == "update":
         return request_update("api", dev_id)
-    dev_id = dev_id or DEFAULT_DEVICE
+    dev_id = _target_device(dev_id)
     now = _now()
     with _lock:
         d = _device_locked(dev_id)
@@ -174,7 +209,7 @@ def set_pending(cmd, dev_id=None):
 
 
 def request_update(reason="api", dev_id=None):
-    dev_id = dev_id or DEFAULT_DEVICE
+    dev_id = _target_device(dev_id)
     now = _now()
     with _lock:
         d = _device_locked(dev_id)
@@ -190,26 +225,23 @@ def request_update(reason="api", dev_id=None):
         return True, "ok"
 
 
-def _maybe_auto_update_locked(d, device_fw):
-    if not device_fw:
-        return False
+def _ota_auto_hold_ids():
     try:
-        remote = _ota_version_info().get("version") or ""
+        with open(OTA_AUTO_HOLD_FILE, "r") as f:
+            ids = set()
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    ids.add(s)
+            return ids
     except Exception:
-        remote = ""
-    # 只升级「更旧 → 更新」；相等或本地更新都不动（防降级）
-    if not remote or device_fw == remote or device_fw >= remote:
-        return False
-    now = _now()
-    if d["update_sticky"]:
-        return False
-    if (now - d["update_notify_ts"]) < UPDATE_NOTIFY_GAP_S:
-        return False
-    d["update_sticky"] = True
-    d["update_ts"] = now
-    d["update_notify_ts"] = now
-    _log("[%s] auto update fw=%s -> %s" % (d["id"], device_fw, remote))
-    return True
+        return set()
+
+
+def _maybe_auto_update_locked(d, device_fw):
+    # 自动升级已关闭：只允许网页「立即更新」/ 显式 update 令触发，
+    # 避免板子升到用户不想升的版本。此函数保留占位，恒不触发。
+    return False
 
 
 def take_pending(dev_id=None, device_fw=None):
@@ -328,11 +360,32 @@ def _health_bits(st):
     return {"nfc": nfc_s, "web": web_s, "rf": rf_s, "sta": "ok" if (st or {}).get("sta") else "off"}
 
 
+def _stamp_device_log(text):
+    """给每行打上服务器接收时间；已带时间戳的行不重复加。"""
+    if not text or not text.strip():
+        return ""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        s = line.lstrip()
+        # 形如 2026-09-24 21:30:00 …
+        if len(s) >= 19 and s[4] == "-" and s[7] == "-" and s[10] == " " and s[13] == ":":
+            out.append(line)
+        else:
+            out.append("%s %s" % (ts, line))
+    return "\n".join(out) + "\n"
+
+
 def _append_device_log(text, dev_id=None):
     dev_id = (dev_id or DEFAULT_DEVICE).replace("/", "_").replace("..", "_")[:48]
     try:
         if not os.path.isdir(LOG_DIR):
             os.makedirs(LOG_DIR)
+        text = _stamp_device_log(text)
+        if not text:
+            return True
         day = time.strftime("%Y%m%d")
         path = os.path.join(LOG_DIR, "device-%s-%s.log" % (dev_id, day))
         # 兼容旧文件名
@@ -342,8 +395,6 @@ def _append_device_log(text, dev_id=None):
                 path = legacy
         with open(path, "a") as f:
             f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
         try:
             names = sorted(
                 n for n in os.listdir(LOG_DIR)
@@ -379,6 +430,33 @@ def _read_device_log(dev_id, day=None, lines=200):
         return "".join(all_lines[-n:])
     except Exception as e:
         return "read fail: %s\n" % e
+
+
+def _clear_device_log(dev_id):
+    """删除该设备全部历史日志文件，返回删除个数。"""
+    dev_id = (dev_id or DEFAULT_DEVICE).replace("/", "_").replace("..", "_")[:48]
+    removed = 0
+    try:
+        if not os.path.isdir(LOG_DIR):
+            return 0
+        prefix = "device-%s-" % dev_id
+        for n in os.listdir(LOG_DIR):
+            if not n.endswith(".log"):
+                continue
+            path = os.path.join(LOG_DIR, n)
+            if not os.path.isfile(path):
+                continue
+            hit = n.startswith(prefix)
+            if not hit and dev_id == DEFAULT_DEVICE:
+                body = n[len("device-"):-len(".log")]
+                hit = body.isdigit() and len(body) == 8
+            if hit:
+                os.remove(path)
+                removed += 1
+        return removed
+    except Exception as e:
+        _log("clear device log fail: %s" % e)
+        return removed
 
 
 def _ota_version_info():
@@ -467,11 +545,11 @@ def _mcp_tool_call(name, arguments):
     dev_id = (arguments or {}).get("id") or None
     if name == "open_garage":
         ok, why = set_pending("open", dev_id)
-        _log("mcp open_garage -> pending=%s (%s)" % (ok, why))
+        _log("mcp open_garage dev=%s -> pending=%s (%s)" % (_target_device(dev_id), ok, why))
         return False, ("已请求打开车库门" if ok else "指令去抖中，请稍后再试(%s)" % why)
     if name == "close_garage":
         ok, why = set_pending("close", dev_id)
-        _log("mcp close_garage -> pending=%s (%s)" % (ok, why))
+        _log("mcp close_garage dev=%s -> pending=%s (%s)" % (_target_device(dev_id), ok, why))
         return False, ("已请求关闭车库门" if ok else "指令去抖中，请稍后再试(%s)" % why)
     if name == "garage_status":
         return False, "状态: " + json.dumps(peek_state(), ensure_ascii=False)
@@ -499,7 +577,7 @@ def _mcp_handle_rpc(msg):
             "protocolVersion": proto,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION},
-            "instructions": "使用 open_garage 打开车库门。",
+            "instructions": "用 open_garage / close_garage 控制车库门；不传 id 时操作主门 garage-dda0。",
         }
         _log("mcp initialize proto=%s" % proto)
         return {"jsonrpc": "2.0", "id": mid, "result": result}
@@ -735,7 +813,7 @@ class Handler(BaseHTTPRequestHandler):
         dev_id = dev_id or self._q("id") or DEFAULT_DEVICE
         if cmd == "update":
             ok, why = request_update("api", dev_id)
-            msg = "已请求检查更新" if ok else ("已在队列中" if why == "already" else "失败")
+            msg = "已请求立即更新" if ok else ("已在队列中" if why == "already" else "失败")
         else:
             ok, why = set_pending(cmd, dev_id)
             _log("ui %s %s -> pending=%s (%s)" % (dev_id, cmd, ok, why))
@@ -764,7 +842,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 self._read_body()
             ok, why = set_pending("open", self._q("id") or None)
-            _log("xiaoai open -> pending=%s (%s)" % (ok, why))
+            _log("xiaoai open dev=%s -> pending=%s (%s)" % (_target_device(self._q("id") or None), ok, why))
             st = peek_state()
             st["result"] = "ok" if ok else why
             self._send_json(200, st)
@@ -774,7 +852,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 self._read_body()
             ok, why = set_pending("close", self._q("id") or None)
-            _log("xiaoai close -> pending=%s (%s)" % (ok, why))
+            _log("xiaoai close dev=%s -> pending=%s (%s)" % (_target_device(self._q("id") or None), ok, why))
             st = peek_state()
             st["result"] = "ok" if ok else why
             self._send_json(200, st)
@@ -837,6 +915,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # ===== 登录 / 管理 API =====
+        if path in ("/api/auth",) and method == "GET":
+            self._send_json(200, {"ok": 1, "required": _auth_required()})
+            return
+
         if path in ("/api/login",) and method == "POST":
             raw = self._read_body()
             try:
@@ -844,6 +926,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 body = {}
             pw = (body.get("password") or "").strip()
+            if not _auth_required():
+                token = uuid.uuid4().hex
+                with _ui_lock:
+                    _ui_tokens.add(token)
+                self._send_json(200, {"ok": 1, "token": token, "auth": 0})
+                return
             if pw and pw == _ui_password():
                 token = uuid.uuid4().hex
                 with _ui_lock:
@@ -867,6 +955,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._read_body()
                 self._cmd_for_device(parts[4], unquote(parts[3]))
                 return
+            # POST /api/devices/{id}/logs/clear — 清掉该设备历史日志
+            if len(parts) == 6 and parts[4] == "logs" and parts[5] == "clear":
+                self._read_body()
+                if not self._require_auth():
+                    return
+                dev_id = unquote(parts[3])
+                n = _clear_device_log(dev_id)
+                _log("[%s] device logs cleared (%d files)" % (dev_id, n))
+                self._send_json(200, {"ok": 1, "id": dev_id, "removed": n})
+                return
 
         if path in ("/api/devices",) and method == "GET":
             if not self._require_auth():
@@ -877,7 +975,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": 1, "devices": items, "ota": _ota_version_info()})
             return
 
-        if method == "GET" and path.startswith("/api/devices/"):
+        if method in ("GET", "DELETE") and path.startswith("/api/devices/"):
             parts = path.split("/")
             if len(parts) >= 4:
                 dev_id = unquote(parts[3])
@@ -896,6 +994,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if len(parts) == 5 and parts[4] == "logs":
                     if not self._require_auth():
+                        return
+                    if method == "DELETE":
+                        n = _clear_device_log(dev_id)
+                        _log("[%s] device logs cleared (%d files)" % (dev_id, n))
+                        self._send_json(200, {"ok": 1, "id": dev_id, "removed": n})
                         return
                     day = self._q("day") or time.strftime("%Y%m%d")
                     lines = self._q("lines") or "200"
@@ -918,8 +1021,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": 0, "error": "empty or too small"})
                 return
             meta = _save_ota_bin(data, version)
-            # 上传后通知：指定 id 只发一台；默认发给所有已注册设备
-            if self._q("notify") not in ("0", "false", "no"):
+            # 默认不通知设备：只保存固件，升级由网页「立即更新」手动触发
+            if self._q("notify") in ("1", "true", "yes"):
                 only = self._q("id")
                 with _lock:
                     ids = [only] if only else list(_devices.keys())

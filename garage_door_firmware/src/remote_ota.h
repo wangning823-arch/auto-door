@@ -2,8 +2,9 @@
 #include <Arduino.h>
 #include "config_store.h"
 
-// 公网 HTTP OTA：设备定时拉 version.json，版本不同则下载 firmware.bin
-// 仅在蓝牙空隙执行；写 flash 期间暂停 Inquiry/NFC（由回调通知 main）
+// 公网 HTTP OTA（仅手动/指令触发）：收到 update 令后拉 version.json，
+// 校验 sha256 通过才 set_boot；无定时自动检查。
+// 写 flash 期间暂停 Inquiry/NFC（由回调通知 main）。
 
 using OtaBusyFn = void (*)(bool active);
 

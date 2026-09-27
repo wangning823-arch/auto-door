@@ -34,13 +34,15 @@ powershell -File D:\mimo\车库门自动化\.mimocode\skills\garage-ota-release\
 1. 确认 `firmware.bin` 存在  
 2. `scp` 到 VPS `/opt/garage-gate/ota/firmware.bin`  
 3. 在 VPS 上按 **实际 bin 的 sha256** 写 `version.json`（version=FW_VERSION）  
-4. `POST /xiaoai/update` 立刻下发 `update` 令  
+4. **不自动下发** `update`（已改为手动）— 需在网页设备页点 **「立即更新」**
 
 SSH：`root@101.37.175.30`，密钥 `~/.ssh/id_ed25519`。
 
-### Step 3：等 OTA 完成
+### Step 3：网页点「立即更新」并等 OTA 完成
 
-设备约 3s 一轮 `/dev/poll`，收到 `update` 后拉固件并重启。一般 **1～2 分钟**。
+**升级只由网页「立即更新」触发**（或 `POST /api/devices/{id}/update` / `POST /xiaoai/update`）。上传固件、版本落后都不会自动升级。
+
+设备约 3s 一轮 `/dev/poll`，收到 `update` 后：停 NFC/Inquiry → 下载并写入 → 校验 sha256 → 激活重启。一般 **1～2 分钟**。
 
 看网关日志：
 
@@ -77,18 +79,20 @@ powershell -File D:\mimo\车库门自动化\.mimocode\skills\garage-ota-release\
 
 | 场景 | 做法 |
 |------|------|
-| 发布后立刻升级 | `publish_ota.ps1`（内部调 `/xiaoai/update`） |
-| 已发布、只催一次 | `curl -X POST https://door.wzx.homes/xiaoai/update` |
-| 版本号更了、等自动 | 设备 poll 带 `?fw=`，服务端比对后自动回 `update` |
-| 兜底 | 设备每天自己查一次 `/ota/version` |
+| 发布后立刻升级 | 发布 → 网页设备页点 **「立即更新」** |
+| 只催一次 | 网页「立即更新」或 `curl -X POST https://door.wzx.homes/xiaoai/update` |
+| 上传固件 | 网页「上传固件」/ `publish_ota.ps1`（只落服务器，不通知设备） |
+| 无自动升级 | 版本号更了也不会自动推；设备端无定时检查 |
 
 ## Examples
 
 用户：「改完了，发布一下 / 不用烧录 / 推给设备」  
-→ 编译 → `publish_ota.ps1` → 等 journal 出现 `cmd=update` → tail 设备日志确认 `fw=` 新版本。
+→ 编译 → `publish_ota.ps1` → 网页设备页点「**立即更新**」→ tail 设备日志确认 `fw=` 新版本。
 
 用户：「看下设备最近日志」  
-→ SSH tail `device-YYYYMMDD.log`，不要求接 USB。
+→ SSH tail `device-*.log`，不要求接 USB。
+
+**不会自动升级**：上传/发布只换服务器上的 bin；板子只在「立即更新」后才拉固件。
 
 ## Troubleshooting
 

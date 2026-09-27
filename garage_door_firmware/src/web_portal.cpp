@@ -1,8 +1,8 @@
 #include "web_portal.h"
 #include "config.h"
+#include "http_client.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ESPmDNS.h>
 #include "ble_bond.h"
 
 static WebServer server(80);
@@ -110,7 +110,7 @@ String WebPortal::pageHtml() const {
   if (!staWanted_)
     html += F("未配置（OTA 需要）");
   else if (staConnected())
-    html += staIp() + F(" · OTA: ") + host_ + F(".local");
+    html += staIp() + F(" · OTA: ") + staIp();
   else
     html += F("连接中/失败");
   html += F("</span></div><div class=\"row\"><span class=\"k\">门状态</span><span class=\"v\">");
@@ -321,13 +321,16 @@ void WebPortal::setupRoutes() {
       server.send(200, "text/html", "garage-door");
       return;
     }
-    String html =
-        F("<!DOCTYPE html><html><head><meta charset=utf-8>"
-          "<meta http-equiv=refresh content=\"0;url=http://192.168.4.1/\">"
-          "<title>GarageDoor</title></head><body>"
-          "<p>正在打开车库门配置页… <a href=http://192.168.4.1/>192.168.4.1</a></p>"
-          "</body></html>");
-    server.sendHeader("Location", "http://192.168.4.1/", true);
+    // 用请求 Host，STA 访问时不要跳去 192.168.4.1
+    String host = server.hostHeader();
+    if (!host.length()) host = WiFi.softAPIP().toString();
+    String url = "http://" + host + "/";
+    String html = String(F("<!DOCTYPE html><html><head><meta charset=utf-8>"
+                           "<meta http-equiv=refresh content=\"0;url=")) +
+                  url + F("\"><title>GarageDoor</title></head><body>"
+                          "<p>正在打开车库门配置页… <a href=") +
+                  url + ">" + host + F("</a></p></body></html>");
+    server.sendHeader("Location", url, true);
     server.send(302, "text/html", html);
   };
 
@@ -378,6 +381,7 @@ void WebPortal::setupRoutes() {
   });
 
   server.on("/rssi", HTTP_GET, []() {
+    httpSetWebBusy(true);
     String h;
     h.reserve(3200);
     h += F(
@@ -424,6 +428,7 @@ void WebPortal::setupRoutes() {
         "document.getElementById('bar').textContent='fetch error';});}"
         "tick();setInterval(tick,2000);</script></body></html>");
     server.send(200, "text/html; charset=utf-8", h);
+    httpSetWebBusy(false);
   });
 
   server.on("/", HTTP_GET, []() {
@@ -434,11 +439,31 @@ void WebPortal::setupRoutes() {
     uint32_t t0 = millis();
     Serial.printf("[WEB] GET / from %s\n",
                   server.client().remoteIP().toString().c_str());
+    // 网页优先：整个响应期间 http worker 不发 VPS（发完立即恢复）
+    httpSetWebBusy(true);
     String html = gPortal->pageHtml();
-    server.send(200, "text/html; charset=utf-8", html);
-    Serial.printf("[WEB] GET / bytes=%u gen=%ums clients=%d\n",
-                  (unsigned)html.length(), (unsigned)(millis() - t0),
-                  WiFi.softAPgetStationNum());
+    // WebServer::send 对 8KB 页面只发出响应头、正文卡死
+    // → 直接用 WiFiClient 分片写，块间 yield，避免 TCP 发送缓冲卡死
+    WiFiClient c = server.client();
+    String hdr = F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
+    hdr += String(html.length());
+    hdr += F("\r\nConnection: close\r\n\r\n");
+    c.print(hdr);
+    size_t off = 0;
+    const size_t total = html.length();
+    while (off < total) {
+      size_t n = total - off;
+      if (n > 512) n = 512;
+      size_t w = c.write((const uint8_t*)html.c_str() + off, n);
+      if (w == 0) break;
+      off += w;
+      delay(1);
+      yield();
+    }
+    c.stop();
+    httpSetWebBusy(false);
+    Serial.printf("[WEB] GET / sent=%u/%u gen=%ums\n", (unsigned)off,
+                  (unsigned)total, (unsigned)(millis() - t0));
   });
 
   server.on("/save", HTTP_GET, []() {
@@ -720,10 +745,8 @@ void WebPortal::setupRoutes() {
           "padding:24px;text-align:center'>"
           "<h2>家庭 Wi‑Fi 已保存</h2><p>SSID：<code>");
     body += ssid;
-    body += F("</code></p><p style='color:#f2c94c'>正在连接… 约几秒后刷新首页看状态。"
-              "连上后无线烧录主机名：</p><p><code>");
-    body += gPortal->host_;
-    body += F(".local</code></p>"
+    body += F("</code></p><p style='color:#2f80ed'>正在连接… 约几秒后刷新首页看状态。"
+              "连上后无线烧录用 STA IP（首页/串口 wifi status）。</p>"
               "<p><a style='color:#2f80ed' href='/'>返回设置</a></p></body>");
     server.send(200, "text/html; charset=utf-8", body);
   });
@@ -805,9 +828,11 @@ void WebPortal::setupRoutes() {
     String uri = server.uri();
     Serial.printf("[WEB] 404 %s from %s\n", uri.c_str(),
                   server.client().remoteIP().toString().c_str());
-    // 任意域名（手机连 AP 后乱跳）都导到配置页
-    server.sendHeader("Location", "http://192.168.4.1/", true);
-    server.send(302, "text/plain", "redirect http://192.168.4.1/");
+    // 跟请求 Host 走：STA(192.168.31.x) 访问时不能再跳到热点 192.168.4.1
+    String host = server.hostHeader();
+    if (!host.length()) host = WiFi.softAPIP().toString();
+    server.sendHeader("Location", "http://" + host + "/", true);
+    server.send(302, "text/plain", "redirect http://" + host + "/");
   });
 }
 
@@ -898,16 +923,8 @@ void WebPortal::startStaFromStore() {
   // （wifi: Should enable WiFi modem sleep when both WiFi and Bluetooth are enabled）
   WiFi.setSleep(true);
 
-  // mDNS：BT 已在跑时跳过（ESPmDNS+SerialBT 易崩），OTA 用 IP 即可
-  if (!mdnsOn_ && !/* placeholder */ false) {
-    // 由 main 在无 BT 或确认安全时再开；此处仅在未起 BT 时尝试
-  }
-  // 明确：STA 模式下暂不开 mDNS，避免 BT+WiFi+mDNS 三栈崩溃
-  if (!mdnsOn_) {
-    Serial.println("[WEB] skip MDNS (BT may be active); use STA IP for web/OTA");
-  }
-
-  Serial.println("[WEB] STA begin ssid=" + ssid + " hostname=" + host_ + ".local");
+  // 已去 mDNS（产品不需要，且 ESPmDNS+BT 易崩）：web/OTA 一律用 STA IP
+  Serial.println("[WEB] STA begin ssid=" + ssid);
   WiFi.begin(ssid.c_str(), pass.c_str());
   Serial.println("[WEB] WiFi.begin called");
   staTrying_ = true;
@@ -918,10 +935,6 @@ void WebPortal::stopSta() {
   staWanted_ = false;
   staTrying_ = false;
   WiFi.disconnect(false, false);
-  if (mdnsOn_) {
-    MDNS.end();
-    mdnsOn_ = false;
-  }
   if (apActive_) {
     WiFi.mode(WIFI_AP);
   } else {
@@ -952,8 +965,7 @@ void WebPortal::loopSta() {
       if (staTrying_) {
         staTrying_ = false;
         Serial.println("[WEB] STA connected ip=" + WiFi.localIP().toString() +
-                       " host=" + host_ + ".local http=" +
-                       String(serverStarted_ ? "up" : "down"));
+                       " http=" + String(serverStarted_ ? "up" : "down"));
       } else if (Serial.availableForWrite() > 160) {
         Serial.printf("[WEB] sta=up ip=%s http=%s heap=%u maxblk=%u\n",
                       WiFi.localIP().toString().c_str(),

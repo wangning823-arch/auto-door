@@ -30,22 +30,14 @@
 #endif
 
 // ===== 远程令：VPS 轮询（蓝牙空隙才访问 WiFi）=====
-// 设备侧用明文 HTTP：mbedTLS 需 ~42KB 连续堆，Classic/BLE+STA 下起不来 TLS。
+// 仅明文 HTTP：TLS 需 ~42KB 连续堆起不来，WiFiClientSecure/mbedTLS 已从固件删除。
 // nginx 只放行 location = /dev/poll 不跳转；MCP/小爱仍走 https://door.wzx.homes
 #ifndef REMOTE_POLL_URL
 #define REMOTE_POLL_URL "http://door.wzx.homes/dev/poll"
 #endif
-// HTTPS MVP：跳过证书校验（仅当 REMOTE_POLL_URL 为 https:// 时用到）
-#ifndef REMOTE_HTTP_INSECURE
-#define REMOTE_HTTP_INSECURE 1
-#endif
 // 连接/读超时（HTTP 轮询）
 #ifndef REMOTE_POLL_TIMEOUT_MS
 #define REMOTE_POLL_TIMEOUT_MS 5000
-#endif
-// 留空 = 不使用第二地址；可填 https:// 备用（内存够时才有意义）
-#ifndef REMOTE_POLL_URL_HTTP
-#define REMOTE_POLL_URL_HTTP ""
 #endif
 // ===== 日志上报 / 在线 OTA（HTTP 明文，与轮询同一 nginx 放行策略）=====
 #ifndef LOG_SHIP_URL
@@ -66,8 +58,9 @@
 #ifndef STATUS_REPORT_URL
 #define STATUS_REPORT_URL "http://door.wzx.homes/dev/status"
 #endif
+// OTA 无自动定时检查；仅 poll 收到 update 令 / 串口 ota check 时才升级
 #ifndef OTA_CHECK_INTERVAL_MS
-#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 正式每天一次；开发用 poll 的 update 令
+#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 保留宏，不再用于自动触发
 #endif
 // 轮询周期须明显小于服务端 TTL（8s），留出蓝牙空隙
 #ifndef REMOTE_POLL_INTERVAL_MS
@@ -135,6 +128,11 @@
 #ifndef PIN_NFC_SCL
 #define PIN_NFC_SCL 17
 #endif
+// PN532 IRQ（可选）：接上则事件驱动，未接则 FreeRTOS 任务轮询
+// 空闲为高（模块上拉）；固件用内部下拉探测「是否被外部拉高」
+#ifndef PIN_NFC_IRQ
+#define PIN_NFC_IRQ 4
+#endif
 
 // RF 抓包参数
 #define RF_CAPTURE_MAX_PULSES  512     // 最大记录脉冲数
@@ -199,6 +197,10 @@
 // 首见就 ≥ 此值：视为库内突变（开关蓝牙），不自动开；与 RSSI_STRONG 同为 -80
 #define RSSI_SUDDEN_STRONG    -80
 #define RSSI_FAR_CLOSE        -90     // 离场关门：≤此约走出 10m（开门时可略调 -88~-92）
+// 单次 ≤-90 只是多径凹点，须连续 N 次 far 才算离场（锯齿 -75/-90 不会触发）
+#ifndef RSSI_FAR_MIN_STREAK
+#define RSSI_FAR_MIN_STREAK 2
+#endif
 #define BLE_CLOSE_FAR_SCANS   2       // 连续 N 次 ≤ FAR 才关（防抖）
 #define BLE_SILENT_GAP_MS     8000    // 多久没匹配算「无」（原 15s，偏晚）
 #define BLE_MISS_FOR_LOST     2       // 连续 N 次未匹配算「丢」（原 3）
@@ -209,7 +211,7 @@
 #define LEAVING_CLOSE_MS      10000
 // ===== 关门：至少 3 个有效 RSSI 且单调变弱才「离开合格」=====
 // 例：-60,-70,-80 可关；-60,-80,-60 视为跳动，否决关门
-#define RSSI_TREND_MIN_N      3     // 最少样本
+#define RSSI_TREND_MIN_N      4     // 最少样本（3 点锯齿易误判，日志回放 4 点挡掉 ~97%）
 #define RSSI_TREND_DROP_DB    15    // 首末至少弱这么多 dB
 #define RSSI_TREND_TOL_DB     3     // 相邻允许的小反弹（多径）
 // 连续无信号这么久才算「真无」，之后再出现才允许无→有开（抖动 miss 不算无）
@@ -219,13 +221,36 @@
 // #define RSSI_LEAVE_SILENT_MS  35000
 
 // ===== NFC 读卡（与蓝牙共存）=====
+// I2C 超时必须短：isready 空读会 NACK，Wire 超时多长就卡多久。
+// 曾留在 1000ms → 串口反复「poll ACK 慢 1204ms」，贴卡落在黑洞里就漏刷。
+#ifndef NFC_WIRE_TIMEOUT_MS
+#define NFC_WIRE_TIMEOUT_MS 50
+#endif
 // 跟踪期不再把 poll 间隔拉到 1200ms：改「蓝牙忙时不 poll + 空窗 350ms 密扫」
 #ifndef NFC_POLL_GAP_BT_TRACK_MS
 #define NFC_POLL_GAP_BT_TRACK_MS 350
 #endif
-// readPassiveTargetID 等待：过短（80ms）贴卡易漏；固定给足窗口
+// readPassiveTargetID 单次等待（同步版在用；太短会漏卡）
 #ifndef NFC_READ_TIMEOUT_MS
 #define NFC_READ_TIMEOUT_MS 200
+#endif
+// InList 粘滞：同一条 InList 期间禁止重发/drain，保护手机 HCE ATR。
+// retries 用有限值（非 0xFF）：片上会自己结束，OTA 前才能安全 abort；
+// 0xFF 会让 InList 永不结束 → 软重启踩在半截 → PN532 拉死 SCL。
+// 0x50≈0.8s 连续寻卡，够 HCE 激活，也够 OTA 前 setRetries(0x01) 收掉。
+#ifndef NFC_INLIST_RETRIES
+#define NFC_INLIST_RETRIES 0x50
+#endif
+// 单次等待上限：没卡就继续等同一条 InList（芯片仍在寻），到点后检查总线是否还活着
+#ifndef NFC_INLIST_WAIT_MS
+#define NFC_INLIST_WAIT_MS 700
+#endif
+// 粘滞 InList 仍无 ready 超过此时长 → 打断重发，防芯片假死
+#ifndef NFC_INLIST_STUCK_MS
+#define NFC_INLIST_STUCK_MS 8000
+#endif
+#ifndef NFC_INLIST_ACK_MS
+#define NFC_INLIST_ACK_MS 100
 #endif
 // 慢 ACK 后立刻重试的间隔（卡可能还贴着）
 #ifndef NFC_SLOW_RETRY_MS
@@ -235,13 +260,13 @@
 #ifndef NFC_SLOW_STREAK_RESYNC
 #define NFC_SLOW_STREAK_RESYNC 3
 #endif
-// 连续无卡 N 次才刷新 RF 场（过勤会打出慢 ACK 死循环）
+// 连续无卡 N 次才「考虑」刷 RF 场（还须满足 NFC_FIELD_REFRESH_MS）
 #ifndef NFC_FIELD_REFRESH_POLLS
 #define NFC_FIELD_REFRESH_POLLS 30
 #endif
-// （保留宏兼容；场刷新不再按短时间触发）
+// 空闲补场最短间隔：过勤（曾约 16s）会慢 ACK→resync→deferred 假死
 #ifndef NFC_FIELD_REFRESH_MS
-#define NFC_FIELD_REFRESH_MS 30000
+#define NFC_FIELD_REFRESH_MS 300000UL
 #endif
 // 自动关码最小间隔：防 leaveQual 卡住后每 4s 连发关码堵死门机
 #ifndef AUTO_CLOSE_MIN_INTERVAL_MS

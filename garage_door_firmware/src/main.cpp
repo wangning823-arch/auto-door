@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <ArduinoOTA.h>
+#include <driver/gpio.h>
 #include "config.h"
 #include "ble_tracker.h"
 #include "door_fsm.h"
@@ -16,6 +17,7 @@
 #include "log_ship.h"
 #include "remote_ota.h"
 #include "status_report.h"
+#include "http_client.h"
 #include "device_id.h"
 
 // ===== 车库门智能控制器 P0.1 =====
@@ -35,6 +37,12 @@ static bool gOtaBegun = false;
 // OTA 写 flash 期间禁止碰 I2C/NFC（否则易把 PN532/总线拖死，升级后刷卡失效）
 static volatile bool gOtaActive = false;
 static volatile uint32_t gOtaActiveAtMs = 0;
+
+// http worker 发送前查询：蓝牙正在占射频（Inquiry/BLE 扫描）就等空隙
+static bool httpBtRadioBusy() {
+  if (!gBtStackInited) return false;
+  return gBt.inquiryBusy() || gBleScan.busy();
+}
 
 static void otaDisarm(const char* why) {
   if (!gOtaActive) return;
@@ -63,8 +71,9 @@ static void serviceOta() {
   }
   if (!gOtaBegun) {
     ArduinoOTA.setHostname(gWeb.staHostname().c_str());
+    ArduinoOTA.setMdnsEnabled(false);  // 无 mDNS，客户端用 STA IP:3232
     ArduinoOTA.onStart([]() {
-      Serial.println("[OTA] START " + String(gWeb.staHostname()) + ".local");
+      Serial.println("[OTA] START ip=" + gWeb.staIp());
       gOtaActive = true;
       gOtaActiveAtMs = millis();
       gNfc.setListen(false);
@@ -95,8 +104,7 @@ static void serviceOta() {
     ArduinoOTA.begin();
     gOtaBegun = true;
     gWeb.setOtaReady(true);
-    Serial.println("[OTA] ready host=" + gWeb.staHostname() +
-                   ".local ip=" + gWeb.staIp() + " fw=" FW_VERSION);
+    Serial.println("[OTA] ready ip=" + gWeb.staIp() + " fw=" FW_VERSION);
   }
   ArduinoOTA.handle();
 }
@@ -227,6 +235,34 @@ static bool gCloseArmed = false;
 static bool gStrongAfterOpen = false;
 static uint32_t gLastAutoCloseMs = 0;
 static bool gLeaveQual = false;
+static bool gTrueNo = true;  // 上电视为「无」，首次有信号即可开
+
+// 误触取证：最近 8 次信号观测（-127=无），离场资格/发关码时上送 VPS
+static int8_t gSigLog[8];
+static uint8_t gSigLogN = 0, gSigLogHead = 0;
+static int gLastSigRssi = -127;
+
+static void sigLogPush(int rssi) {
+  int v = rssi;
+  if (v > 127) v = 127;
+  if (v < -127) v = -127;
+  gSigLog[gSigLogHead] = (int8_t)v;
+  gSigLogHead = (uint8_t)((gSigLogHead + 1) % 8);
+  if (gSigLogN < 8) gSigLogN++;
+}
+
+static void sigLogShip(const char* tag, int rssi) {
+  char body[80];
+  size_t off = 0;
+  for (uint8_t i = 0; i < gSigLogN && off < sizeof(body) - 8; i++) {
+    uint8_t idx = (uint8_t)((gSigLogHead - gSigLogN + i + 16) % 8);
+    off += snprintf(body + off, sizeof(body) - off, "%s%d", i ? " " : "",
+                    (int)gSigLog[idx]);
+  }
+  logShipf("[FSM] sig %s rssi=%d leaveQ=%d strongAfter=%d trueNo=%d | %s",
+           tag, rssi, (int)gLeaveQual, (int)gStrongAfterOpen, (int)gTrueNo,
+           body);
+}
 
 static void clearLeaveQual(const char* why) {
   if (gLeaveQual) {
@@ -254,6 +290,8 @@ static bool autoOpenThenArm(const char* why) {
     gCloseArmed = true;
     gStrongAfterOpen = false;  // 必须再进库变强才允许离场关
     clearLeaveQual("开门重置");
+    // 与关码对称：开码也带上最近 RSSI 窗，否则 VPS 只见 RF TX 不知信号背景
+    sigLogShip("autoOpen", gLastSigRssi);
   }
   return ok;
 }
@@ -269,6 +307,7 @@ static bool tryCloseIfOpen(const char* why) {
     return false;
   }
   bool ok = autoCloseGuarded(why);
+  sigLogShip(ok ? "autoClose" : "closeSkip", gLastSigRssi);
   if (ok) {
     gLastAutoCloseMs = now;
     clearLeaveQual("已发关码");
@@ -320,12 +359,13 @@ struct RssiTrendWin {
 };
 
 static RssiTrendWin gRssiTrend;
-static bool gTrueNo = true;      // 上电视为「无」，首次有信号即可开
 static bool gEverHadSignal = false;
 static uint32_t gNoSigSince = 0; // 0=当前有信号
 
 static void observeSignal(bool hasSignal, int rssi) {
   const uint32_t now = millis();
+  sigLogPush(hasSignal ? rssi : -127);
+  gLastSigRssi = hasSignal ? rssi : -127;
   gBt.recordTs(hasSignal ? (int16_t)rssi : (int16_t)-127);
   if (hasSignal) {
     gNoSigSince = 0;
@@ -341,6 +381,7 @@ static void observeSignal(bool hasSignal, int rssi) {
         Serial.printf("[FSM] 离场趋势合格 rssi=%d（≥%d 点单调变弱） strongAfter=%d\n",
                       rssi, (int)RSSI_TREND_MIN_N, (int)gStrongAfterOpen);
         gRssiTrend.dump();
+        sigLogShip("leaveQual", rssi);
       }
       gLeaveQual = true;
     }
@@ -348,6 +389,9 @@ static void observeSignal(bool hasSignal, int rssi) {
     if (gNoSigSince == 0) gNoSigSince = now;
     if (millisReached(now, gNoSigSince + RSSI_TRUE_SILENT_MS) && !gTrueNo) {
       gTrueNo = true;
+      // 长静默=新的一次出现，旧离场资格/旧趋势作废；否则 -127→弱信号会误关
+      clearLeaveQual("真无确认");
+      gRssiTrend.clear();
       Serial.println("[FSM] 真无确认（连续无信号满，之后有信号才再开）");
     }
     if (!gStrongAfterOpen && gLeaveQual) {
@@ -356,11 +400,29 @@ static void observeSignal(bool hasSignal, int rssi) {
   }
 }
 
-// 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 信号消失/变很远
+// 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 已偏远（isFar）
+// 不看「信号消失」：进库熄火后蓝牙也会消失，那时人还在车库，关门会把人关在里面
 static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
+  // 真无后重新出现应走开门，绝不关
+  if (gTrueNo) return false;
   if (!gLeaveQual || !gStrongAfterOpen) return false;
-  if (!hasSignal || isFar) return true;
-  return false;
+  // 只凭连续偏远关；单纯消失（熄火/闪断）不关，人出车库后手动/远程关
+  return isFar;
+}
+
+// isFar 防抖：-90 凹点/跳动一次不算离场，须连续 RSSI_FAR_MIN_STREAK 次
+static uint8_t gFarStreak = 0;
+static bool debounceFar(bool hasSignal, int rssi) {
+  if (!hasSignal) {
+    gFarStreak = 0;
+    return false;
+  }
+  if (rssi <= RSSI_FAR_CLOSE) {
+    if (gFarStreak < 255) gFarStreak++;
+  } else {
+    gFarStreak = 0;
+  }
+  return gFarStreak >= RSSI_FAR_MIN_STREAK;
 }
 
 static int rfKeyIndexFromArg(const String& s) {
@@ -487,8 +549,7 @@ static void serviceBootLongPress() {
       Serial.println("[BOOT] force SoftAP ON -> " + gWeb.apSsid() +
                      " pass=" + AP_PASSWORD);
       Serial.println("[BOOT] 手机连热点后打开 http://192.168.4.1/");
-      Serial.println("[BOOT] STA ip=" + gWeb.staIp() + " ota=" +
-                     gWeb.staHostname() + ".local");
+      Serial.println("[BOOT] STA ip=" + gWeb.staIp() + " ota=ip");
     }
   } else {
     if (gForceApArmed && !gForceApHandled && (now - gBootHoldStartMs) >= 1500 &&
@@ -542,8 +603,8 @@ static void handleSerial() {
           Serial.println("[CMD] ap_ip=" + WiFi.softAPIP().toString());
         }
         Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
-                       " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
-                       ".local ota=" + String(gOtaBegun ? "on" : "off"));
+                       " ip=" + gWeb.staIp() + " name=" + gWeb.staHostname() +
+                       " ota=" + String(gOtaBegun ? "on" : "off"));
       } else if (line == "wifi off") {
         // 与网页一致：只关热点、保留 STA；BT 栈由 serviceBtStackInit 延时起
         gCfg.saveWifiEnabled(false);
@@ -600,8 +661,8 @@ static void handleSerial() {
                       WiFi.softAPmacAddress().c_str(),
                       (unsigned)ESP.getFreeHeap(), (int)gBtStackInited);
         Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
-                       " ip=" + gWeb.staIp() + " host=" + gWeb.staHostname() +
-                       ".local ota=" + String(gOtaBegun ? "on" : "off") +
+                       " ip=" + gWeb.staIp() + " name=" + gWeb.staHostname() +
+                       " ota=" + String(gOtaBegun ? "on" : "off") +
                        " rssi=" + String(gWeb.staConnected() ? WiFi.RSSI() : 0));
       } else if (line == "relay high" || line == "relay low" || line == "relay pulse") {
         int pin = gDoor.relayPin();
@@ -862,6 +923,11 @@ static void handleSerial() {
       } else if (line == "gpio17" || line == "i2cscan" || line == "i2cscan2") {
         // 推拉测试只给 gpio17：i2cscan 前不要动 SCL，否则会把 PN532 弄挂
         if (line == "gpio17") {
+          // 先停 NFC + 断开 I2C 矩阵，否则对侧任务/Wire 会把 SCL 按住，测不准
+          gNfc.setSuspended(true);
+          Wire.end();
+          gpio_reset_pin((gpio_num_t)PIN_NFC_SCL);
+          gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
           pinMode(PIN_NFC_SCL, OUTPUT);
           digitalWrite(PIN_NFC_SCL, HIGH);
           delay(2);
@@ -872,6 +938,7 @@ static void handleSerial() {
           pinMode(PIN_NFC_SCL, INPUT_PULLUP);
           delay(5);
           int released = digitalRead(PIN_NFC_SCL);
+          gNfc.setSuspended(false);
           pinMode(PIN_NFC_SDA, INPUT_PULLUP);
           delay(2);
           int sda = digitalRead(PIN_NFC_SDA);
@@ -938,13 +1005,23 @@ static void handleSerial() {
         pinMode(PIN_NFC_SCL, INPUT_PULLUP);
         Serial.printf("[BUS] buspull SDA16=%d SCL17=%d\n",
                       digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
-      } else if (line == "busfree") {
-        // 只松 Wire，不碰 PN532 命令（Error263 后 SCL 卡 0.04 时用）
+      } else if (line == "busfree" || line == "busreset") {
+        // 松 Wire + 强制脚回 GPIO：I2C 矩阵仍挂着时 SCL 会被外设按在 0
+        gNfc.setSuspended(true);
         Wire.end();
+        gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
+        gpio_reset_pin((gpio_num_t)PIN_NFC_SCL);
         pinMode(PIN_NFC_SDA, INPUT_PULLUP);
         pinMode(PIN_NFC_SCL, INPUT_PULLUP);
-        Serial.printf("[BUS] busfree Wire.end SDA16=%d SCL17=%d\n",
+        delay(5);
+        Serial.printf("[BUS] %s SDA16=%d SCL17=%d\n", line.c_str(),
                       digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
+        if (line == "busreset") {
+          delay(300);
+          Serial.printf("[BUS] after300ms SDA16=%d SCL17=%d\n",
+                        digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
+        }
+        gNfc.setSuspended(false);
       } else if (line == "nfcinit") {
         Serial.println("[CMD] nfcinit 强制重新初始化...");
         if (gNfc.forceInit()) {
@@ -955,6 +1032,7 @@ static void handleSerial() {
       } else if (line == "nfcscan") {
         Serial.println("[CMD] NFC 持续监听已开，贴卡（最多 30 秒）...");
         if (!gNfc.ok()) gNfc.forceInit();
+        gNfc.setSuspended(true);  // 避免与 nfc 任务并发摸 I2C
         gNfc.startListen(0);  // 持续
         String uid;
         uint32_t t0 = millis();
@@ -966,6 +1044,7 @@ static void handleSerial() {
           delay(20);
         }
         if (uid.length() == 0) Serial.println("[NFC] 超时未读到卡");
+        gNfc.setSuspended(false);
         Serial.printf("[NFC] scan end SCL17=%d\n",
                       digitalRead(PIN_NFC_SCL));
       } else if (line.startsWith("nfcsave ")) {
@@ -1021,14 +1100,25 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   delay(50);
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
+  logShipBegin();  // 必须在 early SCL 日志前，否则 s_len=0 会冲掉
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
+  gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
+  gpio_reset_pin((gpio_num_t)PIN_NFC_SCL);
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
   delay(2);
   Serial.printf("[BOOT] early SDA16=%d SCL17=%d t=%ums\n",
                 digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL),
                 (unsigned)millis());
+  if (!digitalRead(PIN_NFC_SCL)) {
+    // 软件尚未碰 Wire：仍为 0 则是外部（PN532/短路），不是 I2C 矩阵
+    Serial.printf("[BOOT] early SCL=0 → 脚已 gpio_reset+pullup，外部拉住 t=%ums\n",
+                  (unsigned)millis());
+    logShipf("[BOOT] early SCL=0 t=%ums", (unsigned)millis());
+  } else {
+    logShipf("[BOOT] early SCL=1 t=%ums", (unsigned)millis());
+  }
 
   gDoor.begin();
   // 尽早钳位 RF TX，避免上电到 gRf.begin 之间脚位浮空乱发
@@ -1036,21 +1126,22 @@ void setup() {
   digitalWrite(PIN_RF_TX, LOW);
   remoteCmdSetHandler(onRemoteCmd);
   remoteCmdSetMemTrim([]() { gBleScan.releaseMemory(); });
+  httpClientBegin(httpBtRadioBusy);  // 异步 HTTP 任务（loop 不再阻塞等网络）
   gCfg.begin();
   remoteCmdBegin(&gCfg);
-  logShipBegin();
+  // logShipBegin 已在 early SCL 日志前调用，此处再 begin 会清掉已入队日志
   statusReportBegin();
   remoteOtaBegin(&gCfg);
   remoteOtaSetBusyHook([](bool on) {
     gOtaActive = on;
     if (on) {
       gOtaActiveAtMs = millis();
-      gNfc.setListen(false);
+      gNfc.setSuspended(true);  // 不碰 I2C，避免 OTA 启动时卡死
       if (gBtStackInited) {
-        gBt.setInquiryPaused(true);
-        gBt.cancelActiveInquiry();
+        gBt.setInquiryPaused(true);  // 内部会 cancel discovery，非阻塞
       }
     } else {
+      gNfc.setSuspended(false);
       if (gBtStackInited) gBt.setInquiryPaused(false);
       if (gNfc.ok()) gNfc.setListen(true);
       else gNfc.kickRecover();
@@ -1130,7 +1221,19 @@ void setup() {
 
   // NFC：上电约 5s 后自动 init（原先永久 deferred，断电后刷卡会失效）
   Serial.println("[BOOT] NFC auto-init scheduled (~5s)");
-  gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL);
+  gNfc.begin(PIN_NFC_SDA, PIN_NFC_SCL, PIN_NFC_IRQ);
+  gNfc.setCardHandler([](const String& uid) {
+    const bool auth = gNfc.isAuthorized(uid);
+    if (auth) {
+      gDoor.requestManualToggle(OpenSource::NFC);
+      logShipf("[NFC] card: %s authorized → RF", uid.c_str());
+    } else if (gNfc.authUid().length() == 0) {
+      logShipf("[NFC] card: %s unregistered", uid.c_str());
+    } else {
+      logShipf("[NFC] card: %s unauthorized", uid.c_str());
+    }
+    Serial.printf("[NFC] card cb uid=%s auth=%d\n", uid.c_str(), (int)auth);
+  });
   pinMode(PIN_NFC_SDA, INPUT_PULLUP);
   pinMode(PIN_NFC_SCL, INPUT_PULLUP);
   {
@@ -1181,8 +1284,7 @@ void setup() {
     Serial.println("[BOOT] WiFi=调试模式：重新上电会自动再开热点");
 #endif
     if (gWeb.staConfigured()) {
-      Serial.println("[BOOT] 已配家庭 Wi‑Fi，将连 STA：主机 " + gWeb.staHostname() +
-                     ".local（OTA）");
+      Serial.println("[BOOT] 已配家庭 Wi‑Fi，将连 STA（OTA 用 STA IP）");
     }
   } else {
     Serial.println("[BOOT] SoftAP off (wifi_on=0) — will NOT auto-start AP again");
@@ -1213,7 +1315,8 @@ void setup() {
 }
 
 void loop() {
-  // SCL 掉压监视：边沿必打；热点调试期降低稳态心跳频率，少占串口/loop
+  // SCL/SDA 心跳：边沿必须限流。NFC 任务在 I2C 时脚位高速翻转，
+  // loop 每轮 digitalRead 都会当成「边沿」打串口 → Serial 堵死 → poll/状态 45s 离线。
   {
     static int lastSda = -1, lastScl = -1;
     static uint32_t lastBusLog = 0;
@@ -1221,12 +1324,17 @@ void loop() {
     int scl = digitalRead(PIN_NFC_SCL);
     uint32_t now = millis();
     uint32_t busPeriod = gWeb.apActive() ? 5000 : 2000;
-    if (sda != lastSda || scl != lastScl) {
-      Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d%s\n", (unsigned)now, sda,
-                    scl, (scl ? " (idle high)" : " (SCL LOW)"));
+    bool edge = (sda != lastSda || scl != lastScl);
+    if (edge) {
       lastSda = sda;
       lastScl = scl;
-      lastBusLog = now;
+      // 异常（脚被拉低）稍密；正常跳变最多 1s 一条
+      uint32_t edgeGap = (sda == 0 || scl == 0) ? 300UL : 1000UL;
+      if (now - lastBusLog >= edgeGap) {
+        Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d%s\n", (unsigned)now, sda,
+                      scl, (scl ? " (idle high)" : " (SCL LOW)"));
+        lastBusLog = now;
+      }
     } else if (now - lastBusLog >= busPeriod) {
       Serial.printf("[BUS] t=%ums SDA16=%d SCL17=%d\n", (unsigned)now, sda,
                     scl);
@@ -1254,30 +1362,17 @@ void loop() {
   // 远程令：蓝牙忙不发 HTTPS；放在 NFC 之后，避免 TLS 抢贴卡窗口
   // （见下方 NFC 块之后调用 remoteCmdService）
 
-  // ===== NFC 与 WiFi/蓝牙的共存策略 =====
-  // 射频层：NFC=13.56MHz，BT=2.4GHz，互不干扰。
-  // 软件层：PN532 poll 会阻塞 loop → Inquiry/BLE 扫描中不 poll；
-  //         扫描空窗用 350ms 密扫（原先 btTrack 固定 1200ms 导致贴卡常漏）。
+  // ===== NFC 异步：I2C 在独立任务，loop 只收事件 =====
   {
     const bool apOn = gWeb.apActive();
     const bool apClient = apOn && WiFi.softAPgetStationNum() > 0;
-    const bool nfcNeedInit = !gNfc.ok();
-    const bool btBusy = gBtStackInited && gBt.inquiryBusy();
-    const bool bleBusy = gBtStackInited && gBleScan.busy();
-    const bool btSensing = btBusy || bleBusy;
-
-    if (gOtaActive) {
-      // OTA 写 flash：完全不碰 NFC/I2C
-    } else {
+    gNfc.setSuspended(gOtaActive);
+    if (!gOtaActive) {
       static bool nfcWasQuiet = false;
       if (apClient != nfcWasQuiet) {
         nfcWasQuiet = apClient;
-        if (!apClient && !gNfc.ok()) {
-          gNfc.kickRecover();
-        }
+        if (!apClient && !gNfc.ok()) gNfc.kickRecover();
       }
-
-      // 空窗保持密扫；热点有人稍慢给网页；不再因 btTrack 拉到 1200
       if (apClient) {
         gNfc.setPollGapMs(800);
       } else if (apOn) {
@@ -1285,37 +1380,14 @@ void loop() {
       } else {
         gNfc.setPollGapMs(NFC_POLL_GAP_BT_TRACK_MS);
       }
-
-      if (gNfc.ok() && !gNfc.listen()) {
-        gNfc.setListen(true);
-      }
-
-      // 未就绪：允许 init
-      if (nfcNeedInit) {
-        String uid0;
-        gNfc.poll(uid0);
-      } else {
-        // 就绪后始终 poll：关 AP 后 Inquiry 占空比极高，
-        // 若因 btSensing 跳过 poll → 手机只弹窗、读不到 UID、不开门
-        String uid;
-        if (gNfc.poll(uid)) {
-          const bool auth = gNfc.isAuthorized(uid);
-          if (auth) {
-            gDoor.requestManualToggle(OpenSource::NFC);
-            logShipf("[NFC] card: %s authorized → RF", uid.c_str());
-          } else if (gNfc.authUid().length() == 0) {
-            logShipf("[NFC] card: %s unregistered", uid.c_str());
-          } else {
-            logShipf("[NFC] card: %s unauthorized", uid.c_str());
-          }
-        }
-      }
-      (void)btSensing;
+      if (gNfc.ok() && !gNfc.listen()) gNfc.setListen(true);
+      gNfc.service();  // 取读卡事件 → 开门回调
     }
   }
 
   // 远程令：蓝牙忙（Inquiry/BLE 扫描）绝不发 HTTP；STA 已连才轮询
   {
+    gRf.service();  // 异步 RF 发射到点后清 busy
     const bool btBusy =
         gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
     remoteCmdService(btBusy, gWeb.staConnected());
@@ -1370,9 +1442,12 @@ void loop() {
                   (millis() - gBleScan.lastMatchMs()) < BLE_SILENT_GAP_MS;
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
       bool isStrong = hasSignal && r >= RSSI_STRONG;
-      bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
+      bool isFar = false;
 
-      if (scanJustFinished) observeSignal(hasSignal, hasSignal ? r : 0);
+      if (scanJustFinished) {
+        isFar = debounceFar(hasSignal, hasSignal ? r : 0);
+        observeSignal(hasSignal, hasSignal ? r : 0);
+      }
 
       if (scanJustFinished) {
         Serial.printf(
@@ -1439,7 +1514,12 @@ void loop() {
               phase = BlePhase::WAIT_SIGNAL;
               break;
             }
-            if (hasSignal) phase = BlePhase::STRONG;
+            // 丢信号=离开中断/新的一次出现，回 WAIT 以便真无→有开门
+            if (!hasSignal) {
+              phase = BlePhase::WAIT_SIGNAL;
+              break;
+            }
+            // 弱信号保持 LEAVING，不再跳回 STRONG（否则 STRONG↔LEAVING 来回）
             break;
         }
       }
@@ -1469,14 +1549,18 @@ void loop() {
       bool seen = gBt.seenRecently(BLE_SILENT_GAP_MS);
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
       bool isStrong = hasSignal && r >= RSSI_STRONG;
-      bool isFar = hasSignal && r <= RSSI_FAR_CLOSE;
+      bool isFar = false;
       bool lost = !seen;
 
       if (!clInited || seen != clPrevSeen || (seen && abs(r - clPrevRssi) >= 3) ||
           (!seen && clPrevSeen)) {
         observeSignal(hasSignal, hasSignal ? r : 0);
+        isFar = debounceFar(hasSignal, hasSignal ? r : 0);
       }
-      if (!seen) observeSignal(false, 0);
+      if (!seen) {
+        observeSignal(false, 0);
+        isFar = debounceFar(false, 0);
+      }
 
       const bool closeDue = shouldCloseBySignal(hasSignal, isFar);
 
@@ -1550,7 +1634,10 @@ void loop() {
             clPhase = ClPhase::WAIT_SIGNAL;
             break;
           }
-          if (hasSignal) clPhase = ClPhase::STRONG;
+          if (!hasSignal) {
+            clPhase = ClPhase::WAIT_SIGNAL;
+            break;
+          }
           break;
       }
     }

@@ -33,9 +33,13 @@ class RfCapture {
   // saveFn(idx, pulseStr) 由上层写入 NVS
   bool learnKey(int idx, bool (*saveFn)(int, const char*));
 
-  // 回放：pulses 逗号串；成功 true
+  // 回放：成功=已交给 RMT 硬件（立即返回，不阻塞 loop）
   bool playRaw(const char* pulseCsv, uint8_t repeats = RF_PLAY_REPEATS);
   bool playFrame(const uint16_t* p, uint16_t n, uint8_t repeats = RF_PLAY_REPEATS);
+  // 阻塞到发完（loopback/bench 对比收发时用）
+  bool playFrameWait(const uint16_t* p, uint16_t n, uint8_t repeats = RF_PLAY_REPEATS);
+  // 主循环调用：异步发射到点后清 txBusy_
+  void service();
 
   // 槽位缓存（开机加载后 playKey 直接用）
   bool setKeyFromCsv(int idx, const char* csv);
@@ -72,9 +76,13 @@ class RfCapture {
   int txPin() const { return txPin_; }
 
  private:
+  bool ensureRmt();
+  bool playFrameSoftware(const uint16_t* p, uint16_t n, uint8_t repeats);
+
   int rxPin_ = -1;
   int txPin_ = -1;
   volatile bool txBusy_ = false;
+  uint32_t txEndAtUs_ = 0;
 
   uint16_t pulses_[RF_CAPTURE_MAX_PULSES];
   uint16_t count_ = 0;

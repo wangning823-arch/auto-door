@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$TailLogs,
     [switch]$SkipTrigger,
     [int]$TailLines = 40
@@ -43,10 +43,8 @@ Remove-Item $verPath -ErrorAction SilentlyContinue
 & ssh @sshArgs $sshHost "cat /opt/garage-gate/ota/version.json"
 
 if (-not $SkipTrigger) {
-    try {
-        $r = Invoke-WebRequest -Uri "https://door.wzx.homes/xiaoai/update" -Method POST -TimeoutSec 10
-        Write-Host $r.Content
-    } catch { Write-Host ("trigger failed: " + $_) }
+    # 默认不自动下发 update：升级只由网页「立即更新」触发
+    Write-Host "skip auto-trigger (manual only) — 在设备页点「立即更新」才会升级"
 }
 
 & ssh @sshArgs $sshHost "journalctl -u garage-gate -n 12 --no-pager"

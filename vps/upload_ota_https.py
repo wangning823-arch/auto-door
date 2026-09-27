@@ -35,7 +35,7 @@ st, txt = call("/api/login", {"password": PW})
 tok = json.loads(txt)["token"]
 print("login", st)
 
-qs = "?notify=1"
+qs = "?notify=0"
 if VER:
     qs += "&version=" + VER
 if ONLY:

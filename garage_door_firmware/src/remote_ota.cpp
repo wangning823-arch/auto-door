@@ -1,10 +1,14 @@
 #include "remote_ota.h"
 #include "config.h"
 #include "device_id.h"
+#include "http_client.h"
 #include "log_ship.h"
+#include "ble_tracker.h"
 #include <Update.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <mbedtls/sha256.h>
+#include <esp_task_wdt.h>
 
 #ifndef OTA_VERSION_URL
 #define OTA_VERSION_URL "http://door.wzx.homes/ota/version"
@@ -12,83 +16,122 @@
 #ifndef OTA_BIN_URL
 #define OTA_BIN_URL "http://door.wzx.homes/ota/firmware.bin"
 #endif
-#ifndef OTA_CHECK_INTERVAL_MS
-#define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 兜底；开发靠 poll update 令
-#endif
 #ifndef OTA_HTTP_TIMEOUT_MS
-#define OTA_HTTP_TIMEOUT_MS 8000
+#define OTA_HTTP_TIMEOUT_MS 20000
 #endif
 
 static ConfigStore* s_cfg = nullptr;
 static OtaBusyFn s_busyFn = nullptr;
-static uint32_t s_nextMs = 0;
 static bool s_force = false;
 static bool s_active = false;
 static bool s_done = false;
 static char s_lastMsg[64] = "idle";
+static char s_httpWhy[48] = "";  // httpGetStream 最近一次失败原因
+static bool s_radioDown = false;  // BT已停+省电已关：所有退出路径需重启恢复
 
 static void setMsg(const char* m) {
   strncpy(s_lastMsg, m, sizeof(s_lastMsg) - 1);
   s_lastMsg[sizeof(s_lastMsg) - 1] = 0;
 }
 
+static void sha256ToHex(const uint8_t raw[32], char out[65]) {
+  static const char* hex = "0123456789abcdef";
+  for (int i = 0; i < 32; i++) {
+    out[i * 2] = hex[(raw[i] >> 4) & 0xF];
+    out[i * 2 + 1] = hex[raw[i] & 0xF];
+  }
+  out[64] = 0;
+}
+
 void remoteOtaBegin(ConfigStore* cfg) {
   s_cfg = cfg;
-  // 上电 90s 后才查，避开 DHCP/BT 初始化
-  s_nextMs = millis() + 90000UL;
   s_force = false;
   s_done = false;
-  logShipf("[OTA] remote check every %umin url=%s",
-           (unsigned)(OTA_CHECK_INTERVAL_MS / 60000UL), OTA_VERSION_URL);
+  s_active = false;
+  logShipf("[OTA] manual-only (no auto check) url=%s", OTA_VERSION_URL);
 }
 
 void remoteOtaSetBusyHook(OtaBusyFn fn) { s_busyFn = fn; }
+
 void remoteOtaCheckNow() {
   s_force = true;
-  s_nextMs = 0;
+  s_done = false;  // 手动 update 必须能再查
 }
+
 bool remoteOtaActive() { return s_active; }
 const char* remoteOtaLastMsg() { return s_lastMsg; }
 
+static void setHttpWhy(const char* why) {
+  strncpy(s_httpWhy, why, sizeof(s_httpWhy) - 1);
+  s_httpWhy[sizeof(s_httpWhy) - 1] = 0;
+}
+
 static bool httpGetStream(const String& host, uint16_t port, const String& path,
                           WiFiClient* client, long* contentLen) {
+  setHttpWhy("");
   IPAddress addr;
-  if (!WiFi.hostByName(host.c_str(), addr)) return false;
-  if (!client->connect(addr, port, OTA_HTTP_TIMEOUT_MS)) return false;
+  if (!WiFi.hostByName(host.c_str(), addr)) {
+    setHttpWhy("dns fail");
+    return false;
+  }
+  if (!client->connect(addr, port, OTA_HTTP_TIMEOUT_MS)) {
+    setHttpWhy("connect fail");
+    return false;
+  }
+  client->setTimeout(30000);  // 大固件读包慢，别被默认超时掐断
   String req;
   req.reserve(128);
+  // HTTP/1.0：避免 chunked；无 Content-Length 时也能按连接关闭读完
   req += "GET ";
   req += path;
-  req += " HTTP/1.1\r\nHost: ";
+  req += " HTTP/1.0\r\nHost: ";
   req += host;
   req += "\r\nUser-Agent: garage-esp32\r\nConnection: close\r\n\r\n";
   if (client->print(req) != (int)req.length()) {
     client->stop();
+    setHttpWhy("req send fail");
     return false;
   }
-  // 读响应头
   uint32_t start = millis();
   String head;
+  // 逐字节读是刻意的：块读会把 \r\n\r\n 之后的 body 开头一并吞进 head
+  // （version JSON / bin 正文前缀），调用方从 socket 再读就缺了一段
   while (client->connected() || client->available()) {
     if (millis() - start > OTA_HTTP_TIMEOUT_MS) break;
     while (client->available()) {
       char c = (char)client->read();
       head += c;
       if (head.indexOf("\r\n\r\n") >= 0) break;
+      if (head.length() > 2048) {
+        client->stop();
+        setHttpWhy("hdr too long");
+        return false;
+      }
     }
     if (head.indexOf("\r\n\r\n") >= 0) break;
     delay(1);
+    esp_task_wdt_reset();  // header 等待最长 20s，必须喂狗
   }
   int hdrEnd = head.indexOf("\r\n\r\n");
   if (hdrEnd < 0) {
+    bool still = client->connected();
     client->stop();
+    setHttpWhy(still ? "hdr timeout" : "conn closed before hdr");
     return false;
   }
   String header = head.substring(0, hdrEnd);
   int sp1 = header.indexOf(' ');
   int sp2 = header.indexOf(' ', sp1 + 1);
-  if (sp1 < 0 || sp2 < 0) return false;
-  if (header.substring(sp1 + 1, sp2).toInt() != 200) {
+  if (sp1 < 0 || sp2 < 0) {
+    setHttpWhy("bad status line");
+    client->stop();
+    return false;
+  }
+  int code = header.substring(sp1 + 1, sp2).toInt();
+  if (code != 200) {
+    char w[24];
+    snprintf(w, sizeof(w), "http %d", code);
+    setHttpWhy(w);
     client->stop();
     return false;
   }
@@ -98,8 +141,28 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
   if (cl >= 0) {
     *contentLen = header.substring(cl + 15).toInt();
   }
-  // 头后残留 body 仍在 socket 里，交给调用方继续 read
   return true;
+}
+
+// 带重试的流式 GET：header 阶段偶发超时（BT/PS 抖动）时多试几次
+static bool fetchWithRetry(const String& host, uint16_t port,
+                           const String& path, WiFiClient* client, long* clen,
+                           int tries, const char* tag) {
+  for (int i = 0; i < tries; i++) {
+    if (httpGetStream(host, port, path, client, clen)) return true;
+    logShipf("[OTA] %s fetch fail try=%d/%d why=%s", tag, i + 1, tries,
+             s_httpWhy[0] ? s_httpWhy : "?");
+    logShipFlushNow();
+    client->stop();
+    if (i + 1 < tries) {
+      uint32_t t0 = millis();
+      while (millis() - t0 < 400) {
+        delay(1);
+        esp_task_wdt_reset();
+      }
+    }
+  }
+  return false;
 }
 
 static bool parseJsonStr(const String& body, const char* key, String* out) {
@@ -124,40 +187,43 @@ static String withId(const String& path) {
   return p;
 }
 
-static void doOta() {
-  s_force = false;
-  if (s_active || s_done) return;
-
-  String host = "door.wzx.homes";
-  uint16_t port = 80;
-  String vpath = "/ota/version";
-  {
-    String url = OTA_VERSION_URL;
-    if (url.startsWith("http://")) {
-      String rest = url.substring(7);
-      int slash = rest.indexOf('/');
-      String hp = slash >= 0 ? rest.substring(0, slash) : rest;
-      vpath = slash >= 0 ? rest.substring(slash) : String("/ota/version");
-      int c = hp.indexOf(':');
-      if (c >= 0) {
-        host = hp.substring(0, c);
-        port = (uint16_t)atoi(hp.substring(c + 1).c_str());
-      } else {
-        host = hp;
-      }
-    }
+static void parseHttpUrl(const String& url, String* host, uint16_t* port,
+                         String* path, const char* defaultPath) {
+  *host = "door.wzx.homes";
+  *port = 80;
+  *path = defaultPath;
+  if (!url.startsWith("http://")) return;
+  String rest = url.substring(7);
+  int slash = rest.indexOf('/');
+  String hp = slash >= 0 ? rest.substring(0, slash) : rest;
+  *path = slash >= 0 ? rest.substring(slash) : String(defaultPath);
+  int c = hp.indexOf(':');
+  if (c >= 0) {
+    *host = hp.substring(0, c);
+    *port = (uint16_t)atoi(hp.substring(c + 1).c_str());
+  } else {
+    *host = hp;
   }
+}
+
+// 完整性不过就 abort，绝不 set_boot。停 NFC/BT 由 s_busyFn 完成（见 doOta 包装）。
+// 成功路径不返回（ESP.restart）；其余情况返回，由 doOta 统一恢复现场。
+static void otaAttempt() {
+  String host, vpath, bpathUrl = OTA_BIN_URL;
+  uint16_t port = 80;
+  parseHttpUrl(OTA_VERSION_URL, &host, &port, &vpath, "/ota/version");
   vpath = withId(vpath);
 
   WiFiClient client;
   long clen = -1;
-  if (!httpGetStream(host, port, vpath, &client, &clen)) {
+  if (!fetchWithRetry(host, port, vpath, &client, &clen, 2, "version")) {
     setMsg("version fetch fail");
-    logShipf("[OTA] version fetch fail id=%s", deviceId().c_str());
+    logShipf("[OTA] version fetch fail id=%s why=%s", deviceId().c_str(),
+             s_httpWhy[0] ? s_httpWhy : "?");
     return;
   }
   String body;
-  body.reserve(256);
+  body.reserve(512);
   uint32_t start = millis();
   while (client.connected() || client.available()) {
     if (millis() - start > 2000) break;
@@ -167,105 +233,272 @@ static void doOta() {
   }
   client.stop();
 
-  String remoteVer;
+  String remoteVer, remoteSha;
   if (!parseJsonStr(body, "version", &remoteVer)) {
     setMsg("no version");
     logShipf("[OTA] version.json missing version");
     return;
   }
+  remoteVer.trim();
+  parseJsonStr(body, "sha256", &remoteSha);
+  remoteSha.trim();
+  remoteSha.toLowerCase();
   if (remoteVer == FW_VERSION) {
     setMsg("up to date");
+    s_done = true;
     logShipf("[OTA] up to date %s", FW_VERSION);
     return;
   }
-  logShipf("[OTA] new %s -> %s id=%s", FW_VERSION, remoteVer.c_str(),
+  logShipf("[OTA] new %s -> %s sha=%s id=%s", FW_VERSION, remoteVer.c_str(),
+           remoteSha.length() ? remoteSha.substring(0, 12).c_str() : "-",
            deviceId().c_str());
 
-  s_active = true;
-  if (s_busyFn) s_busyFn(true);
-
-  long fsize = -1;
-  String bpath = withId("/ota/firmware.bin");
-  if (!httpGetStream(host, port, bpath, &client, &fsize) || fsize <= 0) {
-    s_active = false;
-    if (s_busyFn) s_busyFn(false);
-    setMsg("bin fetch fail");
-    logShipf("[OTA] bin fetch fail id=%s", deviceId().c_str());
-    return;
+  // 版本确有更新，才动射频：先停 BT 再关省电（BT 开着关省电 → wifi 断言
+  // abort 必崩）。关掉省电后 AP 不再小缓冲排队，大流下行不再溢出丢包。
+  // BT 栈已拆，之后任何退出路径都靠 ESP.restart 恢复（doOta 收尾处理）
+  bool btDown = btRadioPowerDown();
+  if (btDown) {
+    WiFi.setSleep(false);
+    s_radioDown = true;
   }
-  logShipf("[OTA] bin ok size=%ld maxblk=%u", fsize,
-           (unsigned)ESP.getMaxAllocHeap());
-
-  if (!Update.begin(fsize > 0 ? (size_t)fsize : UPDATE_SIZE_UNKNOWN)) {
-    client.stop();
-    s_active = false;
-    if (s_busyFn) s_busyFn(false);
-    setMsg("update begin fail");
-    logShipf("[OTA] Update.begin fail err=%s maxblk=%u", Update.errorString(),
-             (unsigned)ESP.getMaxAllocHeap());
-    return;
+  logShipf("[OTA] radio btStop=%d sleep=%d", (int)btDown,
+           (int)WiFi.getSleep());
+  // BT 下电会引发 WiFi 射频重配，刚断开的 socket 全部作废：等链路稳定
+  // 再开下载连接，否则下到一半 read 出错 → partial
+  {
+    uint32_t tw = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - tw < 8000) {
+      delay(100);
+      esp_task_wdt_reset();
+    }
+    delay(1500);
+    esp_task_wdt_reset();
+    logShipf("[OTA] wifi settle st=%d rssi=%d", (int)WiFi.status(),
+             (int)WiFi.RSSI());
   }
 
-  uint8_t buf[1024];
-  size_t written = 0;
-  start = millis();
-  while ((client.connected() || client.available()) &&
-         (fsize < 0 || (long)written < fsize)) {
-    if (millis() - start > 120000UL) break;
-    int n = client.available();
-    if (n <= 0) {
-      delay(1);
+  // 下载+校验+激活整段最多 3 轮：BT 下电瞬断、链路抖动都可能断流
+  for (int round = 1; round <= 3; round++) {
+    if (round > 1) {
+      logShipf("[OTA] dl retry round=%d/3", round);
+      delay(2000);
+      esp_task_wdt_reset();
+      Update.abort();
+      disableLoopWDT();
+      bool again = Update.begin(UPDATE_SIZE_UNKNOWN);
+      enableLoopWDT();
+      if (!again) {
+        logShipf("[OTA] retry begin fail heap=%u maxblk=%u",
+                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+        break;
+      }
+    }
+
+    long fsize = -1;
+    String bpath;
+    parseHttpUrl(bpathUrl, &host, &port, &bpath, "/ota/firmware.bin");
+    bpath = withId(bpath);
+    if (!fetchWithRetry(host, port, bpath, &client, &fsize, 3, "bin") ||
+        fsize == 0) {
+      Update.abort();
+      setMsg("bin fetch fail");
+      logShipf("[OTA] bin fetch fail round=%d why=%s fsize=%ld", round,
+               s_httpWhy[0] ? s_httpWhy : "?", fsize);
       continue;
     }
-    if (n > (int)sizeof(buf)) n = sizeof(buf);
-    int r = client.read(buf, n);
-    if (r <= 0) break;
-    if (Update.write(buf, (size_t)r) != (size_t)r) {
-      Update.abort();
-      client.stop();
-      s_active = false;
-      if (s_busyFn) s_busyFn(false);
-      setMsg("write fail");
-      logShipf("[OTA] write fail at %u err=%s", (unsigned)written,
-               Update.errorString());
-      return;
-    }
-    written += (size_t)r;
-    start = millis();
-    // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
-    yield();
-    if ((written & 0x7FFF) == 0) {
-      logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
-    }
-  }
-  client.stop();
+    logShipf("[OTA] bin ok size=%ld round=%d heap=%u maxblk=%u rssi=%d sleep=%d",
+             fsize, round, (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.RSSI(),
+             (int)WiFi.getSleep());
 
-  if (!Update.end(true)) {
-    s_active = false;
-    if (s_busyFn) s_busyFn(false);
-    setMsg("end fail");
-    logShipf("[OTA] Update.end fail err=%s", Update.errorString());
-    return;
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+    mbedtls_sha256_starts(&sha, 0);
+#else
+    mbedtls_sha256_starts_ret(&sha, 0);
+#endif
+
+    uint8_t buf[1024];
+    size_t written = 0;
+    size_t nextLogAt = 0x20000;
+    uint32_t dlStart = millis();
+    uint32_t lastReport = millis();
+    bool writeAborted = false;
+    while ((client.connected() || client.available()) &&
+           (fsize < 0 || (long)written < fsize)) {
+      if (millis() - dlStart > 120000UL) break;
+      int n = client.available();
+      if (n <= 0) {
+        delay(1);
+        esp_task_wdt_reset();
+        // 停滞每 5s 直推一条到 VPS：远程就能看到"卡在哪、信号/睡眠状态"
+        if (millis() - lastReport >= 5000) {
+          logShipf(
+              "[OTA] stall %u/%ld for=%ums t=%u avail=%d conn=%d rssi=%d "
+              "sleep=%d heap=%u",
+              (unsigned)written, fsize, (unsigned)(millis() - dlStart),
+              (unsigned)millis(), client.available(), (int)client.connected(),
+              (int)WiFi.RSSI(), (int)WiFi.getSleep(),
+              (unsigned)ESP.getFreeHeap());
+          // 下载期间严禁同步 flush：flush 的 WiFiClient::stop() 是不关 fd 的
+          // 空壳，高频 flush 泄漏 socket，与下载连接在 lwIP 冲突 → 设备侧
+          // FIN 断连（实测每次 flush 后 <1s 断；注释后一次跑完全程）。
+          // 日志只入环，下载结束/重启前统一 flush
+          // logShipFlushNow();
+          lastReport = millis();
+        }
+        continue;
+      }
+      if (n > (int)sizeof(buf)) n = sizeof(buf);
+      int r = client.read(buf, n);
+      if (r <= 0) break;
+      if (Update.write(buf, (size_t)r) != (size_t)r) {
+        Update.abort();
+        mbedtls_sha256_free(&sha);
+        client.stop();
+        setMsg("write fail");
+        logShipf("[OTA] write fail at %u round=%d err=%s", (unsigned)written,
+                 round, Update.errorString());
+        writeAborted = true;
+        break;
+      }
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+      mbedtls_sha256_update(&sha, buf, (size_t)r);
+#else
+      mbedtls_sha256_update_ret(&sha, buf, (size_t)r);
+#endif
+      written += (size_t)r;
+      dlStart = millis();
+      // 1.9MB 边下边写会堵死 loop → 看门狗复位；必须让出
+      yield();
+      delay(0);
+      esp_task_wdt_reset();
+      if (written >= nextLogAt && fsize > 0) {
+        logShipf("[OTA] write %u/%ld", (unsigned)written, fsize);
+        nextLogAt += 0x20000;
+        // 下载中 flush 会断连（见 stall 分支注释），只入环
+        // logShipFlushNow();
+        lastReport = millis();
+      } else if (millis() - lastReport >= 10000) {
+        logShipf("[OTA] dl %u/%ld", (unsigned)written, fsize);
+        // logShipFlushNow();  // 同上：下载中禁 flush
+        lastReport = millis();
+      }
+    }
+    client.stop();
+    if (writeAborted) continue;
+
+    if (fsize > 0 && (long)written < fsize) {
+      Update.abort();
+      mbedtls_sha256_free(&sha);
+      setMsg("partial write");
+      logShipf("[OTA] partial %u/%ld round=%d → retry", (unsigned)written,
+               fsize, round);
+      continue;
+    }
+
+    uint8_t raw[32];
+    char hex[65];
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 3)
+    mbedtls_sha256_finish(&sha, raw);
+#else
+    mbedtls_sha256_finish_ret(&sha, raw);
+#endif
+    mbedtls_sha256_free(&sha);
+    sha256ToHex(raw, hex);
+
+    if (remoteSha.length() == 64 && strcmp(hex, remoteSha.c_str()) != 0) {
+      Update.abort();
+      setMsg("sha mismatch");
+      logShipf("[OTA] sha mismatch got=%s want=%s wrote=%u", hex,
+               remoteSha.c_str(), (unsigned)written);
+      continue;
+    }
+
+    disableLoopWDT();
+    bool ended = Update.end(true);
+    enableLoopWDT();
+    if (!ended) {
+      setMsg("end fail");
+      logShipf("[OTA] Update.end fail err=%s wrote=%u/%ld round=%d sha=%s",
+               Update.errorString(), (unsigned)written, fsize, round, hex);
+      continue;
+    }
+    setMsg("rebooting");
+    logShipf("[OTA] OK bytes=%u sha=%s id=%s -> reboot", (unsigned)written,
+             hex, deviceId().c_str());
+    // 真正 POST 出去再重启，否则日志全丢
+    logShipFlushNow();
+    if (s_busyFn) s_busyFn(true);
+    delay(300);
+    ESP.restart();
   }
-  setMsg("rebooting");
-  logShipf("[OTA] OK bytes=%u id=%s -> reboot", (unsigned)written,
-           deviceId().c_str());
-  logShipFlushNow();
-  delay(300);
-  ESP.restart();
+  logShipf("[OTA] 3 rounds failed -> give up");
 }
 
+static void doOta() {
+  s_force = false;
+  if (s_active || s_done) return;
+  s_active = true;
+  // 取版本之前就让路：header 阶段同样会被 Inquiry/BLE 掐（8s 超时来源）
+  if (s_busyFn) s_busyFn(true);
+  // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来
+  bool httpIdle = httpPause(4000);
+  logShipf("[OTA] begin idle=%d heap=%u maxblk=%u sleep=%d rssi=%d",
+           (int)httpIdle, (unsigned)ESP.getFreeHeap(),
+           (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.getSleep(),
+           (int)WiFi.RSSI());
+  // 此刻网络还正常：预解析日志服务器 IP，下载停滞期的实时日志走 IP 直连
+  // （停滞时 DNS 可阻塞 >5s → loopTask TWT 崩溃）
+  logShipResolve();
+
+  // Update.begin 必须在任何 HTTP 连接（含 version fetch）之前：短连接的
+  // netconn/pbuf 会把最大连续块切到 4KB 以下 → begin 内部 malloc(4KB) 必失败
+  //（err=0，malloc 失败路径不设 error）。失败/已最新由 otaAttempt 里 abort。
+  Update.abort();
+  disableLoopWDT();
+  bool began = Update.begin(UPDATE_SIZE_UNKNOWN);
+  uint8_t err1 = Update.getError();  // 第一次的真实错误（abort 会覆盖）
+  if (!began) {
+    Update.abort();
+    began = Update.begin(UPDATE_SIZE_UNKNOWN);
+  }
+  enableLoopWDT();
+  if (!began) {
+    setMsg("update begin fail");
+    logShipf("[OTA] Update.begin fail err1=%u err2=%u heap=%u maxblk=%u",
+             (unsigned)err1, (unsigned)Update.getError(),
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    httpResume();
+    return;
+  }
+
+  otaAttempt();
+  // 失败/已最新 → 恢复 NFC/Inquiry、省电、放行 http、允许下次触发
+  //（成功路径不返回：ESP.restart）
+  Update.abort();
+  WiFi.setSleep(true);
+  s_active = false;
+  if (s_busyFn) s_busyFn(false);
+  httpResume();
+  if (s_radioDown) {
+    // BT 栈已在 otaAttempt 里拆除，不重启则蓝牙跟踪永久失效
+    s_radioDown = false;
+    logShipf("[OTA] bt down -> reboot to restore");
+    logShipFlushNow();
+    delay(300);
+    ESP.restart();
+  }
+}
+
+// 仅手动/指令触发：无定时自动检查，防止升到不想升的版本
 void remoteOtaService(bool btBusy, bool wifiOk) {
   if (s_active || s_done || !wifiOk) return;
-  const uint32_t now = millis();
-  if (!s_force && (int32_t)(now - s_nextMs) < 0) return;
-  // 蓝牙忙不写 flash；但 update 令/到点检查等太久则插队（否则 Inquiry 几乎常亮会饿死 OTA）
-  static uint32_t s_waitMs = 0;
-  if (btBusy && !s_force) {
-    if (!s_waitMs) s_waitMs = now;
-    if ((now - s_waitMs) < 15000UL) return;
-  }
-  s_waitMs = 0;
-  s_nextMs = millis() + OTA_CHECK_INTERVAL_MS;
+  if (!s_force) return;
+  // update 令必须能插队，不因 Inquiry 一直饿死
+  (void)btBusy;
   doOta();
 }
