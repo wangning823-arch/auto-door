@@ -159,7 +159,14 @@ void logShipResolve() {
   if (WiFi.status() != WL_CONNECTED) return;
   IPAddress addr;
   esp_task_wdt_reset();
-  if (WiFi.hostByName(LOG_SHIP_HOST, addr)) {
+  // hostByName 内部有界（IDLE 16s + DONE 15s），但 loopTask 看门狗 5s 就咬：
+  // OTA/flush 入口的这次解析一卡过 5s 就 TWT 复位（dda0 实测两次 OTA 均死于此
+  // 类路径）。解析期间撤监控，结束立刻补喂。
+  disableLoopWDT();
+  bool ok = WiFi.hostByName(LOG_SHIP_HOST, addr);
+  enableLoopWDT();
+  esp_task_wdt_reset();
+  if (ok) {
     s_shipIp = addr;
     s_shipIpOk = true;
     Serial.printf("[LOGSHIP] resolve %s -> %s\n", LOG_SHIP_HOST,
@@ -168,7 +175,6 @@ void logShipResolve() {
     s_shipIpOk = false;
     Serial.printf("[LOGSHIP] resolve failed host=%s\n", LOG_SHIP_HOST);
   }
-  esp_task_wdt_reset();
 }
 
 // 同步刷出（OTA 重启前专用）：worker 可能还有在飞，重复发一遍无害（幂等追加）

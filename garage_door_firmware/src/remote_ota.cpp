@@ -70,15 +70,6 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
                           WiFiClient* client, long* contentLen) {
   setHttpWhy("");
   IPAddress addr;
-  if (!WiFi.hostByName(host.c_str(), addr)) {
-    setHttpWhy("dns fail");
-    return false;
-  }
-  if (!client->connect(addr, port, OTA_HTTP_TIMEOUT_MS)) {
-    setHttpWhy("connect fail");
-    return false;
-  }
-  client->setTimeout(30000);  // 大固件读包慢，别被默认超时掐断
   String req;
   req.reserve(128);
   // HTTP/1.0：避免 chunked；无 Content-Length 时也能按连接关闭读完
@@ -87,7 +78,29 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
   req += " HTTP/1.0\r\nHost: ";
   req += host;
   req += "\r\nUser-Agent: garage-esp32\r\nConnection: close\r\n\r\n";
-  if (client->print(req) != (int)req.length()) {
+
+  // DNS/connect/send 在 loop 里最坏 31s+20s+10s，而 loopTask 看门狗 5s 就咬：
+  // 实测 dda0 两次 OTA 均死在起步（nginx 连 /ota/version 都没收到、随后 BOOT
+  // 复位）。三者内部都有秒级上界，期间撤监控、结束后立刻补喂。
+  disableLoopWDT();
+  bool dnsOk = WiFi.hostByName(host.c_str(), addr);
+  bool conn = dnsOk && client->connect(addr, port, (int32_t)OTA_HTTP_TIMEOUT_MS);
+  size_t sent = 0;
+  if (conn) {
+    client->setTimeout(30000);  // 大固件读包慢，别被默认超时掐断
+    sent = client->print(req);
+  }
+  enableLoopWDT();
+  esp_task_wdt_reset();
+  if (!dnsOk) {
+    setHttpWhy("dns fail");
+    return false;
+  }
+  if (!conn) {
+    setHttpWhy("connect fail");
+    return false;
+  }
+  if (sent != (size_t)req.length()) {
     client->stop();
     setHttpWhy("req send fail");
     return false;
