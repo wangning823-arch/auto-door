@@ -13,7 +13,7 @@ struct StatusBits {
   bool nfcDeferred = false;
   bool nfcAbsent = false;
   bool nfcListen = true;
-  bool webUp = true;
+  bool webUp = true;   // 本地网页开关状态（VPS 控制台接管后=web_ui）
   bool sta = false;
   bool ap = false;
   bool rfOpen = false;
@@ -21,11 +21,22 @@ struct StatusBits {
   bool rfTxBusy = false;
   bool remoteOn = false;
   int door = 0;
-  int rssi = 0;
+  int rssi = 0;        // WiFi RSSI
   uint32_t heap = 0;
   uint32_t maxblk = 0;
   uint32_t uptimeMs = 0;
   const char* role = "door";
+  // ===== VPS 控制台展示/配置回显（替代本地网页）=====
+  char staIp[20] = "";
+  char mac[24] = "";
+  char bleLab[32] = "";
+  int trackMode = 0;     // 0=BLE 1=经典
+  bool autoTrack = false;
+  bool pairOpen = false;
+  bool pairHasPin = false;
+  int bleRssi = -127;    // 已配对手机（BLE 模式）
+  int carRssi = -127;    // 车机（经典模式）
+  int trend = 0;         // SignalTrend
 };
 
 void statusReportSetBits(const StatusBits& b);

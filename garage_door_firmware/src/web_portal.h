@@ -9,6 +9,9 @@
 #include "config.h"
 #include "nfc_reader.h"
 
+// 分片直写器（实现在 web_portal.cpp）：首页边生成边发，不在碎片堆上整体拼 String
+struct PageW;
+
 // SoftAP + 手机网页：设置车机蓝牙 MAC / BLE 特征 / 查看状态 / 手动开关
 class WebPortal {
  public:
@@ -41,6 +44,11 @@ class WebPortal {
   void setOtaReady(bool on) { otaReady_ = on; }
   bool otaReady() const { return otaReady_; }
 
+  // 本地网页 80 端口开关（配置迁 VPS 控制台后远程 web off 下线；不写 NVS，
+  // 由调用方 saveWebUi；startAp 恢复路径不受限——救砖入口永远可用）
+  void setUiEnabled(bool on);
+  bool uiEnabled() const { return uiEnabled_; }
+
   // 跟踪模式：0=BLE, 1=Classic
   int trackMode() const { return trackMode_; }
   void setTrackMode(int mode);
@@ -53,7 +61,11 @@ class WebPortal {
 
  private:
   void setupRoutes();
-  String pageHtml() const;
+  // 流式输出首页：全程只用栈上小缓冲，避免碎片堆(maxblk≈11KB)上拼 3~9KB 大 String
+  void pageHtml(PageW& w) const;
+  // 网页重响应期间暂停蓝牙 inquiry（复用 OTA 让路模式），发完恢复
+  void webPauseBt();
+  void webResumeBt();
 
   ConfigStore* store_ = nullptr;
   BleTracker* bt_ = nullptr;
@@ -65,6 +77,7 @@ class WebPortal {
   bool apActive_ = false;
   bool stopApPending_ = false;
   bool serverStarted_ = false;
+  bool uiEnabled_ = true;  // 本地网页开关（NVS web_ui）
   int trackMode_ = TRACK_MODE_DEFAULT;
   // 跟踪模式切换后延时重启：运行中无法卸载已起的 BT 栈，重启才能真正二选一
   bool modeRebootPending_ = false;

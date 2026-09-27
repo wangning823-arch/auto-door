@@ -151,3 +151,13 @@ bool ConfigStore::saveAutoTrack(bool on) {
   if (!ready_) return false;
   return prefs.putBool("auto_trk", on);
 }
+
+bool ConfigStore::loadWebUi(bool defaultOn) {
+  if (!ready_) return defaultOn;
+  return prefs.getBool("web_ui", defaultOn);
+}
+
+bool ConfigStore::saveWebUi(bool on) {
+  if (!ready_) return false;
+  return prefs.putBool("web_ui", on);
+}

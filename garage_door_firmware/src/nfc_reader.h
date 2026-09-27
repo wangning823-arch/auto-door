@@ -31,6 +31,7 @@ class NfcReader {
   // 是否探测到 IRQ 线
   bool irqWired() const { return irqWired_; }
   bool asyncRunning() const { return task_ != nullptr; }
+  TaskHandle_t taskHandle() const { return task_; }
 
   void setAuthUid(const String& uid) { authUid_ = uid; }
   String authUid() const { return authUid_; }

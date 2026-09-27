@@ -162,6 +162,8 @@ static void httpWorker(void*) {
   }
 }
 
+static TaskHandle_t s_workerTask = nullptr;
+
 void httpClientBegin(HttpBtBusyFn btBusyFn) {
   s_btBusy = btBusyFn;
   for (int i = 0; i < HTTP_OWNER_COUNT; i++) {
@@ -170,7 +172,13 @@ void httpClientBegin(HttpBtBusyFn btBusyFn) {
   }
   s_jobs = xQueueCreate(6, sizeof(HttpJob*));
   xTaskCreatePinnedToCore(httpWorker, "httpWorker", HTTP_TASK_STACK, nullptr,
-                          HTTP_TASK_PRIO, nullptr, 0);
+                          HTTP_TASK_PRIO, &s_workerTask, 0);
+}
+
+uint32_t httpClientWorkerStackHwm() {
+  if (!s_workerTask) return 0;
+  return (uint32_t)uxTaskGetStackHighWaterMark(s_workerTask) *
+         sizeof(StackType_t);
 }
 
 static bool submit(int owner, bool isPost, const String& host, uint16_t port,
@@ -242,7 +250,15 @@ bool httpTryResult(int owner, int* code, String* body) {
 
 bool httpClientBusy() { return s_radioBusy.load(); }
 
-void httpSetWebBusy(bool busy) { s_webBusy.store(busy); }
+bool httpClientWebBusy() { return s_webBusy.load(); }
+
+void httpSetWebBusy(bool busy) {
+  bool was = s_webBusy.load();
+  s_webBusy.store(busy);
+  // 网页响应结束：发送期间出向请求可能被挤到失败，清掉 netfail 连击，
+  // 否则数据面看门狗会把刚发完网页的 WiFi 拆掉（实测一拆掉线 78s）
+  if (was && !busy) httpClientResetNetFail();
+}
 
 bool httpPause(uint32_t waitMs) {
   s_paused.store(true);

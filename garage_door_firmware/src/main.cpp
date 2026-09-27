@@ -3,6 +3,9 @@
 #include <Wire.h>
 #include <ArduinoOTA.h>
 #include <driver/gpio.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "config.h"
 #include "ble_tracker.h"
 #include "door_fsm.h"
@@ -196,22 +199,140 @@ static bool rfSaveKeyCb(int idx, const char* csv) {
 
 // 远程令：按语义开/关，禁止把 open 做成 toggle
 // （否则门已开时再喊「打开车库」会按上次 OPEN 翻成关）
-static void onRemoteCmd(const char* cmd) {
-  if (!cmd) return;
-  if (strcmp(cmd, "open") == 0) {
+static void onRemoteCmd(const char* raw) {
+  if (!raw || !*raw) return;
+  // ===== 无参指令 =====
+  if (strcmp(raw, "open") == 0) {
     gDoor.requestManualOpen(OpenSource::MIAO);
     Serial.println("[REMOTE] open -> MIAO open");
-  } else if (strcmp(cmd, "close") == 0) {
+    return;
+  }
+  if (strcmp(raw, "close") == 0) {
     gDoor.requestManualClose(OpenSource::MIAO);
     Serial.println("[REMOTE] close -> MIAO close");
-  } else if (strcmp(cmd, "toggle") == 0) {
+    return;
+  }
+  if (strcmp(raw, "toggle") == 0) {
     // 仅显式 toggle（如单按钮场景）才翻转
     gDoor.requestManualToggle(OpenSource::MIAO);
     Serial.println("[REMOTE] toggle -> MIAO toggle");
-  } else if (strcmp(cmd, "update") == 0) {
+    return;
+  }
+  if (strcmp(raw, "update") == 0) {
     // 服务端发现新固件 / 手动触发 → 立刻查 OTA
     logShipf("[REMOTE] update cmd -> ota check");
     remoteOtaCheckNow();
+    return;
+  }
+
+  // ===== 带参指令："<verb> <arg...>"（VPS 控制台替代本地网页的配置通道）=====
+  char verb[20];
+  const char* sp = strchr(raw, ' ');
+  const char* arg = "";
+  if (!sp) {
+    // 服务端会 strip 尾部空格：pairpin 无参 = 清除 PIN（与网页「留空清除」一致）
+    if (strcmp(raw, "pairpin") == 0) {
+      gBleBond.setPairingPin(String(""));
+      logShipf("[REMOTE] pairpin cleared");
+      return;
+    }
+    logShipf("[REMOTE] unknown cmd: %s", raw);
+    return;
+  }
+  size_t vl = (size_t)(sp - raw);
+  if (vl == 0 || vl >= sizeof(verb)) {
+    logShipf("[REMOTE] bad cmd len=%u", (unsigned)vl);
+    return;
+  }
+  memcpy(verb, raw, vl);
+  verb[vl] = '\0';
+  arg = sp + 1;
+
+  if (strcmp(verb, "mac") == 0) {
+    String m(arg);
+    m.trim();
+    m.toUpperCase();
+    if (m.length() != 17) {
+      logShipf("[REMOTE] mac reject len=%u", (unsigned)m.length());
+      return;
+    }
+    m.toCharArray(gMac, sizeof(gMac));
+    gCfg.saveMac(m);
+    if (gWeb.trackMode() == TRACK_MODE_CLASSIC) gBt.begin(gMac);
+    logShipf("[REMOTE] mac set+saved %s", gMac);
+  } else if (strcmp(verb, "mode") == 0) {
+    int m = atoi(arg);
+    if (m == TRACK_MODE_BLE || m == TRACK_MODE_CLASSIC) {
+      gWeb.setTrackMode(m);  // 内部存 NVS，变更后约 1.2s 自重启独占栈
+      logShipf("[REMOTE] mode -> %d", m);
+    } else {
+      logShipf("[REMOTE] mode reject: %s", arg);
+    }
+  } else if (strcmp(verb, "pair") == 0) {
+    if (gWeb.trackMode() != TRACK_MODE_BLE) {
+      logShipf("[REMOTE] pair ignored (classic mode)");
+    } else if (strncmp(arg, "off", 3) == 0) {
+      gBleBond.closePairingWindow("remote");
+      logShipf("[REMOTE] pair window closed");
+    } else {
+      int sec = 90;
+      if (strncmp(arg, "on ", 3) == 0 && arg[3] != '\0') sec = atoi(arg + 3);
+      if (sec <= 0) sec = 90;
+      gBleBond.requestOpenPairing((uint32_t)sec * 1000);
+      logShipf("[REMOTE] pair window %ds", sec);
+    }
+  } else if (strcmp(verb, "pairpin") == 0) {
+    gBleBond.setPairingPin(String(arg));  // 空参数 = 清除
+    logShipf("[REMOTE] pairpin %s", arg[0] ? "set" : "cleared");
+  } else if (strcmp(verb, "autotrack") == 0) {
+    if (strncmp(arg, "on", 2) == 0) {
+      if (gWeb.trackMode() != TRACK_MODE_CLASSIC) {
+        logShipf("[REMOTE] autotrack ignored (BLE mode)");
+      } else {
+        gBt.setAutoTrack(true);
+        gCfg.saveAutoTrack(true);
+        logShipf("[REMOTE] autotrack ON");
+      }
+    } else if (strncmp(arg, "off", 3) == 0) {
+      gBt.setAutoTrack(false);
+      gCfg.saveAutoTrack(false);
+      logShipf("[REMOTE] autotrack OFF");
+    }
+  } else if (strcmp(verb, "nfcinit") == 0) {
+    bool ok = gNfc.forceInit();
+    logShipf("[REMOTE] nfcinit %s", ok ? "OK" : "FAIL");
+  } else if (strcmp(verb, "wifista") == 0) {
+    // "ssid pass"：第一个空格切分，密码可含空格；只有 ssid = 保留旧密码
+    String a(arg);
+    a.trim();
+    int spIdx = a.indexOf(' ');
+    String ssid = spIdx > 0 ? a.substring(0, spIdx) : a;
+    String pass = spIdx > 0 ? a.substring(spIdx + 1) : String();
+    ssid.trim();
+    pass.trim();
+    if (ssid.length() == 0) {
+      logShipf("[REMOTE] wifista reject: empty ssid");
+      return;
+    }
+    if (pass.length() == 0 && gCfg.loadStaSsid() == ssid) {
+      pass = gCfg.loadStaPass();  // 与网页一致：同 SSID 留空 = 不改密码
+    }
+    bool ok = gCfg.saveSta(ssid, pass);
+    gWeb.startStaFromStore();
+    logShipf("[REMOTE] wifista ssid=%s ok=%d", ssid.c_str(), ok ? 1 : 0);
+  } else if (strcmp(verb, "web") == 0) {
+    // 本地网页软下线开关（迁移 VPS 控制台后默认关；出问题串口/远程都可救回）
+    if (strncmp(arg, "off", 3) == 0) {
+      gCfg.saveWebUi(false);
+      gWeb.setUiEnabled(false);
+      logShipf("[REMOTE] local web OFF (STA/remote/logs unaffected)");
+    } else if (strncmp(arg, "on", 2) == 0) {
+      gCfg.saveWebUi(true);
+      gWeb.setUiEnabled(true);
+      logShipf("[REMOTE] local web ON");
+    }
+  } else {
+    logShipf("[REMOTE] unknown cmd: %s", verb);
   }
 }
 
@@ -583,6 +704,7 @@ static void serviceBootLongPress() {
 static void serviceStaDataWatchdog() {
   static uint32_t lastKickMs = 0;
   if (!gWeb.staConnected()) return;  // 真断开由 loopSta 节流重连，不归这里管
+  if (httpClientWebBusy()) return;   // 本地网页正占射频发大响应：失败多半是自己造成的，别拆 WiFi
   int streak = httpClientNetFailStreak();
   if (streak < HTTP_NET_FAIL_KICK) return;
   uint32_t now = millis();
@@ -591,6 +713,67 @@ static void serviceStaDataWatchdog() {
   httpClientResetNetFail();
   logShipf("[WEB] datagate sta=1 netfail=%d -> force STA reconnect", streak);
   gWeb.forceStaReconnect();
+}
+
+// ===== 堆损坏侦查（20260927 panic 定位）=====
+// 崩溃实录：Bluedroid search_devices_copy_cb 里 osi_malloc(524) 返 NULL 后
+// memset(NULL)——但崩溃前 1s 心跳 maxblk=11252，524 不该分不出来 → free list
+// 疑似被写坏。三件套：分配失败钩子（谁、分多大、在哪失败）+ 周期完整性自检
+// （损坏出现在哪 2 秒窗口）+ 任务栈水位（找栈溢出写坏堆的元凶）。
+static volatile uint32_t gHeapFailN = 0;
+static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
+  // 可能在持有堆锁的分配路径里被调：严禁再走堆，防重入
+  static volatile bool inHook = false;
+  if (inHook) return;
+  inHook = true;
+  uint32_t n = ++gHeapFailN;
+  if (n <= 32 || (n & 63) == 0) {  // 限量打印防刷屏
+    char task[16] = "?";
+    TaskHandle_t h = xTaskGetCurrentTaskHandle();
+    if (h) {
+      const char* nm = pcTaskGetName(h);
+      if (nm) {
+        strncpy(task, nm, sizeof(task) - 1);
+        task[sizeof(task) - 1] = '\0';
+      }
+    }
+    char buf[168];
+    int m = snprintf(buf, sizeof(buf),
+                     "[HEAPFAIL] #%u size=%u caps=0x%x fn=%s task=%s "
+                     "free=%u maxblk=%u\n",
+                     (unsigned)n, (unsigned)size, (unsigned)caps,
+                     fn ? fn : "?", task, (unsigned)ESP.getFreeHeap(),
+                     (unsigned)ESP.getMaxAllocHeap());
+    if (m > 0) Serial.write(buf, (size_t)m);
+  }
+  inHook = false;
+}
+
+static void serviceHeapDiag() {
+  static uint32_t lastChk = 0, lastStack = 0;
+  uint32_t now = millis();
+  if (now - lastChk >= 2000) {
+    lastChk = now;
+    if (!heap_caps_check_integrity_all(false)) {
+      Serial.println("[HEAP] INTEGRITY FAIL — free list 已损坏!");
+      heap_caps_check_integrity_all(true);  // 第二遍打印细节
+    }
+  }
+  if (now - lastStack >= 10000) {
+    lastStack = now;
+    if (Serial.availableForWrite() > 256) {
+      uint32_t loopHwm =
+          (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+      TaskHandle_t nh = gNfc.taskHandle();
+      uint32_t nfcHwm = nh
+                            ? (uint32_t)uxTaskGetStackHighWaterMark(nh) *
+                                  sizeof(StackType_t)
+                            : 0;
+      Serial.printf("[TASK] loop=%uB nfc=%uB httpWorker=%uB failN=%u\n",
+                    loopHwm, nfcHwm, httpClientWorkerStackHwm(),
+                    (unsigned)gHeapFailN);
+    }
+  }
 }
 
 static void handleSerial() {
@@ -673,6 +856,14 @@ static void handleSerial() {
         remoteCmdSetEnabled(true);
       } else if (line == "remote off") {
         remoteCmdSetEnabled(false);
+      } else if (line == "web on") {
+        gCfg.saveWebUi(true);
+        gWeb.setUiEnabled(true);
+        Serial.println("[CMD] local web ON (80端口开)");
+      } else if (line == "web off") {
+        gCfg.saveWebUi(false);
+        gWeb.setUiEnabled(false);
+        Serial.println("[CMD] local web OFF (80端口关；远程/日志/OTA不受影响)");
       } else if (line == "logs flush") {
         logShipFlushNow();
         Serial.println("[CMD] logs flush queued pending=" +
@@ -1199,6 +1390,7 @@ void setup() {
   remoteCmdSetHandler(onRemoteCmd);
   remoteCmdSetMemTrim([]() { gBleScan.releaseMemory(); });
   httpClientBegin(httpBtRadioBusy);  // 异步 HTTP 任务（loop 不再阻塞等网络）
+  heap_caps_register_failed_alloc_callback(onAllocFailed);  // 堆侦查：分配失败留痕
   gCfg.begin();
   remoteCmdBegin(&gCfg);
   // logShipBegin 已在 early SCL 日志前调用，此处再 begin 会清掉已入队日志
@@ -1466,13 +1658,14 @@ void loop() {
     logShipService(btBusy, gWeb.staConnected());
     remoteOtaService(btBusy, gWeb.staConnected());
     serviceStaDataWatchdog();
+    serviceHeapDiag();
     {
       StatusBits sb;
       sb.nfcOk = gNfc.ok();
       sb.nfcDeferred = gNfc.deferred();
       sb.nfcAbsent = gNfc.absent();
       sb.nfcListen = gNfc.listen();
-      sb.webUp = true;
+      sb.webUp = gWeb.uiEnabled();  // 本地网页开关（VPS 控制台接管后通常为关）
       sb.sta = gWeb.staConnected();
       sb.ap = gWeb.apActive();
       sb.rfOpen = gRf.keyValid(RF_KEY_OPEN);
@@ -1484,6 +1677,17 @@ void loop() {
       sb.heap = ESP.getFreeHeap();
       sb.maxblk = ESP.getMaxAllocHeap();
       sb.uptimeMs = millis();
+      // ===== 控制台配置回显 =====
+      gWeb.staIp().toCharArray(sb.staIp, sizeof(sb.staIp));
+      strlcpy(sb.mac, gMac, sizeof(sb.mac));
+      sb.trackMode = gWeb.trackMode();
+      sb.autoTrack = gBt.autoTrack();
+      sb.pairOpen = gBleBond.pairingOpen();
+      sb.pairHasPin = gBleBond.hasPasskey();
+      sb.bleRssi = gBleScan.matchRssi();
+      gBleScan.matchLabel().toCharArray(sb.bleLab, sizeof(sb.bleLab));
+      sb.carRssi = gBt.lastRssi();
+      sb.trend = (int)gBt.trend();
 #ifdef DEVICE_ROLE
       sb.role = DEVICE_ROLE;
 #endif

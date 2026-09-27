@@ -22,9 +22,21 @@ static bool s_inFlight = false;
 void statusReportSetBits(const StatusBits& b) { gBits = b; }
 
 // 弱符号默认：未绑定则只报版本/网络
+static void appendEscaped(String& j, const char* s) {
+  for (; s && *s; s++) {
+    char c = *s;
+    if (c == '"' || c == '\\') {
+      j += '\\';
+      j += c;
+    } else if ((unsigned char)c >= 0x20) {
+      j += c;
+    }
+  }
+}
+
 static String buildJson() {
   String j;
-  j.reserve(400);
+  j.reserve(800);
   j += "{\"id\":\"" + deviceId() + "\"";
   j += ",\"fw\":\"" + String(FW_VERSION) + "\"";
   j += ",\"role\":\"" + String(gBits.role) + "\"";
@@ -44,6 +56,21 @@ static String buildJson() {
   j += ",\"rf\":{\"open\":" + String(gBits.rfOpen ? 1 : 0);
   j += ",\"close\":" + String(gBits.rfClose ? 1 : 0);
   j += ",\"tx_busy\":" + String(gBits.rfTxBusy ? 1 : 0) + "}";
+  // ===== 控制台配置回显 =====
+  j += ",\"sta_ip\":\"";
+  appendEscaped(j, gBits.staIp);
+  j += "\",\"mac\":\"";
+  appendEscaped(j, gBits.mac);
+  j += "\",\"mode\":" + String(gBits.trackMode);
+  j += ",\"autotrack\":" + String(gBits.autoTrack ? 1 : 0);
+  j += ",\"pair\":{\"open\":" + String(gBits.pairOpen ? 1 : 0);
+  j += ",\"pin\":" + String(gBits.pairHasPin ? 1 : 0) + "}";
+  j += ",\"car_rssi\":" + String(gBits.carRssi);
+  j += ",\"trend\":" + String(gBits.trend);
+  j += ",\"ble\":{\"rssi\":" + String(gBits.bleRssi);
+  j += ",\"label\":\"";
+  appendEscaped(j, gBits.bleLab);
+  j += "\"}";
   j += "}";
   return j;
 }

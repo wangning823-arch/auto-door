@@ -147,7 +147,8 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
 
     s_failStreak = 0;
     s_okStreak++;
-    char cmd[16] = {0};
+    // 带参指令（mac AA:BB:... / wifista ssid pass …）需要更大缓冲
+    char cmd[128] = {0};
     if (!parseCmd(body, cmd, sizeof(cmd))) {
       if (s_okStreak == 1 || (s_okStreak % 20) == 0) {
         Serial.printf("[REMOTE] poll ok x%d (idle)\n", s_okStreak);

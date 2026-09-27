@@ -49,6 +49,10 @@ class ConfigStore {
   bool loadAutoTrack(bool defaultOn);
   bool saveAutoTrack(bool on);
 
+  // 本地网页 80 端口开关（配置已迁 VPS 控制台；默认保持开，远程 web off 后下线）
+  bool loadWebUi(bool defaultOn = true);
+  bool saveWebUi(bool on);
+
  private:
   bool ready_ = false;
 };

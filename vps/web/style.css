@@ -309,3 +309,16 @@ input[type="file"] {
   .detail-grid { grid-template-columns: 1fr; }
   .ota-card .ota-row { grid-template-columns: 1fr; }
 }
+
+/* ===== 设备配置面板（VPS 控制台替代本地网页） ===== */
+.cfg-group { margin-top: 14px; }
+.cfg-group label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 0.82rem; }
+.cfg-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: stretch; }
+.cfg-row input, .cfg-row select {
+  flex: 1; min-width: 0; padding: 9px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: #0f1419; color: inherit; font-size: 0.92rem;
+}
+.cfg-row .btn { flex: 0 0 auto; white-space: nowrap; }
+@media (max-width: 720px) {
+  .cfg-row { flex-direction: column; }
+}

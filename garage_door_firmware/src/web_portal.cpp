@@ -4,9 +4,84 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "ble_bond.h"
+#include <lwip/sockets.h>
+#include <errno.h>
+#include <esp_task_wdt.h>
 
 static WebServer server(80);
 static WebPortal* gPortal = nullptr;
+
+// 分片直写器：首页边生成边发，碎片堆(maxblk≈11KB)上不再整体拼 3~9KB 大 String
+// （拼装必然 realloc 失败 → 页面截断/乱序，还会踩坏堆元数据，1 秒后在蓝牙
+//  inquiry 结果回调里 panic —— 20260927 串口实测）。
+// 发送用 select(200ms)+send 受控写：WiFiClient::write 内部 1s×10 轮 select，
+// 最坏 10s > loopTask 5s 看门狗 → TWT 复位（log_ship 同款教训）。
+struct PageW {
+  WiFiClient& c;
+  bool ok = true;
+  uint32_t total = 0;
+
+  explicit PageW(WiFiClient& cl) : c(cl) {}
+
+  void w(const char* p, size_t n) {
+    if (!ok || !p || n == 0) return;
+    int fd = c.fd();
+    if (fd < 0) {
+      ok = false;
+      return;
+    }
+    uint32_t st0 = millis();
+    size_t off = 0;
+    while (off < n) {
+      esp_task_wdt_reset();
+      if (millis() - st0 > 3500) {  // 差链路上发送会整段卡死：快失败让出射频，
+        ok = false;                 // 别占满射频挤爆出向轮询(看门狗会拆 WiFi)
+        return;
+      }
+      fd_set wset;
+      FD_ZERO(&wset);
+      FD_SET(fd, &wset);
+      struct timeval tv = {0, 200000};  // 200ms 一片
+      int r = select(fd + 1, nullptr, &wset, nullptr, &tv);
+      if (r < 0) {
+        ok = false;
+        return;
+      }
+      if (r > 0 && FD_ISSET(fd, &wset)) {
+        int k = send(fd, p + off, n - off, MSG_DONTWAIT);
+        if (k > 0) {
+          off += (size_t)k;
+        } else if (k < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+          ok = false;
+          return;
+        }
+      }
+      yield();
+    }
+    total += n;
+  }
+  void w(const char* s) {
+    if (s) w(s, strlen(s));
+  }
+  void w(const __FlashStringHelper* s) {
+    w(reinterpret_cast<const char*>(s), strlen(reinterpret_cast<const char*>(s)));
+  }
+  void w(const String& s) { w(s.c_str(), s.length()); }
+
+  // 页面生成沿用 html += 语义：w += 片段，逐片流式发出
+  PageW& operator+=(const char* s) {
+    w(s, strlen(s));
+    return *this;
+  }
+  PageW& operator+=(const __FlashStringHelper* s) {
+    w(s);
+    return *this;
+  }
+  PageW& operator+=(const String& s) {
+    w(s);
+    return *this;
+  }
+};
 
 static bool validMac(const String& m) {
   if (m.length() != 17) return false;
@@ -38,7 +113,7 @@ String WebPortal::staIp() const {
   return WiFi.localIP().toString();
 }
 
-String WebPortal::pageHtml() const {
+void WebPortal::pageHtml(PageW& w) const {
   String mac = store_ ? store_->loadMac(CAR_BT_MAC) : String(CAR_BT_MAC);
   String door = "未知";
   if (door_) {
@@ -72,9 +147,7 @@ String WebPortal::pageHtml() const {
     }
   }
 
-  String html;
-  html.reserve(2200);
-  html += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+  w += F("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>车库门控制器</title><style>"
             "body{font-family:system-ui,sans-serif;margin:0;background:#0f1419;color:#e7ecf1;}"
@@ -93,33 +166,33 @@ String WebPortal::pageHtml() const {
             ".ok{color:#3dd68c;}.warn{color:#f2c94c;}"
             ".tip{font-size:.75rem;color:#6b7c8f;margin-top:8px;line-height:1.4;}"
             "</style></head><body><div class=\"wrap\">");
-  html += F("<h1>车库门智能控制器</h1><div class=\"sub\">P0 · 无网可用 · 渐变蓝牙判定 · v"
+  w += F("<h1>车库门智能控制器</h1><div class=\"sub\">P0 · 无网可用 · 渐变蓝牙判定 · v"
             FW_VERSION "</div>");
 
-  html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">热点</span><span class=\"v\">");
-  html += apSsid_;
-  html += F("</span></div><div class=\"row\"><span class=\"k\">IP</span><span class=\"v\">");
-  html += WiFi.softAPIP().toString();
-  html += F("</span></div><div class=\"row\"><span class=\"k\">家庭Wi‑Fi</span><span class=\"v ");
+  w += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">热点</span><span class=\"v\">");
+  w += apSsid_;
+  w += F("</span></div><div class=\"row\"><span class=\"k\">IP</span><span class=\"v\">");
+  w += WiFi.softAPIP().toString();
+  w += F("</span></div><div class=\"row\"><span class=\"k\">家庭Wi‑Fi</span><span class=\"v ");
   if (staConnected())
-    html += F("ok\">");
+    w += F("ok\">");
   else if (staWanted_)
-    html += F("warn\">");
+    w += F("warn\">");
   else
-    html += F("\">");
+    w += F("\">");
   if (!staWanted_)
-    html += F("未配置（OTA 需要）");
+    w += F("未配置（OTA 需要）");
   else if (staConnected())
-    html += staIp() + F(" · OTA: ") + staIp();
+    w += staIp() + F(" · OTA: ") + staIp();
   else
-    html += F("连接中/失败");
-  html += F("</span></div><div class=\"row\"><span class=\"k\">门状态</span><span class=\"v\">");
-  html += door;
-  html += F("</span></div><div class=\"row\"><span class=\"k\">车机RSSI</span><span class=\"v\">");
-  html += rssi;
-  html += F("</span></div><div class=\"row\"><span class=\"k\">信号趋势</span><span class=\"v\">");
-  html += trend;
-  html += F("</span></div>"
+    w += F("连接中/失败");
+  w += F("</span></div><div class=\"row\"><span class=\"k\">门状态</span><span class=\"v\">");
+  w += door;
+  w += F("</span></div><div class=\"row\"><span class=\"k\">车机RSSI</span><span class=\"v\">");
+  w += rssi;
+  w += F("</span></div><div class=\"row\"><span class=\"k\">信号趋势</span><span class=\"v\">");
+  w += trend;
+  w += F("</span></div>"
             "<a href=\"/rssi\" style=\"display:block;margin-top:10px;text-align:center;"
             "padding:12px;border-radius:10px;background:#2f80ed;color:#fff;"
             "text-decoration:none;font-weight:600\">RSSI curve over time</a>"
@@ -128,14 +201,14 @@ String WebPortal::pageHtml() const {
   // 家庭 Wi‑Fi（STA）：保存后可从书桌 espota 烧录，不必再拔 USB
   {
     String staSsid = store_ ? store_->loadStaSsid() : String();
-    html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">家庭 Wi‑Fi（无线烧录）</span><span class=\"v\">");
-    html += staSsid.length() ? staSsid : String("未设置");
-    html += F("</span></div>"
+    w += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">家庭 Wi‑Fi（无线烧录）</span><span class=\"v\">");
+    w += staSsid.length() ? staSsid : String("未设置");
+    w += F("</span></div>"
               "<form method=\"GET\" action=\"/wifista\">"
               "<label>SSID</label>"
               "<input type=\"text\" name=\"s\" value=\"");
-    html += staSsid;
-    html += F("\" placeholder=\"车库路由名称\" maxlength=\"32\" autocapitalize=\"off\">"
+    w += staSsid;
+    w += F("\" placeholder=\"车库路由名称\" maxlength=\"32\" autocapitalize=\"off\">"
               "<label style=\"margin-top:8px\">密码</label>"
               "<input type=\"password\" name=\"p\" value=\"\" placeholder=\"密码（留空=不改）\" maxlength=\"64\">"
               "<button type=\"submit\">保存并连接</button></form>"
@@ -147,39 +220,39 @@ String WebPortal::pageHtml() const {
   }
 
   // 跟踪模式选择
-  html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">跟踪模式</span><span class=\"v\">");
-  html += (trackMode_ == TRACK_MODE_BLE) ? "BLE" : "经典蓝牙";
-  html += F("</span></div><div class=\"row\"><span class=\"k\">自动跟踪</span><span class=\"v\">");
-  html += (bt_ && bt_->autoTrack()) ? "开" : "关";
-  html += F("</span></div>"
+  w += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">跟踪模式</span><span class=\"v\">");
+  w += (trackMode_ == TRACK_MODE_BLE) ? "BLE" : "经典蓝牙";
+  w += F("</span></div><div class=\"row\"><span class=\"k\">自动跟踪</span><span class=\"v\">");
+  w += (bt_ && bt_->autoTrack()) ? "开" : "关";
+  w += F("</span></div>"
             "<form method=\"GET\" action=\"/mode\" style=\"margin-top:8px\">"
             "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
             "<input type=\"radio\" name=\"m\" value=\"0\" ");
-  if (trackMode_ == TRACK_MODE_BLE) html += F("checked ");
-  html += F(">BLE（配对手机 IRK 跟踪）</label>"
+  if (trackMode_ == TRACK_MODE_BLE) w += F("checked ");
+  w += F(">BLE（配对手机 IRK 跟踪）</label>"
             "<label style=\"display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer\">"
             "<input type=\"radio\" name=\"m\" value=\"1\" ");
-  if (trackMode_ == TRACK_MODE_CLASSIC) html += F("checked ");
-  html += F(">经典蓝牙（小蚂蚁等车机 MAC）</label>"
+  if (trackMode_ == TRACK_MODE_CLASSIC) w += F("checked ");
+  w += F(">经典蓝牙（小蚂蚁等车机 MAC）</label>"
             "<button type=\"submit\">保存模式</button></form>"
             "<div class=\"tip\">开/关：无→有且&lt;-80立刻开；≥-80不开；离场≤-90约10m关。"
             "经典模式保存后会自动打开周期 Inquiry；网页会显示「自动跟踪」状态。</div></div>");
 
   // ===== 手机配对：开关 + 6位PIN（仅 BLE 模式显示；经典模式隐藏）=====
   if (trackMode_ == TRACK_MODE_BLE) {
-  html += F("<div class=\"card\">"
+  w += F("<div class=\"card\">"
             "<div class=\"row\"><span class=\"k\">手机配对</span><span class=\"v ");
   if (gBleBond.pairingOpen())
-    html += F("warn\">开 · 90秒内可绑 GarageDoorBLE</span></div>");
+    w += F("warn\">开 · 90秒内可绑 GarageDoorBLE</span></div>");
   else
-    html += F("ok\">关 · 拒绝新绑定</span></div>");
-  html += F("<div class=\"row\"><span class=\"k\">已配对手机</span><span class=\"v\">");
-  html += gBleBond.hasIrk() ? gBleBond.identityMac() : String("(尚未绑定)");
-  html += F("</span></div>"
+    w += F("ok\">关 · 拒绝新绑定</span></div>");
+  w += F("<div class=\"row\"><span class=\"k\">已配对手机</span><span class=\"v\">");
+  w += gBleBond.hasIrk() ? gBleBond.identityMac() : String("(尚未绑定)");
+  w += F("</span></div>"
             "<div class=\"row\"><span class=\"k\">手机配对 PIN</span><span class=\"v\">");
-  html += gBleBond.hasPasskey() ? gBleBond.pairingPin()
+  w += gBleBond.hasPasskey() ? gBleBond.pairingPin()
                                 : String("未设置(Just Works)");
-  html += F("</span></div>"
+  w += F("</span></div>"
             "<form method=\"GET\" action=\"/pair\" style=\"display:flex;gap:8px;margin-top:8px\">"
             "<input type=\"hidden\" name=\"a\" value=\"on\">"
             "<button type=\"submit\" style=\"margin-top:0;flex:1\">打开配对（90秒）</button>"
@@ -205,16 +278,16 @@ String WebPortal::pageHtml() const {
             "关闭配对 = 停广播 + 拒绝绑定 + 断开连接。"
             "换手机：解绑再开配对。</div></div>");
   } else {
-    html += F("<div class=\"card\">"
+    w += F("<div class=\"card\">"
               "<div class=\"row\"><span class=\"k\">手机配对</span>"
               "<span class=\"v\">经典模式已禁用（切 BLE 后可配对）</span></div></div>");
   }
 
-  html += F("<div class=\"card\"><form method=\"GET\" action=\"/save\" id=\"macform\">"
+  w += F("<div class=\"card\"><form method=\"GET\" action=\"/save\" id=\"macform\">"
             "<label>车机 / 钥匙 蓝牙 MAC</label>"
             "<input type=\"text\" name=\"mac\" id=\"mac\" value=\"");
-  html += mac;
-  html += F("\" placeholder=\"AA:BB:CC:DD:EE:FF\" maxlength=\"17\" autocapitalize=\"characters\">"
+  w += mac;
+  w += F("\" placeholder=\"AA:BB:CC:DD:EE:FF\" maxlength=\"17\" autocapitalize=\"characters\">"
             "<button type=\"submit\">保存 MAC</button></form>"
             "<button class=\"sec\" type=\"button\" onclick=\"startScan()\" id=\"scanBtn\">"
             "扫描附近蓝牙</button>"
@@ -223,7 +296,7 @@ String WebPortal::pageHtml() const {
             "手机需打开蓝牙并开启「可被搜索/开放检测」；车机需开着蓝牙。"
             "扫到后点列表即可填入 MAC。</div></div>");
 
-  html += F("<div class=\"card\">"
+  w += F("<div class=\"card\">"
             "<div class=\"row\"><span class=\"k\">手动控制</span><span class=\"v\">开/关各发 RF 码，不用门磁</span></div>"
             "<form method=\"GET\" action=\"/door\" style=\"display:flex;gap:8px\">"
             "<button name=\"a\" value=\"open\" type=\"submit\" style=\"flex:1\">开（上）</button>"
@@ -232,35 +305,35 @@ String WebPortal::pageHtml() const {
             "<div class=\"tip\">开、关是不同遥控码，请用明确的开/关按钮，不要靠模糊状态猜。"
             "串口也可: open / close</div></div>");
 
-  html += F("<div class=\"card\">"
+  w += F("<div class=\"card\">"
             "<div class=\"row\"><span class=\"k\">配对手机跟踪</span><span class=\"v\">");
-  html += bleLab;
-  html += F("</span></div><div class=\"row\"><span class=\"k\">手机 RSSI</span><span class=\"v\">");
-  html += bleRssi;
-  html += F("</span></div>"
+  w += bleLab;
+  w += F("</span></div><div class=\"row\"><span class=\"k\">手机 RSSI</span><span class=\"v\">");
+  w += bleRssi;
+  w += F("</span></div>"
             "<div class=\"tip\">BLE 模式只用已配对手机的 IRK+RSSI 判断进出，"
             "不再按名称/MAC 特征过滤。名称扫描已移除；经典车机仍用上方 MAC 扫描。</div></div>");
 
-  html += F("<div class=\"card\">"
+  w += F("<div class=\"card\">"
             "<div class=\"row\"><span class=\"k\">NFC</span><span class=\"v\">");
   if (nfc_) {
     if (nfc_->ok())
-      html += F("ok</span></div>");
+      w += F("ok</span></div>");
     else if (nfc_->absent())
-      html += F("未接模块 · 不再自动撞 I2C</span></div>");
+      w += F("未接模块 · 不再自动撞 I2C</span></div>");
     else if (nfc_->deferred())
-      html += F("defer · 可网页强制初始化</span></div>");
+      w += F("defer · 可网页强制初始化</span></div>");
     else
-      html += F("wait · 自动初始化中</span></div>");
+      w += F("wait · 自动初始化中</span></div>");
   } else {
-    html += F("-</span></div>");
+    w += F("-</span></div>");
   }
-  html += F("<form method=\"GET\" action=\"/nfcinit\">"
+  w += F("<form method=\"GET\" action=\"/nfcinit\">"
             "<button type=\"submit\" class=\"sec\">重新初始化 NFC</button></form>"
             "<div class=\"tip\">上电约 5 秒后短超时探测：无 PN532 则立刻 defer，"
             "不再用 1s 超时堵网页。接上模块后点「重新初始化」。</div></div>");
 
-  html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
+  w += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">射频</span>"
             "<span class=\"v\">WiFi 与蓝牙共用 2.4G</span></div>"
             "<form method=\"GET\" action=\"/wifi/off\">"
             "<button type=\"submit\" style=\"background:#c0392b\">关热点（保留家庭 Wi‑Fi 看网页）</button>"
@@ -269,7 +342,7 @@ String WebPortal::pageHtml() const {
             "点上方关热点后：STA 网页仍可用；约 1.5 秒后自动起经典蓝牙，"
             "再点「扫描」。自动门同样在关热点后才跑。</div></div>");
 
-  html += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">自动开</span>"
+  w += F("<div class=\"card\"><div class=\"row\"><span class=\"k\">自动开</span>"
             "<span class=\"v ok\">仅蓝牙渐近</span></div>"
             "<div class=\"row\"><span class=\"k\">自动关</span>"
             "<span class=\"v ok\">仅渐离+清空</span></div>"
@@ -278,7 +351,7 @@ String WebPortal::pageHtml() const {
             "<div class=\"row\"><span class=\"k\">防砸车</span>"
             "<span class=\"v ok\">F0 已启用</span></div></div>");
 
-  html += F("<script>"
+  w += F("<script>"
             "function startScan(){"
             " var b=document.getElementById('scanBtn');"
             " var box=document.getElementById('scanBox');"
@@ -309,8 +382,20 @@ String WebPortal::pageHtml() const {
             "function pick(m){document.getElementById('mac').value=m;document.getElementById('mac').scrollIntoView();}"
             "</script>");
 
-  html += F("</div></body></html>");
-  return html;
+  w += F("</div></body></html>");
+}
+
+// 网页重响应期间暂停蓝牙 inquiry：inquiry 结果回调与网页发送并发是
+// 碎片堆 panic 的引爆点；发完恢复，autoTrack 下一轮到点自动重扫。
+// setInquiryPaused 内部会 cancel discovery，BT 栈未起时是空操作。
+void WebPortal::webPauseBt() {
+  if (!bt_) return;
+  bt_->setInquiryPaused(true);
+  bt_->cancelActiveInquiry();
+}
+
+void WebPortal::webResumeBt() {
+  if (bt_) bt_->setInquiryPaused(false);
 }
 
 void WebPortal::setupRoutes() {
@@ -382,6 +467,7 @@ void WebPortal::setupRoutes() {
 
   server.on("/rssi", HTTP_GET, []() {
     httpSetWebBusy(true);
+    if (gPortal) gPortal->webPauseBt();
     String h;
     h.reserve(3200);
     h += F(
@@ -428,6 +514,7 @@ void WebPortal::setupRoutes() {
         "document.getElementById('bar').textContent='fetch error';});}"
         "tick();setInterval(tick,2000);</script></body></html>");
     server.send(200, "text/html; charset=utf-8", h);
+    if (gPortal) gPortal->webResumeBt();
     httpSetWebBusy(false);
   });
 
@@ -439,31 +526,23 @@ void WebPortal::setupRoutes() {
     uint32_t t0 = millis();
     Serial.printf("[WEB] GET / from %s\n",
                   server.client().remoteIP().toString().c_str());
-    // 网页优先：整个响应期间 http worker 不发 VPS（发完立即恢复）
+    // 网页优先：响应期间 http worker 不发 VPS；蓝牙 inquiry 同步让路
+    // （复用 OTA 让路模式：不停 inquiry 时，结果回调与碎片堆上的网页发送
+    //  并发会在堆上引爆 panic —— 20260927 串口实测复现过）
     httpSetWebBusy(true);
-    String html = gPortal->pageHtml();
-    // WebServer::send 对 8KB 页面只发出响应头、正文卡死
-    // → 直接用 WiFiClient 分片写，块间 yield，避免 TCP 发送缓冲卡死
+    gPortal->webPauseBt();
     WiFiClient c = server.client();
-    String hdr = F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
-    hdr += String(html.length());
-    hdr += F("\r\nConnection: close\r\n\r\n");
-    c.print(hdr);
-    size_t off = 0;
-    const size_t total = html.length();
-    while (off < total) {
-      size_t n = total - off;
-      if (n > 512) n = 512;
-      size_t w = c.write((const uint8_t*)html.c_str() + off, n);
-      if (w == 0) break;
-      off += w;
-      delay(1);
-      yield();
-    }
+    PageW pw(c);
+    // 不带 Content-Length：正文由 Connection: close 定界，边生成边发，
+    // 碎片堆(maxblk≈11KB)上不再整体拼 3~9KB 大 String（拼装会截断/乱序/踩堆）
+    pw += F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+            "Connection: close\r\n\r\n");
+    gPortal->pageHtml(pw);
     c.stop();
+    gPortal->webResumeBt();
     httpSetWebBusy(false);
-    Serial.printf("[WEB] GET / sent=%u/%u gen=%ums\n", (unsigned)off,
-                  (unsigned)total, (unsigned)(millis() - t0));
+    Serial.printf("[WEB] GET / sent=%u ok=%d gen=%ums\n", (unsigned)pw.total,
+                  (int)pw.ok, (unsigned)(millis() - t0));
   });
 
   server.on("/save", HTTP_GET, []() {
@@ -876,10 +955,14 @@ void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
 
   if (store_) {
     staWanted_ = store_->loadStaSsid().length() > 0;
+    uiEnabled_ = store_->loadWebUi(true);
   }
 
   setupRoutes();
   serverStarted_ = false;
+  if (!uiEnabled_) {
+    Serial.println("[WEB] local UI disabled by NVS (web_ui=0); STA/remote kept");
+  }
 
   // 先 SoftAP，再 HTTP。顺序反了会 assert tcpip_send_msg_wait_sem
   if (enableAp) {
@@ -963,12 +1046,25 @@ void WebPortal::forceStaReconnect() {
 
 void WebPortal::ensureHttpIfSta() {
   if (apActive_) return;
+  if (!uiEnabled_) return;  // 本地网页已下线（VPS 控制台接管）；恢复用 web on / startAp
   if (!staWanted_ || !staConnected()) return;
   if (serverStarted_) return;
   server.begin();
   server.enableDelay(true);
   serverStarted_ = true;
   Serial.println("[WEB] STA HTTP up at http://" + staIp() + "/");
+}
+
+void WebPortal::setUiEnabled(bool on) {
+  uiEnabled_ = on;
+  if (on) {
+    ensureHttpIfSta();  // STA 已连则立即重开；AP 模式本就常开
+    if (!serverStarted_) Serial.println("[WEB] UI enabled (will begin on STA)");
+  } else if (serverStarted_ && !apActive_) {
+    server.stop();
+    serverStarted_ = false;
+    Serial.println("[WEB] local UI stopped (80 closed; AP recovery path untouched)");
+  }
 }
 
 void WebPortal::loopSta() {

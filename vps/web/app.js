@@ -182,21 +182,33 @@
 
     var nfc = nfcState(st.nfc);
     var rf = rfState(st.rf);
-    var webS = st.web ? ["正常", "ok"] : (st.web === 0 ? ["异常", "err"] : ["-", ""]);
+    var webS = st.web ? ["开", "ok"] : (st.web === 0 ? ["关", "warn"] : ["-", ""]);
     var staS = st.sta ? ["已连接", "ok"] : ["未连接", "warn"];
+    var modeS = st.mode === 1 ? "经典" : (st.mode === 0 ? "BLE" : "-");
+    var pairS = st.pair
+      ? (st.pair.open ? "配对窗口开" : (st.pair.pin ? "已设PIN" : "关"))
+      : "-";
 
     $("statusGrid").innerHTML = [
       statusItem("NFC", nfc[0], nfc[1]),
-      statusItem("网页", webS[0], webS[1]),
+      statusItem("本地网页", webS[0], webS[1]),
       statusItem("射频 RF", rf[0], rf[1]),
       statusItem("WiFi STA", staS[0], staS[1]),
+      statusItem("STA IP", st.sta_ip || "-", ""),
       statusItem("固件", d.fw || st.fw || "-", ""),
       statusItem("门状态", st.door === 1 ? "开" : (st.door === 2 ? "关" : "未知"), ""),
+      statusItem("跟踪模式", modeS, ""),
+      statusItem("配对", pairS, st.pair && st.pair.open ? "warn" : ""),
+      statusItem("车机 RSSI", st.car_rssi != null ? st.car_rssi : "-", ""),
       statusItem("堆内存", st.heap != null ? st.heap : "-", ""),
       statusItem("最大块", st.maxblk != null ? st.maxblk : "-", ""),
-      statusItem("RSSI", st.rssi != null ? st.rssi : "-", ""),
+      statusItem("WiFi RSSI", st.rssi != null ? st.rssi : "-", ""),
       statusItem("远程令", st.remote ? "开" : "关", st.remote ? "ok" : "warn")
     ].join("");
+
+    // 配置表单回填
+    if (st.mac) $("cfgMac").value = st.mac;
+    if (st.mode === 0 || st.mode === 1) $("cfgMode").value = String(st.mode);
 
     $("devMeta").textContent =
       "id=" + d.id +
@@ -281,6 +293,64 @@
       });
   }
 
+  // 通用配置指令（替代本地网页）：POST .../cmd {"cmd":"mac AA:BB:..."}
+  function sendRawCmd(cmd) {
+    if (!currentId) return Promise.reject(new Error("no device"));
+    setTip($("cfgTip"), "下发：" + cmd);
+    return api("/api/devices/" + encodeURIComponent(currentId) + "/cmd", {
+      method: "POST",
+      body: JSON.stringify({ cmd: cmd })
+    })
+      .then(function (j) {
+        if (j.ok) {
+          setTip($("cfgTip"), "已下发「" + cmd + "」，约 3 秒生效", "ok");
+          setTimeout(refreshDetail, 4500);
+        } else {
+          setTip($("cfgTip"), "失败：" + (j.result || "unknown"), "err");
+        }
+        return j;
+      })
+      .catch(function (e) {
+        setTip($("cfgTip"), e.message || "下发失败", "err");
+        throw e;
+      });
+  }
+
+  function cfgWire() {
+    $("cfgMacBtn").addEventListener("click", function () {
+      var m = ($("cfgMac").value || "").trim().toUpperCase();
+      if (m.length !== 17) { setTip($("cfgTip"), "MAC 格式应为 AA:BB:CC:DD:EE:FF", "err"); return; }
+      sendRawCmd("mac " + m);
+    });
+    $("cfgModeBtn").addEventListener("click", function () {
+      var m = $("cfgMode").value;
+      if (!window.confirm("切换跟踪模式会让设备约 1.2 秒后重启，继续？")) return;
+      sendRawCmd("mode " + m);
+    });
+    $("cfgAutoOn").addEventListener("click", function () { sendRawCmd("autotrack on"); });
+    $("cfgAutoOff").addEventListener("click", function () { sendRawCmd("autotrack off"); });
+    $("cfgPairOn").addEventListener("click", function () { sendRawCmd("pair on"); });
+    $("cfgPairOff").addEventListener("click", function () { sendRawCmd("pair off"); });
+    $("cfgPinBtn").addEventListener("click", function () {
+      var pin = ($("cfgPin").value || "").trim();
+      if (pin && !/^\d{1,6}$/.test(pin)) { setTip($("cfgTip"), "PIN 应为 1-6 位数字", "err"); return; }
+      sendRawCmd("pairpin " + pin).then(function () { $("cfgPin").value = ""; });
+    });
+    $("cfgWifiBtn").addEventListener("click", function () {
+      var ssid = ($("cfgSsid").value || "").trim();
+      var pass = $("cfgPass").value || "";
+      if (!ssid) { setTip($("cfgTip"), "SSID 不能为空", "err"); return; }
+      sendRawCmd("wifista " + ssid + (pass ? " " + pass : ""))
+        .then(function () { $("cfgPass").value = ""; });
+    });
+    $("cfgNfcBtn").addEventListener("click", function () { sendRawCmd("nfcinit"); });
+    $("cfgWebOff").addEventListener("click", function () {
+      if (!window.confirm("关闭本地网页后，车库局域网内 80 端口不再响应（远程控制不受影响）。继续？")) return;
+      sendRawCmd("web off");
+    });
+    $("cfgWebOn").addEventListener("click", function () { sendRawCmd("web on"); });
+  }
+
   function uploadOta() {
     var file = ($("binInput").files || [])[0];
     if (!file) {
@@ -349,6 +419,7 @@
     $("otaBar").classList.toggle("hidden");
   });
   $("uploadBtn").addEventListener("click", uploadOta);
+  cfgWire();
 
   function boot() {
     // 调试期服务端可关闭登录：/api/auth required=false 时直接进列表

@@ -958,6 +958,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._read_body()
                 self._cmd_for_device(parts[4], unquote(parts[3]))
                 return
+            # POST /api/devices/{id}/cmd  body={"cmd":"mac AA:BB:..."} — 通用配置指令
+            # （替代本地网页：mac/mode/pair/pairpin/autotrack/nfcinit/wifista/web …）
+            if len(parts) == 5 and parts[4] == "cmd":
+                if not self._require_auth():
+                    return
+                raw = self._read_body() or b"{}"
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    body = {}
+                cmd = str(body.get("cmd") or "").strip()
+                dev_id = unquote(parts[3])
+                if not cmd or len(cmd) > 120 or any(ord(c) < 0x20 for c in cmd):
+                    self._send_json(400, {"ok": 0, "error": "bad cmd"})
+                    return
+                ok, why = set_pending(cmd, dev_id)
+                _log("[%s] ui cmd -> pending=%s (%s) cmd=%s" % (dev_id, ok, why, cmd))
+                self._send_json(200 if ok else 429, {
+                    "ok": 1 if ok else 0,
+                    "result": "ok" if ok else why,
+                    "id": dev_id,
+                    "cmd": cmd,
+                })
+                return
             # POST /api/devices/{id}/logs/clear — 清掉该设备历史日志
             if len(parts) == 6 and parts[4] == "logs" and parts[5] == "clear":
                 self._read_body()

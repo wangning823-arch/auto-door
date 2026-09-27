@@ -42,6 +42,10 @@ bool httpSubmitPost(int owner, const String& host, uint16_t port,
 bool httpTryResult(int owner, int* code, String* body);
 // HTTP 占用射频中（发送/等蓝牙）→ 新一轮 inquiry 让路
 bool httpClientBusy();
+// 本地网页正在发送大响应（web_busy 窗口内出向请求会等待）
+bool httpClientWebBusy();
+// httpWorker 任务栈剩余水位（字节，0=任务未起）——堆侦查诊断用
+uint32_t httpClientWorkerStackHwm();
 // 本地网页正在响应（loop 在发页面）→ worker 让路，等页面发完再发 VPS
 void httpSetWebBusy(bool busy);
 // OTA 前调用：暂停新提交并排空在飞请求（等 worker 空闲，最多 waitMs）
