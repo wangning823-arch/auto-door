@@ -72,7 +72,9 @@ MCP_PROTOCOL_KNOWN = ("2025-03-26", "2024-11-05", "2024-10-07")
 # 蓝牙 Inquiry 忙时设备可能 >6s 才 poll 一次；坏网时退避+排队可 >25s
 # （dda0 实测 25s TTL 大量 expired unclaimed）→ 放宽到 60s
 PENDING_TTL_S = 60.0
-UPDATE_TTL_S = 600.0
+# update 粘滞窗口：武装后设备在此时间内第一次 poll 即下发（一次性）。
+# dda0 曾静默 33min+ 才闪现上线，600s 武装窗口根本等不到 → 放宽到 2h
+UPDATE_TTL_S = 7200.0
 UPDATE_NOTIFY_GAP_S = 300.0
 MIN_SET_GAP = 2.0
 ONLINE_S = 45.0  # 超过则列表显示离线
