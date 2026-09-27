@@ -9,6 +9,7 @@
 #include <WiFiClient.h>
 #include <mbedtls/sha256.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 
 #ifndef OTA_VERSION_URL
 #define OTA_VERSION_URL "http://door.wzx.homes/ota/version"
@@ -469,13 +470,33 @@ static void doOta() {
   // Update.begin 必须在任何 HTTP 连接（含 version fetch）之前：短连接的
   // netconn/pbuf 会把最大连续块切到 4KB 以下 → begin 内部 malloc(4KB) 必失败
   //（err=0，malloc 失败路径不设 error）。失败/已最新由 otaAttempt 里 abort。
-  Update.abort();
+  // 实测 14:09 同场景成功、14:29/14:30 连续 4 次 err=0 失败且失败后 maxblk 仍
+  // 11252：begin 瞬间 8BIT 堆被 WiFi/tcpip 高优先级分配吃穿，采样总落在恢复后。
+  // → 带间隔重试给碎片恢复时间；每次失败打探针（probe4k/max8）留下判据。
+  bool began = false;
+  uint8_t err1 = 0;
   disableLoopWDT();
-  bool began = Update.begin(UPDATE_SIZE_UNKNOWN);
-  uint8_t err1 = Update.getError();  // 第一次的真实错误（abort 会覆盖）
-  if (!began) {
-    Update.abort();
+  for (int t = 0; t < 6 && !began; t++) {
+    if (t) {
+      Update.abort();
+      uint32_t tw = millis();
+      while (millis() - tw < 300) {
+        delay(10);
+        esp_task_wdt_reset();
+      }
+    }
+    void* probe = malloc(4096);
+    bool have4k = (probe != NULL);
+    if (probe) free(probe);
     began = Update.begin(UPDATE_SIZE_UNKNOWN);
+    if (t == 0) err1 = Update.getError();
+    if (!began) {
+      logShipf(
+          "[OTA] begin try=%d err=%u probe4k=%d free=%u maxIn=%u max8=%u",
+          t, (unsigned)Update.getError(), (int)have4k,
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
   }
   enableLoopWDT();
   if (!began) {
