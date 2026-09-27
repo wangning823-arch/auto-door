@@ -5,7 +5,8 @@
 ## 目录结构
 
 ```
-garage_door_firmware/
+archive/              # 旧根布局固件工程（历史归档，勿在此编译/改动）
+garage_door_firmware/ # 当前固件工程（唯一有效，所有改动都在这里）
 ├── src/              # 固件源码
 ├── docs/             # 文档、接线图
 ├── tools/            # 调试工具（RSSI监控、串口脚本）
