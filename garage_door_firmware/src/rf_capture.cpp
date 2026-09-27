@@ -1,10 +1,26 @@
 #include "rf_capture.h"
 #include "esp32-hal-rmt.h"
+#include "esp_rom_gpio.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/gpio_struct.h"
 
 // RMT：硬件按 µs 时序发 OOK，主循环不必 delay 等待
 static rmt_obj_t* s_rmtTx = nullptr;
 // 每 rmt_data_t 装 2 段（level+duration）；80脉冲×12帧 + 帧间隔 ≈ 486 项
 static rmt_data_t s_rmtBuf[512];
+// rmtInit 成功时抓到的 GPIO 矩阵输出信号号；pinMode/forceTxLow 可能把
+// func_out_sel 抢回 GPIO，而 ensureRmt 单例缓存不再重绑 → RMT 对空气发
+static uint16_t s_rmtSig = 0;
+
+// 每次发射前确保矩阵仍绑在 RMT 上（被抢则重绑）
+static void rmtRebind(int pin) {
+  if (pin < 0 || s_rmtSig == 0 || s_rmtSig == SIG_GPIO_OUT_IDX) return;
+  uint16_t cur = (uint16_t)GPIO.func_out_sel_cfg[pin].func_sel;
+  if (cur == s_rmtSig) return;
+  esp_rom_gpio_connect_out_signal((uint32_t)pin, s_rmtSig, false, false);
+  Serial.printf("[RF] RMT matrix re-bound GPIO%d (sig %u -> %u)\n", pin, cur,
+                s_rmtSig);
+}
 
 static volatile uint16_t rfPulseBuf[RF_CAPTURE_MAX_PULSES];
 static volatile uint32_t rfLastChangeUs = 0;
@@ -78,8 +94,11 @@ void RfCapture::begin(int rxPin, int txPin) {
 }
 
 bool RfCapture::ensureRmt() {
-  if (s_rmtTx) return true;
   if (txPin_ < 0) return false;
+  if (s_rmtTx) {
+    rmtRebind(txPin_);  // 缓存命中也要核对矩阵路由
+    return true;
+  }
   s_rmtTx = rmtInit(txPin_, RMT_TX_MODE, RMT_MEM_512);
   if (!s_rmtTx) {
     Serial.println("[RF] RMT init fail → 回退软件 bit-bang");
@@ -87,7 +106,8 @@ bool RfCapture::ensureRmt() {
   }
   // rmtSetTick 参数单位是 ns（见 esp32-hal-rmt.h）；1000ns = 1µs/tick，码表按 µs 存
   rmtSetTick(s_rmtTx, 1000.0f);
-  Serial.printf("[RF] RMT TX ready GPIO%d (async)\n", txPin_);
+  s_rmtSig = (uint16_t)GPIO.func_out_sel_cfg[txPin_].func_sel;
+  Serial.printf("[RF] RMT TX ready GPIO%d (async) sig=%u\n", txPin_, s_rmtSig);
   return true;
 }
 
@@ -818,6 +838,110 @@ void RfCapture::carrierTest(uint32_t ms) {
   digitalWrite(txPin_, LOW);
   txBusy_ = false;
   Serial.println("[RF] carrier done, GPIO low");
+}
+
+// 把发射脚输出从 RMT 外设夺回普通 GPIO（connect_out_signal 改 func_out_sel）
+static void takePinFromRmt(int pin) {
+  esp_rom_gpio_connect_out_signal((uint32_t)pin, SIG_GPIO_OUT_IDX, false,
+                                  false);
+  pinMode(pin, OUTPUT);
+}
+
+void RfCapture::pinGpioLevel(bool high) {
+  if (txPin_ < 0) return;
+  takePinFromRmt(txPin_);
+  // 持续高电平期间占住 txBusy_：防 TX 卡死看门狗 80ms 后强拉低
+  txBusy_ = high;
+  digitalWrite(txPin_, high ? HIGH : LOW);
+  Serial.printf("[RF] GPIO%d 直接 = %s（万用表测模块 DATA 脚）\n", txPin_,
+                high ? "HIGH" : "LOW");
+  if (!high) Serial.println("[RF] GPIO 低（下次 rfplay 会自动重绑回 RMT）");
+}
+
+void RfCapture::pinGpioPulse(uint32_t ms) {
+  if (txPin_ < 0) return;
+  if (ms < 10) ms = 10;
+  if (ms > 5000) ms = 5000;
+  takePinFromRmt(txPin_);
+  txBusy_ = true;
+  digitalWrite(txPin_, HIGH);
+  Serial.printf("[RF] GPIO%d 脉冲 HIGH %ums → LOW\n", txPin_, ms);
+  delay(ms);
+  digitalWrite(txPin_, LOW);
+  txBusy_ = false;
+  Serial.println("[RF] pulse done（下次 rfplay 会自动重绑回 RMT）");
+}
+
+bool RfCapture::playKeySoft(int idx) {
+  if (!keyValid(idx)) {
+    Serial.printf("[RF] 按键 %d 未学习\n", idx);
+    return false;
+  }
+  takePinFromRmt(txPin_);
+  Serial.printf("[RF] SOFT TX key%d x%u 帧（同步阻塞路径，绕过 RMT）\n", idx,
+                (unsigned)RF_PLAY_REPEATS);
+  bool ok = playFrameSoftware(keys_[idx], keyLen_[idx], RF_PLAY_REPEATS);
+  Serial.printf("[RF] SOFT TX %s（下次 rfplay 会自动重绑回 RMT）\n",
+                ok ? "done" : "FAIL");
+  return ok;
+}
+
+bool RfCapture::playKeyMonitor(int idx) {
+  if (!keyValid(idx)) {
+    Serial.printf("[RF] 按键 %d 未学习\n", idx);
+    return false;
+  }
+  if (!ensureRmt()) {
+    Serial.println("[RFMON] RMT 不可用");
+    return false;
+  }
+  // 开输入缓冲才能 digitalRead 读到 pad；gpio_config 可能动矩阵 → 再重绑一次
+  pinMode(txPin_, INPUT | OUTPUT);
+  rmtRebind(txPin_);
+  uint16_t sigBefore = (uint16_t)GPIO.func_out_sel_cfg[txPin_].func_sel;
+  Serial.printf("[RFMON] key%d async TX, func_out_sel=%u (rmtSig=%u)\n", idx,
+                sigBefore, s_rmtSig);
+
+  uint32_t t0 = micros();
+  if (!playFrame(keys_[idx], keyLen_[idx], RF_PLAY_REPEATS)) {
+    Serial.println("[RFMON] playFrame FAIL");
+    return false;
+  }
+  // 高速采样覆盖整个发射窗口（totalUs+余量）
+  bool prev = digitalRead(txPin_);
+  int edges = 0;
+  struct {
+    uint32_t us;
+    uint8_t lvl;
+  } tr[16];
+  int ntr = 0;
+  while ((uint32_t)(micros() - t0) < 430000UL) {
+    bool cur = digitalRead(txPin_);
+    if (cur != prev) {
+      uint32_t dt = micros() - t0;
+      if (ntr < 16) {
+        tr[ntr].us = dt;
+        tr[ntr].lvl = cur ? 1 : 0;
+        ntr++;
+      }
+      edges++;
+      prev = cur;
+    }
+  }
+  uint16_t sigAfter = (uint16_t)GPIO.func_out_sel_cfg[txPin_].func_sel;
+  service();  // 发射窗口已过，清 txBusy_
+  Serial.printf("[RFMON] edges=%d func_out_sel_after=%u\n", edges, sigAfter);
+  for (int i = 0; i < ntr; i++) {
+    Serial.printf("[RFMON]   t=%6uus -> %s\n", (unsigned)tr[i].us,
+                  tr[i].lvl ? "HIGH" : "LOW");
+  }
+  // 12帧 × 80脉冲 ≈ 1920 跳变；边沿为 0 = 波形没到引脚
+  if (edges >= 500) {
+    Serial.println("[RFMON] PASS：RMT 波形已到引脚");
+    return true;
+  }
+  Serial.println("[RFMON] FAIL：发射窗口内引脚几乎无跳变 → 波形没到引脚");
+  return false;
 }
 
 bool RfCapture::playRaw(const char* pulseCsv, uint8_t repeats) {

@@ -891,6 +891,44 @@ static void handleSerial() {
           if (v >= 50 && v <= 5000) ms = (uint32_t)v;
         }
         gRf.carrierTest(ms);
+      } else if (line.startsWith("rfpin")) {
+        // rfpin high | rfpin low | rfpin pulse [ms] —— 直接操控发射脚 GPIO
+        // （先把引脚从 RMT 矩阵夺回普通 GPIO，测完需重启才能再用 rfplay）
+        String rest = line.substring(5);
+        rest.trim();
+        if (rest == "high") {
+          gRf.pinGpioLevel(true);
+        } else if (rest == "low") {
+          gRf.pinGpioLevel(false);
+        } else if (rest.startsWith("pulse")) {
+          uint32_t ms = 1000;
+          int sp = rest.indexOf(' ');
+          if (sp > 0) {
+            long v = rest.substring(sp + 1).toInt();
+            if (v >= 10 && v <= 5000) ms = (uint32_t)v;
+          }
+          gRf.pinGpioPulse(ms);
+        } else {
+          Serial.println("[RF] 用法: rfpin high | rfpin low | rfpin pulse [ms]");
+        }
+      } else if (line.startsWith("rfsoft ")) {
+        // rfsoft 0|1|2|3 —— 强制旧同步 bit-bang 路径发码（绕过 RMT）
+        int idx = rfKeyIndexFromArg(line.substring(7));
+        if (idx < 0) {
+          Serial.println("[RF] 用法: rfsoft 0|1|2|3  或 open/close/stop/lock");
+        } else {
+          gRf.playKeySoft(idx);
+        }
+      } else if (line.startsWith("rfmon")) {
+        // rfmon [0-3] —— 异步发码并采样 GPIO26，验证波形真到引脚
+        String rest = line.substring(5);
+        rest.trim();
+        int idx = rest.length() ? rfKeyIndexFromArg(rest) : RF_KEY_CLOSE;
+        if (idx < 0) {
+          Serial.println("[RF] 用法: rfmon [0-3]（默认 1=关门）");
+        } else {
+          gRf.playKeyMonitor(idx);
+        }
       } else if (line.startsWith("rfset ")) {
         // rfset 0 123,456,... 手动灌码
         String rest = line.substring(6);
@@ -1064,7 +1102,7 @@ static void handleSerial() {
         Serial.println("[NFC] 已清除授权卡");
       } else if (line == "help") {
         Serial.println(
-            "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfauto on|off (max 2min) | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
+            "cmds: status | open | close | rfcap | rfstop | rflearn 0-3 | rfplay 0-3 | rfsoft 0-3 | rfmon [0-3] | rfpin high|low|pulse | rfauto on|off (max 2min) | rfloop 0 | rfbench 0 6 | rfcloop | rfcarrier | rfkeys | "
             "rfexport | rfclear | rfdefaults | i2cscan | i2cscan2 | buspull | busfree | sclhold | sclrelease | nfcscan | nfcsave <uid> | wifi on|off | autotrack on|off | blebond | blepair [sec] | bleunpair");
       } else if (line == "rfdefaults") {
         // 强制写入实车验证的开/关码（修第二块板开码不对）

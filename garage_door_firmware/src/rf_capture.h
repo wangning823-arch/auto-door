@@ -64,6 +64,15 @@ class RfCapture {
   // 发射脚自检：ms 毫秒方波（0=拉高 ms 后拉低），便于万用表测 GPIO26
   void carrierTest(uint32_t ms = 1000);
 
+  // ===== 诊断：直接 GPIO 控制（先把发射脚从 RMT 矩阵夺回）=====
+  // 注意：夺回后 RMT 路由已断，rfplay 需重启设备才恢复
+  void pinGpioLevel(bool high);
+  void pinGpioPulse(uint32_t ms);
+  // 同步 bit-bang 发码（完全绕过 RMT，验证发射模块本身）
+  bool playKeySoft(int idx);
+  // 异步发码 + 实时采样 GPIO26：打印跳变边沿，验证波形真到引脚
+  bool playKeyMonitor(int idx);
+
   // RX 预热后，TX 持续高电平 carrierMs，同步抓包看能否收到
   bool carrierLoopback(uint32_t carrierMs = 800);
 
