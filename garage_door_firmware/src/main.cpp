@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <ArduinoOTA.h>
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -36,80 +35,15 @@ static RfCapture gRf;
 static NfcReader gNfc;
 static char gMac[24] = CAR_BT_MAC;
 static bool gBtStackInited = false;
-static bool gOtaBegun = false;
 // OTA 写 flash 期间禁止碰 I2C/NFC（否则易把 PN532/总线拖死，升级后刷卡失效）
+// 由 VPS 远程 OTA 的 busy hook 置位（ArduinoOTA/桌面 espota 已移除：
+// 其 UDP parsePacket 每 loop 试分配 1460B、~200失败/秒，是 DEF 池头号搅动者）
 static volatile bool gOtaActive = false;
-static volatile uint32_t gOtaActiveAtMs = 0;
 
 // http worker 发送前查询：蓝牙正在占射频（Inquiry/BLE 扫描）就等空隙
 static bool httpBtRadioBusy() {
   if (!gBtStackInited) return false;
   return gBt.inquiryBusy() || gBleScan.busy();
-}
-
-static void otaDisarm(const char* why) {
-  if (!gOtaActive) return;
-  gOtaActive = false;
-  Serial.printf("[OTA] disarm (%s)\n", why ? why : "?");
-  if (gNfc.ok()) gNfc.setListen(true);
-  else gNfc.kickRecover();
-}
-
-// STA 连上后启动 ArduinoOTA：传输期间暂停 Inquiry+NFC，结束后恢复
-static void serviceOta() {
-  if (!gWeb.staConnected()) {
-    // STA 掉线可能打断 OTA：必须清 gOtaActive，否则刷卡路径被永久跳过
-    otaDisarm("sta lost");
-    if (gOtaBegun) {
-      ArduinoOTA.end();
-      gOtaBegun = false;
-      gWeb.setOtaReady(false);
-      Serial.println("[OTA] STA lost, OTA stopped");
-    }
-    return;
-  }
-  // 兜底：onStart 后若既无 onEnd/onError（网络半死），超时自动解除
-  if (gOtaActive && (millis() - gOtaActiveAtMs) > 180000UL) {
-    otaDisarm("timeout 180s");
-  }
-  if (!gOtaBegun) {
-    ArduinoOTA.setHostname(gWeb.staHostname().c_str());
-    ArduinoOTA.setMdnsEnabled(false);  // 无 mDNS，客户端用 STA IP:3232
-    ArduinoOTA.onStart([]() {
-      Serial.println("[OTA] START ip=" + gWeb.staIp());
-      gOtaActive = true;
-      gOtaActiveAtMs = millis();
-      gNfc.setListen(false);
-      if (gBtStackInited) {
-        gBt.setInquiryPaused(true);
-        gBt.cancelActiveInquiry();
-      }
-    });
-    ArduinoOTA.onEnd([]() {
-      Serial.println("[OTA] END (reboot)");
-      gOtaActive = false;
-      if (gBtStackInited) gBt.setInquiryPaused(false);
-      if (gNfc.ok()) gNfc.setListen(true);
-    });
-    ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
-      static int lastPct = -1;
-      int pct = t ? (int)(100u * p / t) : 0;
-      if (pct != lastPct && (pct % 10 == 0 || pct == 100)) {
-        lastPct = pct;
-        Serial.printf("[OTA] %d%%\n", pct);
-      }
-    });
-    ArduinoOTA.onError([](ota_error_t e) {
-      Serial.printf("[OTA] error %u\n", (unsigned)e);
-      otaDisarm("error");
-      if (gBtStackInited) gBt.setInquiryPaused(false);
-    });
-    ArduinoOTA.begin();
-    gOtaBegun = true;
-    gWeb.setOtaReady(true);
-    Serial.println("[OTA] ready ip=" + gWeb.staIp() + " fw=" FW_VERSION);
-  }
-  ArduinoOTA.handle();
 }
 
 // 经典 BT + BLE 配对栈：SoftAP 调试时推迟，优先让网页先出来
@@ -883,7 +817,7 @@ static void handleSerial() {
         }
         Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
                        " ip=" + gWeb.staIp() + " name=" + gWeb.staHostname() +
-                       " ota=" + String(gOtaBegun ? "on" : "off"));
+                       " ota=off(vps)");
       } else if (line == "wifi off") {
         // 与网页一致：只关热点、保留 STA；BT 栈由 serviceBtStackInit 延时起
         gCfg.saveWifiEnabled(false);
@@ -949,7 +883,7 @@ static void handleSerial() {
                       (unsigned)ESP.getFreeHeap(), (int)gBtStackInited);
         Serial.println("[CMD] sta=" + String(gWeb.staConnected() ? "up" : "down") +
                        " ip=" + gWeb.staIp() + " name=" + gWeb.staHostname() +
-                       " ota=" + String(gOtaBegun ? "on" : "off") +
+                       " ota=off(vps)" +
                        " rssi=" + String(gWeb.staConnected() ? WiFi.RSSI() : 0));
       } else if (line == "relay high" || line == "relay low" || line == "relay pulse") {
         int pin = gDoor.relayPin();
@@ -1462,7 +1396,6 @@ void setup() {
   remoteOtaSetBusyHook([](bool on) {
     gOtaActive = on;
     if (on) {
-      gOtaActiveAtMs = millis();
       gNfc.setSuspended(true);  // 不碰 I2C，避免 OTA 启动时卡死
       if (gBtStackInited) {
         gBt.setInquiryPaused(true);  // 内部会 cancel discovery，非阻塞
@@ -1670,7 +1603,6 @@ void loop() {
   }
 
   gWeb.loop();
-  serviceOta();
   gDoor.loop(gBt);
   serviceBootLongPress();
   handleSerial();
@@ -1737,8 +1669,11 @@ void loop() {
       sb.remoteOn = remoteCmdEnabled();
       sb.door = (int)gDoor.doorState();
       sb.rssi = gWeb.staConnected() ? WiFi.RSSI() : 0;
-      sb.heap = ESP.getFreeHeap();
-      sb.maxblk = ESP.getMaxAllocHeap();
+      // 心跳/控制台改 DEF 池口径：ESP.getFreeHeap/getMaxAllocHeap 是
+      // INTERNAL 口径（含 11KB malloc 摸不到的死块），一直误导排障；
+      // DEF 才是 malloc 真正在用的池（[HEAPPOOL] 有全量分池）
+      sb.heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+      sb.maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
       sb.uptimeMs = millis();
       // ===== 控制台配置回显 =====
       gWeb.staIp().toCharArray(sb.staIp, sizeof(sb.staIp));
@@ -2008,9 +1943,11 @@ void loop() {
     // availableForWrite() 最大约 128 —— 旧条件 >256 永假，心跳从不输出
     // （两台设备 67KB VPS 日志 0 条 [LOG] 实证），断网期丢失 sta/rssi 面包屑
     if (Serial.availableForWrite() > 96) {
+      // DEF 池口径（ESP.getFreeHeap/getMaxAllocHeap 是 INTERNAL 死块口径）
       logShipf(
           "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s",
-          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
           (int)gWeb.staConnected(),
           gWeb.staConnected() ? "up" : "down",
           gDoor.debugLine().c_str(), gBt.debugLine().c_str(),
