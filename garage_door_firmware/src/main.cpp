@@ -721,30 +721,53 @@ static void serviceStaDataWatchdog() {
 // 疑似被写坏。三件套：分配失败钩子（谁、分多大、在哪失败）+ 周期完整性自检
 // （损坏出现在哪 2 秒窗口）+ 任务栈水位（找栈溢出写坏堆的元凶）。
 static volatile uint32_t gHeapFailN = 0;
+// 失败事件只在钩子里记字段（无锁、不 printf），完整诊断在 loop 上下文打印
+struct HeapFailEvt {
+  volatile uint32_t seq;
+  uint32_t size;
+  uint32_t caps;
+  void* ra0;
+  void* ra1;
+  void* ra2;
+  void* ra3;
+  void* ra4;
+  void* ra5;
+  char task[16];
+  char fn[24];
+};
+static HeapFailEvt gFailEvt;
+
 static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
-  // 可能在持有堆锁的分配路径里被调：严禁再走堆，防重入
+  // 分配路径里被调：严禁再走堆/分配，防重入防死锁
   static volatile bool inHook = false;
   if (inHook) return;
   inHook = true;
   uint32_t n = ++gHeapFailN;
-  if (n <= 32 || (n & 63) == 0) {  // 限量打印防刷屏
-    char task[16] = "?";
+  if (n <= 16 || (n & 255) == 0) {
+    gFailEvt.size = (uint32_t)size;
+    gFailEvt.caps = (uint32_t)caps;
+    gFailEvt.ra0 = __builtin_return_address(0);
+    gFailEvt.ra1 = __builtin_return_address(1);
+    // ra2/ra3 穿过 heap_caps_* 公共层，指向真正调用 malloc/realloc 的代码
+    gFailEvt.ra2 = __builtin_return_address(2);
+    gFailEvt.ra3 = __builtin_return_address(3);
+    // ra4/ra5: malloc 的调用者（String/lwIP/业务代码，真正要抓的层）
+    gFailEvt.ra4 = __builtin_return_address(4);
+    gFailEvt.ra5 = __builtin_return_address(5);
+    const char* fnm = fn ? fn : "?";
+    strncpy(gFailEvt.fn, fnm, sizeof(gFailEvt.fn) - 1);
+    gFailEvt.fn[sizeof(gFailEvt.fn) - 1] = '\0';
+    gFailEvt.task[0] = '?';
+    gFailEvt.task[1] = '\0';
     TaskHandle_t h = xTaskGetCurrentTaskHandle();
     if (h) {
       const char* nm = pcTaskGetName(h);
       if (nm) {
-        strncpy(task, nm, sizeof(task) - 1);
-        task[sizeof(task) - 1] = '\0';
+        strncpy(gFailEvt.task, nm, sizeof(gFailEvt.task) - 1);
+        gFailEvt.task[sizeof(gFailEvt.task) - 1] = '\0';
       }
     }
-    char buf[168];
-    int m = snprintf(buf, sizeof(buf),
-                     "[HEAPFAIL] #%u size=%u caps=0x%x fn=%s task=%s "
-                     "free=%u maxblk=%u\n",
-                     (unsigned)n, (unsigned)size, (unsigned)caps,
-                     fn ? fn : "?", task, (unsigned)ESP.getFreeHeap(),
-                     (unsigned)ESP.getMaxAllocHeap());
-    if (m > 0) Serial.write(buf, (size_t)m);
+    gFailEvt.seq = n;  // 最后写：loop 见 seq 变化才消费
   }
   inHook = false;
 }
@@ -757,6 +780,46 @@ static void serviceHeapDiag() {
     if (!heap_caps_check_integrity_all(false)) {
       Serial.println("[HEAP] INTEGRITY FAIL — free list 已损坏!");
       heap_caps_check_integrity_all(true);  // 第二遍打印细节
+    }
+  }
+  // 消费最近一次分配失败：分池统计 + 调用者返回地址（addr2line 定位）
+  {
+    static uint32_t lastSeen = 0;
+    uint32_t seq = gFailEvt.seq;
+    if (seq != lastSeen) {
+      lastSeen = seq;
+      multi_heap_info_t iCap, i8bit;
+      heap_caps_get_info(&iCap, gFailEvt.caps);
+      heap_caps_get_info(&i8bit, MALLOC_CAP_8BIT);
+      // logShipf = 串口 + VPS 双通道：侦查数据不插 USB 也能从设备日志看
+      // 格式: free/big 成对（8BIT 大小 vs 失败 caps 口径大小）
+      logShipf("[HEAPFAIL] #%u sz=%u t=%s big8=%u ra4=%p ra5=%p",
+               (unsigned)seq, (unsigned)gFailEvt.size, gFailEvt.task,
+               (unsigned)i8bit.largest_free_block, gFailEvt.ra4,
+               gFailEvt.ra5);
+    }
+  }
+  // 每 10s 分池水位：哪个 caps 口径在「饿」
+  static uint32_t lastPool = 0;
+  if (now - lastPool >= 10000) {
+    lastPool = now;
+    // 不再看串口缓冲：logShipf 自带串口+VPS 双通道，门闩会让 VPS 侧漏数据
+    {
+      multi_heap_info_t iDef, i18, i8, iIn;
+      heap_caps_get_info(&iDef, MALLOC_CAP_DEFAULT);
+      heap_caps_get_info(&i18, MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT);
+      heap_caps_get_info(&i8, MALLOC_CAP_8BIT);
+      heap_caps_get_info(&iIn, MALLOC_CAP_INTERNAL);
+      // 每池格式: total_free/largest_free
+      logShipf("[HEAPPOOL] DEF %u/%u INTDEF %u/%u 8BIT %u/%u INT %u/%u fail=%u",
+               (unsigned)iDef.total_free_bytes,
+               (unsigned)iDef.largest_free_block,
+               (unsigned)i18.total_free_bytes,
+               (unsigned)i18.largest_free_block,
+               (unsigned)i8.total_free_bytes,
+               (unsigned)i8.largest_free_block,
+               (unsigned)iIn.total_free_bytes,
+               (unsigned)iIn.largest_free_block, (unsigned)gHeapFailN);
     }
   }
   if (now - lastStack >= 10000) {

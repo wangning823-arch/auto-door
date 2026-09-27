@@ -233,10 +233,14 @@ static void parseHttpUrl(const String& url, String* host, uint16_t* port,
   }
 }
 
-// 完整性不过就 abort，绝不 set_boot。停 NFC/BT 由 s_busyFn 完成（见 doOta 包装）。
-// 成功路径不返回（ESP.restart）；其余情况返回，由 doOta 统一恢复现场。
-static void otaAttempt() {
-  String host, vpath, bpathUrl = OTA_BIN_URL;
+// 取版本确认有更新 → 立即蓝牙下电（释放 ~88KB）→ 等 WiFi 链路稳。
+// 用户方案：update 结束必重启，蓝牙留着没意义——先下电再 begin，
+// 8BIT 池直接回到 ~110KB，Update.begin 的 4KB malloc 不用再和 tcpip
+// 抢碎池里的微秒窗口（旧顺序 begin 在前：max8≈4084 被抢 → 6 连败）。
+// 返回 true = 有更新且射频已就绪（s_radioDown=true，失败路径必须重启恢复）；
+// 返回 false = 无更新/取版本失败（射频未动，doOta 直接恢复现场）。
+static bool otaPrepare(String* shaOut) {
+  String host, vpath;
   uint16_t port = 80;
   parseHttpUrl(OTA_VERSION_URL, &host, &port, &vpath, "/ota/version");
   vpath = withId(vpath);
@@ -247,7 +251,7 @@ static void otaAttempt() {
     setMsg("version fetch fail");
     logShipf("[OTA] version fetch fail id=%s why=%s", deviceId().c_str(),
              s_httpWhy[0] ? s_httpWhy : "?");
-    return;
+    return false;
   }
   String body;
   body.reserve(512);
@@ -264,7 +268,7 @@ static void otaAttempt() {
   if (!parseJsonStr(body, "version", &remoteVer)) {
     setMsg("no version");
     logShipf("[OTA] version.json missing version");
-    return;
+    return false;
   }
   remoteVer.trim();
   parseJsonStr(body, "sha256", &remoteSha);
@@ -274,7 +278,7 @@ static void otaAttempt() {
     setMsg("up to date");
     s_done = true;
     logShipf("[OTA] up to date %s", FW_VERSION);
-    return;
+    return false;
   }
   logShipf("[OTA] new %s -> %s sha=%s id=%s", FW_VERSION, remoteVer.c_str(),
            remoteSha.length() ? remoteSha.substring(0, 12).c_str() : "-",
@@ -303,6 +307,17 @@ static void otaAttempt() {
     logShipf("[OTA] wifi settle st=%d rssi=%d", (int)WiFi.status(),
              (int)WiFi.RSSI());
   }
+  if (shaOut) *shaOut = remoteSha;
+  return true;
+}
+
+// 下载+校验+激活（版本已确认、射频已下电、Update.begin 已由 doOta 完成）。
+// 完整性不过就 abort，绝不 set_boot。停 NFC/BT 由 s_busyFn 完成（见 doOta 包装）。
+// 成功路径不返回（ESP.restart）；其余情况返回，由 doOta 统一恢复现场。
+static void otaAttempt(const String& remoteSha) {
+  String host, bpathUrl = OTA_BIN_URL;
+  uint16_t port = 80;
+  WiFiClient client;
 
   // 下载+校验+激活整段最多 3 轮：BT 下电瞬断、链路抖动都可能断流
   for (int round = 1; round <= 3; round++) {
@@ -480,12 +495,19 @@ static void doOta() {
   // （停滞时 DNS 可阻塞 >5s → loopTask TWT 崩溃）
   logShipResolve();
 
-  // Update.begin 必须在任何 HTTP 连接（含 version fetch）之前：短连接的
-  // netconn/pbuf 会把最大连续块切到 4KB 以下 → begin 内部 malloc(4KB) 必失败
-  //（err=0，malloc 失败路径不设 error）。失败/已最新由 otaAttempt 里 abort。
-  // 实测 14:09 同场景成功、14:29/14:30 连续 4 次 err=0 失败且失败后 maxblk 仍
-  // 11252：begin 瞬间 8BIT 堆被 WiFi/tcpip 高优先级分配吃穿，采样总落在恢复后。
-  // → 带间隔重试给碎片恢复时间；每次失败打探针（probe4k/max8）留下判据。
+  // 用户方案：先取版本确认有更新 → 蓝牙下电释放 ~88KB → 再 begin。
+  // 旧顺序 begin 在最前：8BIT 池碎在 max8≈4KB，4KB 预留还要和 tcpip 抢
+  // 微秒窗口（实测 res4k 被吃 → 6 连败 err=0）。下电后池子回到 ~110KB，
+  // begin 十拿九稳；hold4k 预留逻辑保留作兜底。
+  // （本注释更新 = 触发新版本号，用于线上验证新时序：radio 应先于 begin。）
+  String remoteSha;
+  if (!otaPrepare(&remoteSha)) {
+    // 无更新/取版本失败：射频未动 → 恢复现场即可
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    httpResume();
+    return;
+  }
   bool began = false;
   uint8_t err1 = 0;
   disableLoopWDT();
@@ -525,10 +547,18 @@ static void doOta() {
     s_active = false;
     if (s_busyFn) s_busyFn(false);
     httpResume();
+    if (s_radioDown) {
+      // 射频已在 otaPrepare 拆掉：不重启则蓝牙跟踪永久失效
+      s_radioDown = false;
+      logShipf("[OTA] begin fail -> reboot to restore BT");
+      logShipFlushNow();
+      delay(300);
+      ESP.restart();
+    }
     return;
   }
 
-  otaAttempt();
+  otaAttempt(remoteSha);
   // 失败/已最新 → 恢复 NFC/Inquiry、省电、放行 http、允许下次触发
   //（成功路径不返回：ESP.restart）
   Update.abort();
