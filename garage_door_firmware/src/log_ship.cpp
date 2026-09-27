@@ -23,6 +23,13 @@
 #ifndef LOG_SHIP_RING_BYTES
 #define LOG_SHIP_RING_BYTES 2560
 #endif
+// 单次快照上限（分片上传）：碎片堆里 8BIT max8 实测可低至 ~2.4KB，整环 2560B
+// 拷进 String 会 OOM → body 变空 → 发出空 POST → 服务端静默丢弃而环已摘走
+// → 内容永久丢失且每轮重复（20260927 dda0：20 次200 空包 0 落盘的死循环）。
+// 1536 < 观测最小 max8(2292)，拷贝必成；成功后 1s 续发下一片
+#ifndef LOG_SHIP_CHUNK
+#define LOG_SHIP_CHUNK 1536
+#endif
 
 static char s_ring[LOG_SHIP_RING_BYTES];
 static size_t s_len = 0;  // 有效字节，紧凑存放
@@ -190,10 +197,15 @@ void logShipFlushNow() {
 
   ringLock();
   String body;
-  body.reserve(s_len);
-  body.concat(s_ring, s_len);
+  // 同样分片：整环 2560B 在碎片堆 OOM 会 early-skip，OTA 重启前一段日志全丢
+  size_t fchunk = s_len > LOG_SHIP_CHUNK ? LOG_SHIP_CHUNK : s_len;
+  if (fchunk > 0) {
+    body.reserve(fchunk);
+    body.concat(s_ring, fchunk);
+    if (body.length() != fchunk) fchunk = 0;
+  }
   ringUnlock();
-  if (body.length() == 0 || WiFi.status() != WL_CONNECTED) {
+  if (fchunk == 0 || WiFi.status() != WL_CONNECTED) {
     Serial.printf("[FLUSH] early skip dt=%u\n", (unsigned)(millis() - t0));
     return;
   }
@@ -274,7 +286,11 @@ void logShipFlushNow() {
   Serial.printf("[FLUSH] done code=%d dt=%u\n", code, (unsigned)(millis() - t0));
   if (code == 200) {
     ringLock();
-    s_len = 0;
+    // 只摘已发出的环头一片；新日志在环尾不受影响
+    if (fchunk <= s_len) {
+      memmove(s_ring, s_ring + fchunk, s_len - fchunk);
+      s_len -= fchunk;
+    }
     ringUnlock();
     s_failStreak = 0;
   }
@@ -291,7 +307,11 @@ void logShipService(bool btBusy, bool wifiOk) {
     s_inFlight = false;
     if (code == 200) {
       s_failStreak = 0;
-      s_nextMs = millis() + LOG_SHIP_INTERVAL_MS;
+      // 环里还有积压 → 1s 后接着发下一片；发干净才回 30s 周期
+      ringLock();
+      size_t left = s_len;
+      ringUnlock();
+      s_nextMs = millis() + (left > 0 ? 1000UL : LOG_SHIP_INTERVAL_MS);
     } else {
       s_failStreak++;
       ringLock();
@@ -311,17 +331,25 @@ void logShipService(bool btBusy, bool wifiOk) {
   uint16_t port = 80;
   parseLogUrl(&host, &port, &path);
 
-  // 快照并摘掉（飞行期间新日志落新 ring，互不干扰）
+  // 快照环头 ≤CHUNK（分片），见 LOG_SHIP_CHUNK 注释的空包死循环；
+  // 摘环仅在拷贝成功后执行——OOM 时内容留环里下轮再试（旧实现先清环会丢日志）
   String body;
+  size_t chunk = 0;
   ringLock();
   if (s_len > 0) {
-    body.reserve(s_len);
-    body.concat(s_ring, s_len);
-    s_len = 0;
+    chunk = s_len > LOG_SHIP_CHUNK ? LOG_SHIP_CHUNK : s_len;
+    body.reserve(chunk);
+    body.concat(s_ring, chunk);
+    if (body.length() == chunk) {
+      memmove(s_ring, s_ring + chunk, s_len - chunk);
+      s_len -= chunk;
+    } else {
+      chunk = 0;
+    }
   }
   ringUnlock();
 
-  if (body.length() == 0) {
+  if (chunk == 0) {
     s_nextMs = now + LOG_SHIP_INTERVAL_MS;
     return;
   }

@@ -54,3 +54,6 @@ garage_door_firmware/lib/Adafruit_PN532/examples/
 
 # 3D 澶栧３鏈湴绱犳潗
 澶栧３瀹夎3D/
+
+# 临时诊断抓取页（会话生成的空/残缺文件，不入库）
+diag_page_*.html
