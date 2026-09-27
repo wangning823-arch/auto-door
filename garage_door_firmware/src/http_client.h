@@ -16,6 +16,20 @@ enum HttpOwner {
 // 返回 true = 蓝牙（Inquiry/BLE 扫描）正在占射频
 using HttpBtBusyFn = bool (*)();
 
+// 连续网络层失败（code<0：DNS/connect/读超时）达此数 → 数据面看门狗强制重连
+#ifndef HTTP_NET_FAIL_KICK
+#define HTTP_NET_FAIL_KICK 4
+#endif
+
+// 提交后这么久仍未被 worker 取走（结果必丢）→ 合成失败释放该 owner
+#ifndef HTTP_STUCK_UNPICKED_MS
+#define HTTP_STUCK_UNPICKED_MS 300000UL
+#endif
+// worker 取走后超过 timeout+此值 仍无结果 → 视为丢失，合成失败释放
+#ifndef HTTP_STUCK_EXTRA_MS
+#define HTTP_STUCK_EXTRA_MS 60000UL
+#endif
+
 // setup 早期调用一次：建队列+任务
 void httpClientBegin(HttpBtBusyFn btBusyFn);
 // 提交请求；false = 队列满（调用方稍后重试）。owner 同一时刻最多一个在飞
@@ -35,3 +49,6 @@ void httpSetWebBusy(bool busy);
 bool httpPause(uint32_t waitMs);
 // 恢复接受提交
 void httpResume();
+// 连续网络层失败计数（code<0 累加，HTTP 状态码清零）——数据面看门狗用
+int httpClientNetFailStreak();
+void httpClientResetNetFail();

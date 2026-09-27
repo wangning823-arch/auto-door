@@ -29,6 +29,8 @@ class WebPortal {
   bool staConfigured() const;
   bool staConnected() const;
   String staIp() const;
+  // 数据面看门狗：sta=1 但网络层连续失败（僵尸关联/IP 黑洞）→ 主动断开重连
+  void forceStaReconnect();
   // 设备名（仅日志/OTA 协议元数据；无 mDNS，访问一律用 STA IP）
   String staHostname() const { return host_; }
   void loopSta();  // 非阻塞重连 + 状态打印

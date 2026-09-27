@@ -943,6 +943,24 @@ void WebPortal::stopSta() {
   Serial.println("[WEB] STA stopped");
 }
 
+// 数据面看门狗调用：status 显示已连接却连续发不出（僵尸关联/IP 层黑洞）时，
+// 主动断开重连自愈。真断开场景不走这里（loopSta 已有节流重连）。
+void WebPortal::forceStaReconnect() {
+  if (!staWanted_) return;
+  String ssid = store_ ? store_->loadStaSsid() : String();
+  String pass = store_ ? store_->loadStaPass() : String();
+  if (!ssid.length()) {
+    Serial.println("[WEB] forceStaReconnect: no stored ssid, skip");
+    return;
+  }
+  Serial.printf("[WEB] forceStaReconnect ssid=%s (data-path watchdog)\n",
+                ssid.c_str());
+  WiFi.disconnect(false, false);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  staTrying_ = true;
+  staNextRetryMs_ = millis() + 15000;
+}
+
 void WebPortal::ensureHttpIfSta() {
   if (apActive_) return;
   if (!staWanted_ || !staConnected()) return;

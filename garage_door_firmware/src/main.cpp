@@ -560,6 +560,23 @@ static void serviceBootLongPress() {
   }
 }
 
+// ===== 数据面看门狗：sta=1 却连续网络层失败 → 僵尸关联，强制重连自愈 =====
+// 背景：dda0 曾在路由器侧网络正常时静默 33 分钟——WiFi.status() 一直报已连接，
+// 但 DNS/connect 全失败（deauth 漏收/DHCP 黑洞）。loopSta 只要 WL_CONNECTED 就
+// 提前 return，永远不会自救。这里补上数据面校验：发送结果说"网络层失败"才动手。
+static void serviceStaDataWatchdog() {
+  static uint32_t lastKickMs = 0;
+  if (!gWeb.staConnected()) return;  // 真断开由 loopSta 节流重连，不归这里管
+  int streak = httpClientNetFailStreak();
+  if (streak < HTTP_NET_FAIL_KICK) return;
+  uint32_t now = millis();
+  if (lastKickMs != 0 && (now - lastKickMs) < 120000UL) return;  // 限频防抖
+  lastKickMs = now;
+  httpClientResetNetFail();
+  logShipf("[WEB] datagate sta=1 netfail=%d -> force STA reconnect", streak);
+  gWeb.forceStaReconnect();
+}
+
 static void handleSerial() {
   static String line;
   while (Serial.available()) {
@@ -1431,6 +1448,7 @@ void loop() {
     remoteCmdService(btBusy, gWeb.staConnected());
     logShipService(btBusy, gWeb.staConnected());
     remoteOtaService(btBusy, gWeb.staConnected());
+    serviceStaDataWatchdog();
     {
       StatusBits sb;
       sb.nfcOk = gNfc.ok();
@@ -1684,8 +1702,11 @@ void loop() {
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 8000) {
     lastLog = millis();
-    // 串口缓冲不空闲就跳过周期日志，避免 TX 满时 println 拖死 loop
-    if (Serial.availableForWrite() > 256) {
+    // 串口缓冲不空闲就跳过周期日志，避免 TX 满时 println 拖死 loop。
+    // 阈值必须小于 FIFO 深度：本框架默认无软件 TX 缓冲（仅 128B 硬件 FIFO），
+    // availableForWrite() 最大约 128 —— 旧条件 >256 永假，心跳从不输出
+    // （两台设备 67KB VPS 日志 0 条 [LOG] 实证），断网期丢失 sta/rssi 面包屑
+    if (Serial.availableForWrite() > 96) {
       logShipf(
           "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s",
           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),

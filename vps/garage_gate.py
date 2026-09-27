@@ -69,8 +69,9 @@ MCP_SERVER_VERSION = "0.2.0"
 MCP_PROTOCOL_DEFAULT = "2024-11-05"
 MCP_PROTOCOL_KNOWN = ("2025-03-26", "2024-11-05", "2024-10-07")
 
-# 蓝牙 Inquiry 忙时设备可能 >6s 才 poll 一次；TTL 过短会把指令扔掉
-PENDING_TTL_S = 25.0
+# 蓝牙 Inquiry 忙时设备可能 >6s 才 poll 一次；坏网时退避+排队可 >25s
+# （dda0 实测 25s TTL 大量 expired unclaimed）→ 放宽到 60s
+PENDING_TTL_S = 60.0
 UPDATE_TTL_S = 600.0
 UPDATE_NOTIFY_GAP_S = 300.0
 MIN_SET_GAP = 2.0

@@ -28,6 +28,7 @@
 
 struct HttpJob {
   int owner;
+  uint32_t gen;  // 提交代次：owner 被在飞看门狗判死后，旧结果按代次丢弃
   bool isPost;
   String host;
   uint16_t port;
@@ -40,11 +41,16 @@ struct HttpSlot {
   std::atomic<bool> ready{false};
   int code = 0;
   String body;
+  uint32_t gen = 0;        // 最近一次提交的代次
+  uint32_t submitMs = 0;   // 提交时刻（在飞看门狗）
+  uint32_t startMs = 0;    // worker 取走开始执行的时刻；0=还没被取走
+  uint32_t timeoutMs = 0;
 };
 
 static QueueHandle_t s_jobs = nullptr;
 static HttpSlot s_slots[HTTP_OWNER_COUNT];
 static std::atomic<bool> s_ownerBusy[HTTP_OWNER_COUNT];
+static std::atomic<int> s_netFail{0};      // 连续网络层失败（code<0）
 static std::atomic<bool> s_radioBusy{false};
 static std::atomic<bool> s_webBusy{false};   // 本地网页响应中
 static std::atomic<bool> s_paused{false};    // OTA 排空期：拒新提交
@@ -111,18 +117,32 @@ static int httpExchange(const HttpJob& j, String* respOut) {
   return head.substring(sp1 + 1, sp2).toInt();
 }
 
+// 单次任务完成：代次一致才交付结果（被看门狗判死的旧任务直接丢弃）
+static void httpFinishJob(HttpJob* j, int code, const String& resp) {
+  HttpSlot& s = s_slots[j->owner];
+  if (s.gen == j->gen) {
+    s.code = code;
+    s.body = resp;
+    s.ready.store(true);  // 数据先写，ready 后置
+  }
+  if (code < 0) {
+    s_netFail++;  // DNS/connect/超时等网络层失败
+  } else {
+    s_netFail = 0;
+  }
+  delete j;
+  s_workerBusy.store(false);
+}
+
 static void httpWorker(void*) {
   HttpJob* j = nullptr;
   for (;;) {
     if (xQueueReceive(s_jobs, &j, portMAX_DELAY) != pdTRUE || !j) continue;
     s_workerBusy.store(true);
+    s_slots[j->owner].startMs = millis();
 
     if (WiFi.status() != WL_CONNECTED) {
-      s_slots[j->owner].code = -10;
-      s_slots[j->owner].body = "";
-      s_slots[j->owner].ready.store(true);  // ownerBusy 由消费方收结果时清
-      delete j;
-      s_workerBusy.store(false);
+      httpFinishJob(j, -10, String());  // ownerBusy 由消费方收结果时清
       continue;
     }
 
@@ -138,13 +158,7 @@ static void httpWorker(void*) {
     String resp;
     int code = httpExchange(*j, &resp);
     s_radioBusy.store(false);
-
-    s_slots[j->owner].code = code;
-    s_slots[j->owner].body = resp;
-    s_slots[j->owner].ready.store(true);  // 数据先写，ready 后置
-    delete j;
-    j = nullptr;
-    s_workerBusy.store(false);
+    httpFinishJob(j, code, resp);
   }
 }
 
@@ -166,8 +180,15 @@ static bool submit(int owner, bool isPost, const String& host, uint16_t port,
   if (s_paused.load()) return false;  // OTA 排空期拒新单
   if (s_ownerBusy[owner].load()) return false;  // 该 owner 已有在飞请求
   s_ownerBusy[owner].store(true);
-  HttpJob* j = new HttpJob{owner, isPost, host, port, path, body, timeoutMs};
+  HttpSlot& s = s_slots[owner];
+  s.gen++;
+  s.submitMs = millis();
+  s.startMs = 0;
+  s.timeoutMs = timeoutMs;
+  HttpJob* j = new HttpJob{owner, s.gen, isPost, host, port, path, body,
+                           timeoutMs};
   if (xQueueSend(s_jobs, &j, 0) != pdTRUE) {
+    s.submitMs = 0;
     s_ownerBusy[owner].store(false);
     delete j;
     return false;
@@ -189,11 +210,32 @@ bool httpSubmitPost(int owner, const String& host, uint16_t port,
 bool httpTryResult(int owner, int* code, String* body) {
   if (owner < 0 || owner >= HTTP_OWNER_COUNT) return false;
   HttpSlot& s = s_slots[owner];
+  if (!s.ready.load() && s_ownerBusy[owner].load()) {
+    // 在飞看门狗：结果丢失（null 任务被丢弃/worker 卡死）时合成失败释放，
+    // 否则该 owner 的 inFlight 永远等不到结果 → 这类请求死到重启为止
+    uint32_t now = millis();
+    bool stuck;
+    if (s.startMs == 0) {
+      stuck = s.submitMs != 0 && (now - s.submitMs) > HTTP_STUCK_UNPICKED_MS;
+    } else {
+      stuck = (now - s.startMs) > s.timeoutMs + HTTP_STUCK_EXTRA_MS;
+    }
+    if (stuck) {
+      s.gen++;  // 迟到的真实结果按代次丢弃，不污染下一个请求
+      s.code = -12;
+      s.body = "";
+      s.ready.store(true);
+      Serial.printf("[HTTP] owner=%d 在飞超时 (picked=%d) -> 合成 -12 释放\n",
+                    owner, (int)(s.startMs != 0));
+    }
+  }
   if (!s.ready.load()) return false;
   if (code) *code = s.code;
   if (body) *body = s.body;
   s.body = "";
   s.ready.store(false);
+  s.submitMs = 0;
+  s.startMs = 0;
   s_ownerBusy[owner].store(false);  // 消费完才允许该 owner 再提交
   return true;
 }
@@ -214,3 +256,6 @@ bool httpPause(uint32_t waitMs) {
 }
 
 void httpResume() { s_paused.store(false); }
+
+int httpClientNetFailStreak() { return s_netFail.load(); }
+void httpClientResetNetFail() { s_netFail.store(0); }

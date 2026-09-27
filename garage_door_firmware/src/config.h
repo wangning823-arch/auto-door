@@ -62,7 +62,7 @@
 #ifndef OTA_CHECK_INTERVAL_MS
 #define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 保留宏，不再用于自动触发
 #endif
-// 轮询周期须明显小于服务端 TTL（8s），留出蓝牙空隙
+// 轮询周期须明显小于服务端 TTL（60s，2026-09-27 由 25s 放宽；见 garage_gate.py）
 #ifndef REMOTE_POLL_INTERVAL_MS
 #define REMOTE_POLL_INTERVAL_MS 3000
 #endif
