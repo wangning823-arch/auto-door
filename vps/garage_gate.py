@@ -982,6 +982,16 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 4:
                     if not self._require_auth():
                         return
+                    if method == "DELETE":
+                        # 从列表移除；设备下次上报时会自动重新注册
+                        with _lock:
+                            if dev_id not in _devices:
+                                self._send_json(404, {"ok": 0, "error": "no device"})
+                                return
+                            _devices.pop(dev_id, None)
+                        _log("[%s] device removed from list" % dev_id)
+                        self._send_json(200, {"ok": 1, "id": dev_id, "removed": 1})
+                        return
                     with _lock:
                         d = _devices.get(dev_id)
                         if not d:
@@ -1102,8 +1112,7 @@ def main():
     for d in (WEB_DIR, OTA_DIR, LOG_DIR):
         if not os.path.isdir(d):
             os.makedirs(d)
-    with _lock:
-        _device_locked(DEFAULT_DEVICE)
+    # 不再预创建 default：默认设备只在真的有不带 id 的上报时才出现
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     _log("listen http://%s:%s ui=/ api=/api devices=/api/devices" % (HOST, PORT))
     try:

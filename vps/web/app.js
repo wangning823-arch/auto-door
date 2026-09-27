@@ -101,7 +101,10 @@
         box.innerHTML = list.map(function (d) {
           return (
             '<div class="device-card" data-id="' + d.id + '">' +
-              '<div class="name">' + (d.name || d.id) + "</div>" +
+              '<div class="card-top">' +
+                '<div class="name">' + (d.name || d.id) + "</div>" +
+                '<button class="btn ghost sm del-btn" type="button" data-del="' + d.id + '">删除</button>' +
+              "</div>" +
               '<div class="id">' + d.id + " · " + (d.role || "-") + "</div>" +
               '<div class="pill-row" style="margin-bottom:10px">' +
                 (d.online ? pill("在线", "ok") : pill("离线", "err")) +
@@ -115,6 +118,23 @@
         Array.prototype.forEach.call(box.querySelectorAll(".device-card"), function (el) {
           el.addEventListener("click", function () {
             openDetail(el.getAttribute("data-id"));
+          });
+        });
+        Array.prototype.forEach.call(box.querySelectorAll(".del-btn"), function (btn) {
+          btn.addEventListener("click", function (e) {
+            e.stopPropagation();
+            var id = btn.getAttribute("data-del");
+            if (!window.confirm("删除设备 " + id + "？\n设备下次上报时会自动重新出现在列表中。")) return;
+            btn.disabled = true;
+            api("/api/devices/" + encodeURIComponent(id), { method: "DELETE" })
+              .then(function () {
+                setTip($("listTip"), "已删除 " + id, "ok");
+                loadList();
+              })
+              .catch(function (err) {
+                setTip($("listTip"), err.message || "删除失败", "err");
+                btn.disabled = false;
+              });
           });
         });
         setTip($("listTip"), "共 " + list.length + " 台");

@@ -179,6 +179,21 @@ input[type="file"] {
   font-weight: 650;
   margin-bottom: 4px;
 }
+.device-card .card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.device-card .card-top .name { margin-bottom: 0; }
+.device-card .del-btn {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  border-radius: 8px;
+  color: var(--muted);
+}
+.device-card .del-btn:hover { color: var(--err); border-color: var(--err); }
 .device-card .id {
   font-family: var(--mono);
   font-size: 0.78rem;
