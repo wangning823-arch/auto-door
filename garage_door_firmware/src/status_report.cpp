@@ -77,6 +77,8 @@ static String buildJson() {
     j += ",\"lcap\":" + String((unsigned long)cap);
     j += ",\"lpend\":" + String((unsigned long)pend);
     j += ",\"latt\":" + String((unsigned long)att);
+    // DNS 互斥拿锁超时累计：>0 = 有任务在抢 hostByName（framework 非重入）
+    j += ",\"dnsbusy\":" + String((unsigned long)httpDnsBusyCount());
   }
   j += ",\"ble\":{\"rssi\":" + String(gBits.bleRssi);
   j += ",\"label\":\"";

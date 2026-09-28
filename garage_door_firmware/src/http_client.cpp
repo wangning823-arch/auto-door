@@ -26,6 +26,8 @@
 #define HTTP_WEB_WAIT_MAX_MS 15000
 #endif
 
+// DNS 锁等待上限见 http_client.h（HTTP_DNS_LOCK_WAIT_MS / _LOOP_MS）
+
 struct HttpJob {
   int owner;
   uint32_t gen;  // 提交代次：owner 被在飞看门狗判死后，旧结果按代次丢弃
@@ -57,9 +59,41 @@ static std::atomic<bool> s_paused{false};    // OTA 排空期：拒新提交
 static std::atomic<bool> s_workerBusy{false};  // worker 正在处理一个 job
 static HttpBtBusyFn s_btBusy = nullptr;
 
+// ===== DNS 互斥（见 http_client.h 注释）=====
+// 两个任务并发调 hostByName 会把框架的事件位握手踩烂且无法自愈，
+// 故所有 hostByName 都先过这里。取不到锁 = 别人正在查，调用方跳过本轮。
+static SemaphoreHandle_t s_dnsMtx = nullptr;
+static std::atomic<uint32_t> s_dnsBusy{0};  // 拿锁超时累计 → status.dnsbusy
+
+bool httpDnsLock(uint32_t waitMs) {
+  if (!s_dnsMtx) return true;  // httpClientBegin 前只有 loop 单任务，无并发
+  uint32_t t0 = millis();
+  for (;;) {
+    if (xSemaphoreTake(s_dnsMtx, pdMS_TO_TICKS(50)) == pdTRUE) return true;
+    // loop 侧此刻看门狗还没撤：边等边喂，别把 5s 等成 TWT 复位
+    esp_task_wdt_reset();
+    if (millis() - t0 >= waitMs) {
+      s_dnsBusy++;
+      return false;
+    }
+  }
+}
+
+void httpDnsUnlock() {
+  if (s_dnsMtx) xSemaphoreGive(s_dnsMtx);
+}
+
+uint32_t httpDnsBusyCount() { return s_dnsBusy.load(); }
+
 static int httpExchange(const HttpJob& j, String* respOut) {
   IPAddress addr;
-  if (!WiFi.hostByName(j.host.c_str(), addr)) return -11;
+  bool dnsOk = false;
+  // worker 不受 loop 看门狗约束，但也不能无限等：loop 侧查一次最坏 ~16s
+  if (httpDnsLock(HTTP_DNS_LOCK_WAIT_MS)) {
+    dnsOk = WiFi.hostByName(j.host.c_str(), addr);
+    httpDnsUnlock();
+  }
+  if (!dnsOk) return -11;
   WiFiClient client;
   if (!client.connect(addr, j.port, (int32_t)j.timeoutMs)) return -1;
 
@@ -166,6 +200,8 @@ static TaskHandle_t s_workerTask = nullptr;
 
 void httpClientBegin(HttpBtBusyFn btBusyFn) {
   s_btBusy = btBusyFn;
+  // DNS 互斥必须在 worker 起来之前就绪，否则首包可能绕过串行化
+  if (!s_dnsMtx) s_dnsMtx = xSemaphoreCreateMutex();
   for (int i = 0; i < HTTP_OWNER_COUNT; i++) {
     s_ownerBusy[i].store(false);
     s_slots[i].ready.store(false);

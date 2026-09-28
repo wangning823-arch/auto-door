@@ -96,8 +96,15 @@ static bool httpGetStream(const String& host, uint16_t port, const String& path,
   // DNS/connect/send 在 loop 里最坏 31s+20s+10s，而 loopTask 看门狗 5s 就咬：
   // 实测 dda0 两次 OTA 均死在起步（nginx 连 /ota/version 都没收到、随后 BOOT
   // 复位）。三者内部都有秒级上界，期间撤监控、结束后立刻补喂。
+  // 等 DNS 锁放在撤看门狗之前：锁内每 50ms 喂狗，卡在锁上能被 TWT 救回；
+  // 锁只包 hostByName（与 worker 的 httpExchange 互斥），不包 connect/send。
+  if (!httpDnsLock(HTTP_DNS_LOCK_WAIT_LOOP_MS)) {
+    setHttpWhy("dns lock busy");
+    return false;
+  }
   disableLoopWDT();
   bool dnsOk = WiFi.hostByName(host.c_str(), addr);
+  httpDnsUnlock();
   bool conn = dnsOk && client->connect(addr, port, (int32_t)OTA_HTTP_TIMEOUT_MS);
   size_t sent = 0;
   if (conn) {
@@ -485,12 +492,25 @@ static void doOta() {
   s_active = true;
   // 取版本之前就让路：header 阶段同样会被 Inquiry/BLE 掐（8s 超时来源）
   if (s_busyFn) s_busyFn(true);
-  // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来
+  // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来。
+  // 必须看返回值：false = 还有在飞请求（可能正卡在它自己的 DNS/connect 上），
+  // 此时带着"在飞未知"往下走，Update.begin 会和它抢堆、日志 flush 会和它
+  // 抢 DNS 锁——dda0 实测这条路径挂死 13.5 分钟，只能断电。
+  // 4s 覆盖常态（单 job 超时 2.5~4s），再给 12s 覆盖 worker 等蓝牙让路的
+  // 最坏 15s 窗口；合计 16s 仍不空就放弃本轮（s_done 不置位，下次 update 可再来）。
   bool httpIdle = httpPause(4000);
+  if (!httpIdle) httpIdle = httpPause(12000);
   logShipf("[OTA] begin idle=%d heap=%u maxblk=%u sleep=%d rssi=%d",
            (int)httpIdle, (unsigned)ESP.getFreeHeap(),
            (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.getSleep(),
            (int)WiFi.RSSI());
+  if (!httpIdle) {
+    logShipf("[OTA] http worker busy >16s -> abort round, retry on next update");
+    s_active = false;
+    if (s_busyFn) s_busyFn(false);
+    httpResume();  // httpPause 失败会保持暂停，不恢复就永远发不出请求
+    return;
+  }
   // 此刻网络还正常：预解析日志服务器 IP，下载停滞期的实时日志走 IP 直连
   // （停滞时 DNS 可阻塞 >5s → loopTask TWT 崩溃）
   logShipResolve();

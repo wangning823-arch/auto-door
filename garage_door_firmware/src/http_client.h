@@ -49,10 +49,37 @@ uint32_t httpClientWorkerStackHwm();
 // 本地网页正在响应（loop 在发页面）→ worker 让路，等页面发完再发 VPS
 void httpSetWebBusy(bool busy);
 // OTA 前调用：暂停新提交并排空在飞请求（等 worker 空闲，最多 waitMs）
-// 返回 true=已空闲；失败也会保持暂停，调用方无需重试
+// 返回 true=已空闲；失败仍保持暂停，调用方必须自行 httpResume 恢复
 bool httpPause(uint32_t waitMs);
 // 恢复接受提交
 void httpResume();
+
+// ===== DNS 互斥 =====
+// WiFi.hostByName 内部是跨任务事件位握手（WIFI_DNS_IDLE_BIT/DONE_BIT），
+// 两次 waitStatusBits 的超时返回值都被丢弃（WiFiGeneric.cpp hostByName），
+// IDLE 到点后照样 clearStatusBits 往下走——并发调用必然互踩 DONE 位。
+// 更糟：dns_gethostbyname 的回调 arg 指向调用者栈上的 aResult，超时返回后
+// 回调仍挂在 lwIP 表里，回包会写进已释放的栈帧。
+// 实测后果：dda0 OTA 入口 loop 与 worker 同时解析 → 挂死 13.5 分钟零请求，
+// 只能断电恢复；两台硬件固件完全相同，1388 网稳不撞这把锁所以从不出事。
+// 所有 hostByName 必须先持这把锁；锁内只包 hostByName，别把 connect/读写圈进来。
+// waitMs = 拿锁上限（在 loop 上下文调用时该值须 < 看门狗 5s）；
+// 返回 false = 别的任务正在查 DNS，调用方应跳过本轮、稍后重试。
+bool httpDnsLock(uint32_t waitMs);
+// 仅在 httpDnsLock 返回 true 后调用
+void httpDnsUnlock();
+// 拿锁超时累计次数（status 上报 dnsbusy，远程即可判断是否在撞锁）
+uint32_t httpDnsBusyCount();
+
+// worker 等 DNS 锁的上限：loop 侧一次解析最坏 ~16s（框架 IDLE 16s/DONE 15s）
+#ifndef HTTP_DNS_LOCK_WAIT_MS
+#define HTTP_DNS_LOCK_WAIT_MS 20000
+#endif
+// loop 等 DNS 锁的上限：看门狗 5s 就咬，拿不到就跳过本轮解析
+// （logShipFlushNow 留环重试 / OTA 走 fetchWithRetry 重试）
+#ifndef HTTP_DNS_LOCK_WAIT_LOOP_MS
+#define HTTP_DNS_LOCK_WAIT_LOOP_MS 4000
+#endif
 // 连续网络层失败计数（code<0 累加，HTTP 状态码清零）——数据面看门狗用
 int httpClientNetFailStreak();
 void httpClientResetNetFail();

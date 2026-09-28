@@ -220,6 +220,14 @@ void logShipResolve() {
   if (WiFi.status() != WL_CONNECTED) return;
   IPAddress addr;
   esp_task_wdt_reset();
+  // 先拿 DNS 锁、再撤看门狗：等锁期间看门狗仍开着，锁内每 50ms 喂一次，
+  // 卡在锁上也会被 TWT 救回来而不是静默挂死。worker 与本函数并发调
+  // hostByName 会踩烂框架的事件位握手（见 http_client.h），拿不到就跳过本轮，
+  // 下次 flush / OTA fetch 自会重试。
+  if (!httpDnsLock(HTTP_DNS_LOCK_WAIT_LOOP_MS)) {
+    Serial.println("[LOGSHIP] dns lock busy -> skip resolve");
+    return;
+  }
   // hostByName 内部有界（IDLE 16s + DONE 15s），但 loopTask 看门狗 5s 就咬：
   // OTA/flush 入口的这次解析一卡过 5s 就 TWT 复位（dda0 实测两次 OTA 均死于此
   // 类路径）。解析期间撤监控，结束立刻补喂。
@@ -227,6 +235,7 @@ void logShipResolve() {
   bool ok = WiFi.hostByName(LOG_SHIP_HOST, addr);
   enableLoopWDT();
   esp_task_wdt_reset();
+  httpDnsUnlock();
   if (ok) {
     s_shipIp = addr;
     s_shipIpOk = true;
