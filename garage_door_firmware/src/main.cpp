@@ -160,6 +160,20 @@ static void onRemoteCmd(const char* raw) {
     remoteOtaCheckNow();
     return;
   }
+  if (strcmp(raw, "reboot") == 0) {
+    // 远程软复位。两个用途：
+    //  1) 验证 RTC noinit 真的跨复位保留——重启后必须出现
+    //     [LOGSHIP] resume N bytes from prev run，否则说明方案没生效
+    //  2) 不带 flush：日志环原样留在 RTC，重启后由 logShipBegin 续传
+    if (remoteOtaActive()) {
+      logShipf("[REMOTE] reboot refused: ota active");
+      return;
+    }
+    logShipf("[REMOTE] reboot -> soft reset (ring kept in RTC)");
+    delay(200);  // 让串口把这行打完，便于现场对照
+    ESP.restart();
+    return;
+  }
 
   // ===== 带参指令："<verb> <arg...>"（VPS 控制台替代本地网页的配置通道）=====
   char verb[20];
