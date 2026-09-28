@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "config.h"
@@ -1360,6 +1361,9 @@ void setup() {
   delay(50);
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
   logShipBegin();  // 必须在 early SCL 日志前，否则 s_len=0 会冲掉
+  // 复位原因只打串口、VPS 看不到（7 次静默重启无从查），开机补报是唯一定案线索：
+  // 1=掉电/上电 3=软件重启 4=panic 5=INT_WDT 6=Task_WDT 9=brownout
+  logShipf("[BOOT] rst=%d t=%ums", (int)esp_reset_reason(), (unsigned)millis());
   remoteOtaHold4k();  // 堆还干净时预留 4KB 连续块，OTA begin 前让出（防8BIT碎片）
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
