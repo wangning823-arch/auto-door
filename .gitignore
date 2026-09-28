@@ -58,3 +58,7 @@ garage_door_firmware/lib/Adafruit_PN532/examples/
 
 # ��ʱ���ץȡҳ���Ự���ɵĿ�/��ȱ�ļ�������⣩
 diag_*.html
+
+# 本次 dda0 日志断流诊断的临时产物（诊断完成后可删）
+.tmp_diag/
+peek_boot.py
