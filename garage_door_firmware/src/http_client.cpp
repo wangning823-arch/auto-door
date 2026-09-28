@@ -195,6 +195,18 @@ static bool submit(int owner, bool isPost, const String& host, uint16_t port,
   s.timeoutMs = timeoutMs;
   HttpJob* j = new HttpJob{owner, s.gen, isPost, host, port, path, body,
                            timeoutMs};
+  // 碎片堆里 new 或 String 拷贝可能失败：new 返回空 / String 静默变空串。
+  // 若不校验就发出去，Content-Length 会变成 0，服务端判空丢弃；
+  // 但调用方（logShip）已在提交前摘过环，等于日志永久丢失。
+  // 这里按提交失败返回，调用方走既有回填路径。
+  if (!j || j->host.length() != host.length() ||
+      j->path.length() != path.length() ||
+      j->body.length() != body.length()) {
+    s.submitMs = 0;
+    s_ownerBusy[owner].store(false);
+    delete j;
+    return false;
+  }
   if (xQueueSend(s_jobs, &j, 0) != pdTRUE) {
     s.submitMs = 0;
     s_ownerBusy[owner].store(false);

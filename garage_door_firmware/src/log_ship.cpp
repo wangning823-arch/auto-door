@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 #include <lwip/sockets.h>
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
@@ -30,6 +31,24 @@
 #ifndef LOG_SHIP_CHUNK
 #define LOG_SHIP_CHUNK 1536
 #endif
+// 下限：再小就发不动了（每片都要付一次 HTTP 往返）
+#ifndef LOG_SHIP_CHUNK_MIN
+#define LOG_SHIP_CHUNK_MIN 256
+#endif
+
+// 按当前 8BIT 最大连续块给分片封顶。
+// 固定 1536 在碎片堆里会 reserve 失败 → chunk=0 → 一包不发，积压永远抽不干；
+// 而且积压越多 chunk 越固定在上限，越需要大块，越失败（反相关死锁）。
+// 一次发送期间同时存活三份拷贝：body / s_snap / HttpJob.body，
+// 所以可用量按 largest/2 估，留一半给并存的另两份和请求串。
+static size_t safeChunk() {
+  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (largest < LOG_SHIP_CHUNK_MIN + 64) return 0;  // 连小片都放不下，下轮再试
+  size_t cap = (largest - 64) / 2;
+  if (cap > LOG_SHIP_CHUNK) cap = LOG_SHIP_CHUNK;
+  if (cap < LOG_SHIP_CHUNK_MIN) cap = LOG_SHIP_CHUNK_MIN;
+  return cap;
+}
 
 static char s_ring[LOG_SHIP_RING_BYTES];
 static size_t s_len = 0;  // 有效字节，紧凑存放
@@ -197,8 +216,10 @@ void logShipFlushNow() {
 
   ringLock();
   String body;
-  // 同样分片：整环 2560B 在碎片堆 OOM 会 early-skip，OTA 重启前一段日志全丢
-  size_t fchunk = s_len > LOG_SHIP_CHUNK ? LOG_SHIP_CHUNK : s_len;
+  // 同样分片 + 自适应上限：整环 2560B 或固定 1536 在碎片堆 OOM 会 early-skip，
+  // OTA 重启前一段日志全丢
+  const size_t fmax = safeChunk();
+  size_t fchunk = s_len > fmax ? fmax : s_len;
   if (fchunk > 0) {
     body.reserve(fchunk);
     body.concat(s_ring, fchunk);
@@ -331,13 +352,19 @@ void logShipService(bool btBusy, bool wifiOk) {
   uint16_t port = 80;
   parseLogUrl(&host, &port, &path);
 
-  // 快照环头 ≤CHUNK（分片），见 LOG_SHIP_CHUNK 注释的空包死循环；
+  // 快照环头 ≤自适应上限，见 safeChunk()/LOG_SHIP_CHUNK 注释的空包死循环；
   // 摘环仅在拷贝成功后执行——OOM 时内容留环里下轮再试（旧实现先清环会丢日志）
+  const size_t s_chunkMax = safeChunk();
   String body;
   size_t chunk = 0;
+  if (s_chunkMax == 0) {
+    // 堆碎片到连小片都放不下：别摘环，3s 后重试（30s 会让黑窗拖太久）
+    s_nextMs = now + 3000;
+    return;
+  }
   ringLock();
   if (s_len > 0) {
-    chunk = s_len > LOG_SHIP_CHUNK ? LOG_SHIP_CHUNK : s_len;
+    chunk = s_len > s_chunkMax ? s_chunkMax : s_len;
     body.reserve(chunk);
     body.concat(s_ring, chunk);
     if (body.length() == chunk) {
@@ -350,16 +377,28 @@ void logShipService(bool btBusy, bool wifiOk) {
   ringUnlock();
 
   if (chunk == 0) {
+    // 环为空（正常静默）或 reserve 失败（留环重试）：都等下一轮
     s_nextMs = now + LOG_SHIP_INTERVAL_MS;
     return;
   }
   buildPath(&path);
+  // 回填用的 s_snap 必须在提交前拷贝成功：环已在上面摘走，
+  // 若 s_snap 拷贝 OOM 变空串，非 200 时 ringPrepend 会回填空气，日志照丢。
+  s_snap = body;
+  if (s_snap.length() != body.length()) {
+    s_snap = "";
+    ringLock();
+    ringPrepend(body.c_str(), body.length());
+    ringUnlock();
+    s_nextMs = now + 3000;
+    return;
+  }
   if (httpSubmitPost(HTTP_OWNER_LOGS, host, port, path, body,
                      LOG_SHIP_TIMEOUT_MS)) {
-    s_snap = body;
     s_inFlight = true;
   } else {
-    // 队列满：塞回，稍后重试
+    // 队列满 / HttpJob 拷贝失败：塞回，稍后重试
+    s_snap = "";
     ringLock();
     ringPrepend(body.c_str(), body.length());
     ringUnlock();
