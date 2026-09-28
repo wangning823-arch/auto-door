@@ -18,3 +18,8 @@ void logShipFlushNow();
 // 下载停滞期网络黑洞中 DNS 可阻塞 >5s → TWT 崩溃，flush 必须走缓存 IP 直连
 void logShipResolve();
 size_t logShipPending();
+// 发送阻塞点诊断：why/largest8/cap/pend/attempt
+// why: 0=未尝试 1=在飞 2=wifi断 3=未到点 4=safeChunk=0 5=环空
+//      6=body拷贝失败 7=snap拷贝失败 8=已入队 9=已发出 10=非200 11=submit失败
+void logShipDiag(uint8_t* why, uint32_t* largest8, uint32_t* cap,
+                 uint32_t* pend, uint32_t* attempt);

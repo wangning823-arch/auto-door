@@ -67,6 +67,17 @@ static String buildJson() {
   j += ",\"pin\":" + String(gBits.pairHasPin ? 1 : 0) + "}";
   j += ",\"car_rssi\":" + String(gBits.carRssi);
   j += ",\"trend\":" + String(gBits.trend);
+  // 日志发送阻塞点诊断：远程直接看 why，不用猜卡在哪一步
+  {
+    uint8_t why = 0;
+    uint32_t l8 = 0, cap = 0, pend = 0, att = 0;
+    logShipDiag(&why, &l8, &cap, &pend, &att);
+    j += ",\"lwhy\":" + String((unsigned)why);
+    j += ",\"ll8\":" + String((unsigned long)l8);
+    j += ",\"lcap\":" + String((unsigned long)cap);
+    j += ",\"lpend\":" + String((unsigned long)pend);
+    j += ",\"latt\":" + String((unsigned long)att);
+  }
   j += ",\"ble\":{\"rssi\":" + String(gBits.bleRssi);
   j += ",\"label\":\"";
   appendEscaped(j, gBits.bleLab);

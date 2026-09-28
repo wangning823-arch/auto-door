@@ -31,30 +31,46 @@
 #ifndef LOG_SHIP_CHUNK
 #define LOG_SHIP_CHUNK 1536
 #endif
-// 下限：低于此值宁可不发（一次 HTTP 往返不值）。dda0 实测 8BIT largest 最低 980，
-// 对应 cap≈197，故必须 ≤197，否则又回到"永远发不出"的死锁。
+// 下限：宁可发小片也不发零片。dda0 实测 8BIT largest 最低 980，
+// 96 字节片只需 4*96+256=640，仍留 340 余量。
 #ifndef LOG_SHIP_CHUNK_MIN
-#define LOG_SHIP_CHUNK_MIN 128
+#define LOG_SHIP_CHUNK_MIN 96
 #endif
 
+// 分配期的固定开销：4 份 String 各 ~16B 块头 + req 的 160B 请求头 = 256。
+// 并发余量 CHURN_SLACK：测量 largest 与实际 4 次分配之间，wifi/NFC 任务可能
+// 已经吃掉一部分（dda0 弱网时每天 80 次 forceStaReconnect + NFC 无休止
+// auto-retry 持续搅动堆）。零余量公式 cap=(L-192)/4 会让 need 恰好等于 L，
+// 测量值稍一变化就拷贝失败 → 提交前 return → 一包不出网且永不自愈
+// （20260928 dda0：重启后 1-2 分钟有日志，之后 38 分钟零 POST）。
+#define LOG_SHIP_OVERHEAD 256
+#define LOG_SHIP_CHURN_SLACK 512
+
 // 按当前 8BIT 最大连续块给分片封顶。
-// 固定 1536 在碎片堆里会 reserve 失败 → chunk=0 → 一包不发，积压永远抽不干；
-// 而且积压越多 chunk 越固定在上限，越需要大块，越失败（反相关死锁）。
+// 固定 1536 在碎片堆里会 reserve 失败 → chunk=0 → 一包不发，积压永远抽不干。
 //
-// 一次发送期间**跨任务**同时存活 4 份拷贝，各需 cap+8(heap头)：
+// 一次发送期间**跨任务**同时存活多份拷贝：
 //   loop 任务  : body、s_snap
 //   worker 任务: HttpJob.body、req（req 还要 160B 请求头）
-// 故 4*cap + 4*8 + 160 <= largest → cap <= (largest-192)/4。
-// 分母写成 2 会让 cap 偏大一倍，submit() 里的拷贝校验必然判失败 → 返回 false
-// → 请求根本不出网（20260928 dda0 实测 75s 内 0 次 /dev/logs）。
+// 故 4*cap + OVERHEAD + CHURN_SLACK <= largest。
 static size_t safeChunk() {
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  if (largest < 192 + LOG_SHIP_CHUNK_MIN * 4) return 0;
-  size_t cap = (largest - 192) / 4;
+  size_t floor_need = LOG_SHIP_OVERHEAD + LOG_SHIP_CHURN_SLACK;
+  if (largest <= floor_need) return 0;  // 连最小片的余量都保不住，下轮再试
+  size_t cap = (largest - floor_need) / 4;
   if (cap > LOG_SHIP_CHUNK) cap = LOG_SHIP_CHUNK;
   if (cap < LOG_SHIP_CHUNK_MIN) cap = LOG_SHIP_CHUNK_MIN;
   return cap;
 }
+
+// ===== 发送阻塞点诊断（打进 status，远程即可看到卡在哪一步）=====
+// why: 0=未尝试 1=在飞等待 2=wifi断 3=未到点 4=safeChunk=0(堆太碎)
+//      5=环空(正常) 6=body拷贝失败 7=snap拷贝失败 8=submit失败 9=已发出
+// largest8/cap/pend: 上次尝试时的 8BIT 最大块、算出的分片上限、环内积压
+static volatile uint8_t s_why = 0;
+static volatile uint32_t s_largest8 = 0;
+static volatile uint32_t s_cap = 0;
+static volatile uint32_t s_attempt = 0;  // 尝试次数（>0 说明确实走到发送流程）
 
 static char s_ring[LOG_SHIP_RING_BYTES];
 static size_t s_len = 0;  // 有效字节，紧凑存放
@@ -71,6 +87,19 @@ static void ringLock() {
 }
 static void ringUnlock() {
   if (s_mtx) xSemaphoreGive(s_mtx);
+}
+
+void logShipDiag(uint8_t* why, uint32_t* largest8, uint32_t* cap,
+                 uint32_t* pend, uint32_t* attempt) {
+  if (why) *why = s_why;
+  if (largest8) *largest8 = s_largest8;
+  if (cap) *cap = s_cap;
+  if (attempt) *attempt = s_attempt;
+  if (pend) {
+    ringLock();
+    *pend = (uint32_t)s_len;
+    ringUnlock();
+  }
 }
 
 static void ringPush(const char* s, size_t n) {
@@ -329,11 +358,13 @@ void logShipService(bool btBusy, bool wifiOk) {
 
   // 收结果：成功=快照已发走（ring 提交时已摘掉）；失败=塞回队头重试
   if (s_inFlight) {
+    s_why = 1;
     int code = 0;
     if (!httpTryResult(HTTP_OWNER_LOGS, &code, nullptr)) return;
     s_inFlight = false;
     if (code == 200) {
       s_failStreak = 0;
+      s_why = 9;
       // 环里还有积压 → 1s 后接着发下一片；发干净才回 30s 周期
       ringLock();
       size_t left = s_len;
@@ -341,6 +372,7 @@ void logShipService(bool btBusy, bool wifiOk) {
       s_nextMs = millis() + (left > 0 ? 1000UL : LOG_SHIP_INTERVAL_MS);
     } else {
       s_failStreak++;
+      s_why = 10;  // 收到非200（网络失败/服务端拒）
       ringLock();
       ringPrepend(s_snap.c_str(), s_snap.length());
       ringUnlock();
@@ -350,9 +382,15 @@ void logShipService(bool btBusy, bool wifiOk) {
     return;
   }
 
-  if (!wifiOk) return;
+  if (!wifiOk) {
+    s_why = 2;
+    return;
+  }
   const uint32_t now = millis();
-  if ((int32_t)(now - s_nextMs) < 0) return;
+  if ((int32_t)(now - s_nextMs) < 0) {
+    s_why = 3;
+    return;
+  }
 
   String host, path;
   uint16_t port = 80;
@@ -361,15 +399,19 @@ void logShipService(bool btBusy, bool wifiOk) {
   // 快照环头 ≤自适应上限，见 safeChunk()/LOG_SHIP_CHUNK 注释的空包死循环；
   // 摘环仅在拷贝成功后执行——OOM 时内容留环里下轮再试（旧实现先清环会丢日志）
   const size_t s_chunkMax = safeChunk();
+  s_largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  s_cap = (uint32_t)s_chunkMax;
   String body;
   size_t chunk = 0;
   if (s_chunkMax == 0) {
     // 堆碎片到连小片都放不下：别摘环，3s 后重试（30s 会让黑窗拖太久）
+    s_why = 4;
     s_nextMs = now + 3000;
     return;
   }
   ringLock();
   if (s_len > 0) {
+    s_attempt++;
     chunk = s_len > s_chunkMax ? s_chunkMax : s_len;
     body.reserve(chunk);
     body.concat(s_ring, chunk);
@@ -377,6 +419,7 @@ void logShipService(bool btBusy, bool wifiOk) {
       memmove(s_ring, s_ring + chunk, s_len - chunk);
       s_len -= chunk;
     } else {
+      s_why = 6;  // body 拷贝 OOM → 不摘环，3s 重试
       chunk = 0;
     }
   }
@@ -384,6 +427,7 @@ void logShipService(bool btBusy, bool wifiOk) {
 
   if (chunk == 0) {
     // 环为空（正常静默）或 reserve 失败（留环重试）：都等下一轮
+    if (s_why != 6) s_why = 5;
     s_nextMs = now + LOG_SHIP_INTERVAL_MS;
     return;
   }
@@ -392,6 +436,7 @@ void logShipService(bool btBusy, bool wifiOk) {
   // 若 s_snap 拷贝 OOM 变空串，非 200 时 ringPrepend 会回填空气，日志照丢。
   s_snap = body;
   if (s_snap.length() != body.length()) {
+    s_why = 7;
     s_snap = "";
     ringLock();
     ringPrepend(body.c_str(), body.length());
@@ -401,9 +446,11 @@ void logShipService(bool btBusy, bool wifiOk) {
   }
   if (httpSubmitPost(HTTP_OWNER_LOGS, host, port, path, body,
                      LOG_SHIP_TIMEOUT_MS)) {
+    s_why = 8;  // 已入队，等 worker 发出
     s_inFlight = true;
   } else {
     // 队列满 / HttpJob 拷贝失败：塞回，稍后重试
+    s_why = 11;
     s_snap = "";
     ringLock();
     ringPrepend(body.c_str(), body.length());
