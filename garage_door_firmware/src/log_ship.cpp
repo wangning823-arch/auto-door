@@ -31,20 +31,26 @@
 #ifndef LOG_SHIP_CHUNK
 #define LOG_SHIP_CHUNK 1536
 #endif
-// 下限：再小就发不动了（每片都要付一次 HTTP 往返）
+// 下限：低于此值宁可不发（一次 HTTP 往返不值）。dda0 实测 8BIT largest 最低 980，
+// 对应 cap≈197，故必须 ≤197，否则又回到"永远发不出"的死锁。
 #ifndef LOG_SHIP_CHUNK_MIN
-#define LOG_SHIP_CHUNK_MIN 256
+#define LOG_SHIP_CHUNK_MIN 128
 #endif
 
 // 按当前 8BIT 最大连续块给分片封顶。
 // 固定 1536 在碎片堆里会 reserve 失败 → chunk=0 → 一包不发，积压永远抽不干；
 // 而且积压越多 chunk 越固定在上限，越需要大块，越失败（反相关死锁）。
-// 一次发送期间同时存活三份拷贝：body / s_snap / HttpJob.body，
-// 所以可用量按 largest/2 估，留一半给并存的另两份和请求串。
+//
+// 一次发送期间**跨任务**同时存活 4 份拷贝，各需 cap+8(heap头)：
+//   loop 任务  : body、s_snap
+//   worker 任务: HttpJob.body、req（req 还要 160B 请求头）
+// 故 4*cap + 4*8 + 160 <= largest → cap <= (largest-192)/4。
+// 分母写成 2 会让 cap 偏大一倍，submit() 里的拷贝校验必然判失败 → 返回 false
+// → 请求根本不出网（20260928 dda0 实测 75s 内 0 次 /dev/logs）。
 static size_t safeChunk() {
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  if (largest < LOG_SHIP_CHUNK_MIN + 64) return 0;  // 连小片都放不下，下轮再试
-  size_t cap = (largest - 64) / 2;
+  if (largest < 192 + LOG_SHIP_CHUNK_MIN * 4) return 0;
+  size_t cap = (largest - 192) / 4;
   if (cap > LOG_SHIP_CHUNK) cap = LOG_SHIP_CHUNK;
   if (cap < LOG_SHIP_CHUNK_MIN) cap = LOG_SHIP_CHUNK_MIN;
   return cap;
