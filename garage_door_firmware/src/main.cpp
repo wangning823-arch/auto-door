@@ -18,6 +18,7 @@
 #include "ble_bond.h"
 #include "remote_cmd.h"
 #include "log_ship.h"
+#include "crash_snap.h"
 #include "remote_ota.h"
 #include "status_report.h"
 #include "http_client.h"
@@ -1361,9 +1362,12 @@ void setup() {
   delay(50);
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
   logShipBegin();  // 必须在 early SCL 日志前，否则 s_len=0 会冲掉
+  crashSnapBegin();  // 崩溃快照（RTC noinit）：上一轮现场由 crashSnapReport 上报
   // 复位原因只打串口、VPS 看不到（7 次静默重启无从查），开机补报是唯一定案线索：
   // 1=掉电/上电 3=软件重启 4=panic 5=INT_WDT 6=Task_WDT 9=brownout
   logShipf("[BOOT] rst=%d t=%ums", (int)esp_reset_reason(), (unsigned)millis());
+  // 崩溃现场（RTC noinit 跨复位保留）：仅 PANIC/WDT/BROWNOUT 时上报
+  crashSnapReport((int)esp_reset_reason());
   remoteOtaHold4k();  // 堆还干净时预留 4KB 连续块，OTA begin 前让出（防8BIT碎片）
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
@@ -1658,6 +1662,17 @@ void loop() {
     remoteOtaService(btBusy, gWeb.staConnected());
     serviceStaDataWatchdog();
     serviceHeapDiag();
+    // 崩溃快照：每 1s 抓一次当前任务调用栈到 RTC noinit 段。
+    // panic 时无法执行用户代码（panic_abort 结尾就是 break），拿不到崩溃瞬间
+    // 的栈；只能靠周期采样，1s 粒度足以定位"卡在哪个函数"。
+    {
+      static uint32_t lastSnap = 0;
+      uint32_t nowSnap = millis();
+      if ((int32_t)(nowSnap - lastSnap) >= 1000) {
+        lastSnap = nowSnap;
+        crashSnapCapture();
+      }
+    }
     {
       StatusBits sb;
       sb.nfcOk = gNfc.ok();

@@ -3,6 +3,7 @@
 #include "device_id.h"
 #include "http_client.h"
 #include "log_ship.h"
+#include "crash_snap.h"
 #include "ble_tracker.h"
 #include <Update.h>
 #include <WiFi.h>
@@ -383,6 +384,9 @@ static void otaAttempt(const String& remoteSha) {
         esp_task_wdt_reset();
         // 停滞每 5s 直推一条到 VPS：远程就能看到"卡在哪、信号/睡眠状态"
         if (millis() - lastReport >= 5000) {
+          // 下载把 loop 整个堵死，loop 自己的 1s 采样跑不到这里 → 在这采
+          crashSnapMark("ota.dl");
+          crashSnapCapture();
           logShipf(
               "[OTA] stall %u/%ld for=%ums t=%u avail=%d conn=%d rssi=%d "
               "sleep=%d heap=%u",
@@ -490,6 +494,7 @@ static void doOta() {
   s_force = false;
   if (s_active || s_done) return;
   s_active = true;
+  crashSnapMark("ota.start");
   // 取版本之前就让路：header 阶段同样会被 Inquiry/BLE 掐（8s 超时来源）
   if (s_busyFn) s_busyFn(true);
   // 排空 http worker（拒新单+等在飞结束）：把它占的堆还回来。
@@ -521,6 +526,7 @@ static void doOta() {
   // begin 十拿九稳；hold4k 预留逻辑保留作兜底。
   // （本注释更新 = 触发新版本号，用于线上验证新时序：radio 应先于 begin。）
   String remoteSha;
+  crashSnapMark("ota.version");  // 取版本：射频下电前的最后一步
   if (!otaPrepare(&remoteSha)) {
     // 无更新/取版本失败：射频未动 → 恢复现场即可
     s_active = false;
@@ -530,6 +536,7 @@ static void doOta() {
   }
   bool began = false;
   uint8_t err1 = 0;
+  crashSnapMark("ota.begin");  // Update.begin：8BIT 碎片时最容易炸的一步
   disableLoopWDT();
   for (int t = 0; t < 6 && !began; t++) {
     if (t) {

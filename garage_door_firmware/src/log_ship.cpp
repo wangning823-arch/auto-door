@@ -1,4 +1,5 @@
 #include "log_ship.h"
+#include "crash_snap.h"
 #include "config.h"
 #include "device_id.h"
 #include "http_client.h"
@@ -6,6 +7,8 @@
 #include <WiFiClient.h>
 #include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
+#include <esp_attr.h>
+#include <esp_system.h>
 #include <lwip/sockets.h>
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
@@ -72,8 +75,19 @@ static volatile uint32_t s_largest8 = 0;
 static volatile uint32_t s_cap = 0;
 static volatile uint32_t s_attempt = 0;  // 尝试次数（>0 说明确实走到发送流程）
 
-static char s_ring[LOG_SHIP_RING_BYTES];
-static size_t s_len = 0;  // 有效字节，紧凑存放
+// ===== 日志环放 RTC noinit 段：panic 后重启不丢现场 =====
+// panic 时无法执行任何用户代码（panic_abort 反汇编后结尾就是 break 1,15；
+// shutdown handler 只挂在 esp_restart 上，panic 走 esp_restart_noos 绕过它），
+// 所以"崩的瞬间把日志存起来"这条路走不通。唯一可行的是让日志环本身就活在
+// 跨复位保留的内存里：RTC_NOINIT_ATTR → .rtc_noinit（NOLOAD，启动不清零），
+// 软复位/看门狗复位后内容保留，掉电清零。
+// 不能用 RTC_DATA_ATTR——那是已初始化段，启动会从 flash 重新装载=清零。
+// 掉电后该段是随机值，靠 magic + 长度双重校验，不合法就当空环优雅降级。
+#define LOG_SHIP_RTC_MAGIC 0x4C534850u  // "LSHP"
+
+static RTC_NOINIT_ATTR char s_ring[LOG_SHIP_RING_BYTES];
+static RTC_NOINIT_ATTR size_t s_len;  // 有效字节，紧凑存放
+static RTC_NOINIT_ATTR uint32_t s_rtcMagic;
 static uint32_t s_nextMs = 0;
 static int s_failStreak = 0;
 static bool s_inFlight = false;      // 快照已提交、结果未收
@@ -81,6 +95,12 @@ static String s_snap;                 // 在飞的请求快照（失败时塞回
 static SemaphoreHandle_t s_mtx = nullptr;  // NFC 任务写 / loop 读写
 static IPAddress s_shipIp;             // 预解析缓存：flush 走 IP 直连，跳过 DNS
 static bool s_shipIpOk = false;
+
+// RTC 段合法性：magic 对且长度在界内（掉电后两者都是垃圾）
+static bool rtcRingOk() {
+  return s_rtcMagic == LOG_SHIP_RTC_MAGIC && s_len < LOG_SHIP_RING_BYTES;
+}
+static void rtcRingArm() { s_rtcMagic = LOG_SHIP_RTC_MAGIC; }
 
 static void ringLock() {
   if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -104,6 +124,11 @@ void logShipDiag(uint8_t* why, uint32_t* largest8, uint32_t* cap,
 
 static void ringPush(const char* s, size_t n) {
   if (n == 0) return;
+  // RTC 段在掉电后是随机值：先校验再动 s_len，否则垃圾长度会越界读写
+  if (!rtcRingOk()) {
+    s_len = 0;
+    rtcRingArm();
+  }
   if (n >= LOG_SHIP_RING_BYTES) {
     s += (n - LOG_SHIP_RING_BYTES) + 1;
     n = LOG_SHIP_RING_BYTES - 1;
@@ -124,6 +149,10 @@ static void ringPush(const char* s, size_t n) {
 // 发送失败把快照塞回队头（新日志已在后面）
 static void ringPrepend(const char* s, size_t n) {
   if (n == 0) return;
+  if (!rtcRingOk()) {
+    s_len = 0;
+    rtcRingArm();
+  }
   if (n >= LOG_SHIP_RING_BYTES) {
     s += (n - (LOG_SHIP_RING_BYTES - 1));
     n = LOG_SHIP_RING_BYTES - 1;
@@ -146,9 +175,25 @@ static void ringPrepend(const char* s, size_t n) {
 void logShipBegin() {
   if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
   ringLock();
-  s_len = 0;
+  // 上一轮日志跨复位留在 RTC 里：panic/看门狗复位后重启，这里把它续传出去。
+  // 掉电后 RTC 是随机值 → rtcRingOk() 不过 → 清空当新环；长度越界同样清。
+  size_t prevLen = rtcRingOk() ? s_len : 0;
+  if (!prevLen) s_len = 0;
+  rtcRingArm();
+  // 在旧日志前插一条分隔标记：VPS 时间戳是上报时刻，不分段会把
+  // "崩溃前的日志"误读成"开机后的日志"
+  if (prevLen > 0) {
+    char mark[96];
+    int m = snprintf(mark, sizeof(mark),
+                     "[LOGSHIP] ==== 以下 %u 字节为上一轮(rst=%d)遗留 ====\n",
+                     (unsigned)prevLen, (int)esp_reset_reason());
+    // snprintf 截断时返回的是"所需长度"而非实写长度，超界会把 mark 外的内存读出去
+    if (m > 0 && m < (int)sizeof(mark)) ringPrepend(mark, (size_t)m);
+    Serial.printf("[LOGSHIP] resume %u bytes from prev run (rst=%d)\n",
+                  (unsigned)prevLen, (int)esp_reset_reason());
+  }
   ringUnlock();
-  s_nextMs = millis() + 8000;
+  s_nextMs = millis() + (prevLen ? 1000UL : 8000UL);  // 有遗留就尽快发出去
   s_failStreak = 0;
   s_inFlight = false;
   Serial.println("[LOGSHIP] begin url=" LOG_SHIP_URL);
@@ -224,6 +269,7 @@ void logShipResolve() {
   // 卡在锁上也会被 TWT 救回来而不是静默挂死。worker 与本函数并发调
   // hostByName 会踩烂框架的事件位握手（见 http_client.h），拿不到就跳过本轮，
   // 下次 flush / OTA fetch 自会重试。
+  crashSnapMark("ls.dns");
   if (!httpDnsLock(HTTP_DNS_LOCK_WAIT_LOOP_MS)) {
     Serial.println("[LOGSHIP] dns lock busy -> skip resolve");
     return;
@@ -251,6 +297,7 @@ void logShipResolve() {
 // [FLUSH] 打点用于定位 TWT：崩溃时串口最后一条 FLUSH 行 = 卡住的段
 void logShipFlushNow() {
   uint32_t t0 = millis();
+  crashSnapMark("ls.flush");
   Serial.printf("[FLUSH] enter t=%u\n", (unsigned)t0);
   s_nextMs = 0;
   String host, path;

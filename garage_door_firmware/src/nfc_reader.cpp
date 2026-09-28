@@ -1,6 +1,7 @@
 #include "nfc_reader.h"
 #include "config.h"
 #include "log_ship.h"
+#include "crash_snap.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <Adafruit_PN532.h>
@@ -53,6 +54,18 @@ static bool busIdle(int sda, int scl) {
   return digitalRead(sda) && digitalRead(scl);
 }
 
+// ===== 上云节流 =====
+// 总线卡死时 poll 路径每 100~500ms 就会打一条恢复日志，而日志环只有 2560B，
+// 不节流会把真正有用的行（hwInit 判死原因）全冲掉。串口照旧全量，只有上云节流。
+static uint32_t s_cldRecoverMs = 0;
+static uint32_t s_cldHwInitMs = 0;
+static bool nfcCloudOk(uint32_t* lastMs, uint32_t gapMs) {
+  uint32_t now = millis();
+  if (*lastMs && (now - *lastMs) < gapMs) return false;
+  *lastMs = now;
+  return true;
+}
+
 // SCL 被从机/半截传输按死时：Wire.end 还脚 + 推挽 9-clock。
 // 关键：时钟必须是推挽 OUTPUT；开漏 HIGH 只是松手，从机仍可按住 SCL。
 // 注意：ESP32 pinMode(OUTPUT) 会按输出寄存器（默认 0）驱动 → 必须先写 1 再改模式，
@@ -89,6 +102,12 @@ static void i2cBusRecover(int sda, int scl) {
   delay(5);
   Serial.printf("[NFC] bus recover pushScl=%d pushAfter=%d idleScl=%d\n",
                 pushScl, pushAfter, digitalRead(scl));
+  // recover 是否奏效是判定「总线卡死 vs 芯片没焊」的唯一依据，必须上云；
+  // 但 poll 路径卡死时每 100~500ms 就会走一次，不节流会把 2560B 环冲爆
+  if (nfcCloudOk(&s_cldRecoverMs, 10000)) {
+    logShipf("[NFC] bus recover pushScl=%d pushAfter=%d idleScl=%d", pushScl,
+             pushAfter, digitalRead(scl));
+  }
 }
 
 // I2C 超时后必须松手：否则 ESP 外设/从机时钟拉伸会把 SCL 按在 0.04
@@ -531,10 +550,13 @@ bool NfcReader::recoverBusAndResync() {
 bool NfcReader::hwInit() {
   if (sda_ < 0) return false;
   Serial.printf("[NFC] hwInit t=%ums\n", (unsigned)millis());
+  crashSnapMark("nfc.hwinit");
 
   releaseBus(sda_, scl_);
   if (!busIdle(sda_, scl_)) {
     Serial.println("[NFC] bus low → recover first");
+    logShipf("[NFC] bus low → recover first SDA=%d SCL=%d",
+             digitalRead(sda_), digitalRead(scl_));
     i2cBusRecover(sda_, scl_);
   }
   int idleSda = digitalRead(sda_);
@@ -544,13 +566,22 @@ bool NfcReader::hwInit() {
   // 总线仍被拉死时禁止 nfc.begin/getFirmwareVersion（会 1s 超时连打卡死 loop）
   if (!idleSda || !idleScl) {
     Serial.println("[NFC] abort: bus not idle, will not touch PN532 cmds");
+    // 这条以前只打串口 → 远程只见 auto-retry 看不到判死原因，是这次排查的盲区
+    logShipf("[NFC] abort: bus not idle SDA=%d SCL=%d (recover失败)",
+             idleSda, idleScl);
     ok_ = false;
     deferred_ = true;
     if (failStreak_ < 60000) failStreak_++;
     return false;
   }
+  // 进得来说明总线空闲：把电平记上云，下次对照能看出是"芯片没焊"还是"被按死"
+  if (nfcCloudOk(&s_cldHwInitMs, 15000)) {
+    logShipf("[NFC] idle SDA=%d SCL=%d → probe SCL=%d", idleSda, idleScl,
+             digitalRead(scl_));
+  }
 
   // 未接芯片：先短超时探测，避免 1000ms×N 次把 HTTP/主循环堵死
+  crashSnapMark("nfc.probe");
   if (!probePresent()) {
     absent_ = true;
     ok_ = false;
@@ -587,9 +618,13 @@ bool NfcReader::hwInit() {
   uint32_t ver = nfc.getFirmwareVersion();
   Serial.printf("[NFC] ver=0x%08X cost=%ums SCL=%d\n", ver,
                 (unsigned)(millis() - t0), digitalRead(scl_));
+  // 读数本身（而非只有成败）才能区分"芯片没焊/被按死/I2C 半残"
+  logShipf("[NFC] ver=0x%08X cost=%ums SCL=%d", ver,
+           (unsigned)(millis() - t0), digitalRead(scl_));
 
   if (!ver) {
     Serial.println("[NFC] ver=0 → recover + retry once");
+    logShipf("[NFC] ver=0 → recover + retry once SCL=%d", digitalRead(scl_));
     releaseBus(sda_, scl_);
     i2cBusRecover(sda_, scl_);
     if (!busIdle(sda_, scl_)) {
@@ -605,6 +640,7 @@ bool NfcReader::hwInit() {
     delay(200);
     ver = nfc.getFirmwareVersion();
     Serial.printf("[NFC] retry ver=0x%08X SCL=%d\n", ver, digitalRead(scl_));
+    logShipf("[NFC] retry ver=0x%08X SCL=%d", ver, digitalRead(scl_));
   }
 
   if (!ver) {
@@ -771,6 +807,8 @@ void NfcReader::taskTrampoline(void* arg) {
 }
 
 void NfcReader::taskLoop() {
+  // 1s 采一次栈：NFC 任务自己卡死时，loop 的快照还停在 loop 里看不到这里
+  uint32_t lastSnap = 0;
   for (;;) {
     if (suspended_) {
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -783,6 +821,13 @@ void NfcReader::taskLoop() {
       vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (suspended_) continue;
+    {
+      uint32_t now = millis();
+      if (now - lastSnap >= 1000) {
+        lastSnap = now;
+        crashSnapCapture();
+      }
+    }
     if (!lockBus(200)) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
@@ -835,6 +880,10 @@ void NfcReader::maybeRecover() {
     bootInitDone_ = true;
     Serial.printf("[NFC] 上电自动 init t=%ums SCL=%d\n", (unsigned)now,
                   digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL));
+    // 开机第一次碰 I2C 的电平：断电重启后 SCL 是否还被拉住就看这行
+    logShipf("[NFC] boot auto-init t=%ums SCL=%d SDA=%d", (unsigned)now,
+             digitalRead(scl_ >= 0 ? scl_ : PIN_NFC_SCL),
+             digitalRead(sda_ >= 0 ? sda_ : PIN_NFC_SDA));
     if (hwInit()) {
       logShipf("[NFC] boot auto-init OK");
       return;
@@ -878,6 +927,9 @@ void NfcReader::maybeRecover() {
   }
   lastRecoverMs_ = now;
   Serial.printf("[NFC] recover try fail=%u\n", failStreak_);
+  // 已被 NFC_RECOVER_GAP_MS 节流（15s 一次），可直接上云
+  logShipf("[NFC] recover try fail=%u SDA=%d SCL=%d", failStreak_,
+           digitalRead(sda_), digitalRead(scl_));
   if (!hwInit()) {
     deferred_ = true;
     lastAutoRetryMs_ = now;
@@ -961,6 +1013,11 @@ bool NfcReader::poll(String& uid) {
   if (!digitalRead(sda_) || !digitalRead(scl_)) {
     Serial.printf("[NFC] poll bus stuck SDA=%d SCL=%d → recover\n",
                   digitalRead(sda_), digitalRead(scl_));
+    // 运行中卡总线的唯一入口；卡死时每次 poll 都会进来，故节流上云
+    if (nfcCloudOk(&s_cldRecoverMs, 10000)) {
+      logShipf("[NFC] poll bus stuck SDA=%d SCL=%d → recover",
+               digitalRead(sda_), digitalRead(scl_));
+    }
     nfcRewire(sda_, scl_);
     if (!busIdle(sda_, scl_)) {
       i2cBusRecover(sda_, scl_);
@@ -998,6 +1055,11 @@ bool NfcReader::poll(String& uid) {
 
   if (!busIdle(sda_, scl_)) {
     Serial.println("[NFC] poll bus LOW → release + resync");
+    // poll 后总线被拉低=传输中没放线，是"能探到但用不起来"的现场，节流上云
+    if (nfcCloudOk(&s_cldRecoverMs, 10000)) {
+      logShipf("[NFC] poll bus LOW → release + resync SDA=%d SCL=%d",
+               digitalRead(sda_), digitalRead(scl_));
+    }
     releaseBus(sda_, scl_);
     recoverBusAndResync();
     lastPollSlow_ = true;

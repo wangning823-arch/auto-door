@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include "crash_snap.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <atomic>
@@ -88,14 +89,18 @@ uint32_t httpDnsBusyCount() { return s_dnsBusy.load(); }
 static int httpExchange(const HttpJob& j, String* respOut) {
   IPAddress addr;
   bool dnsOk = false;
+  crashSnapMark("http.dns");
   // worker 不受 loop 看门狗约束，但也不能无限等：loop 侧查一次最坏 ~16s
   if (httpDnsLock(HTTP_DNS_LOCK_WAIT_MS)) {
+    crashSnapCapture();  // 锁内是当初 dda0 挂死的现场，进去前留一份栈
     dnsOk = WiFi.hostByName(j.host.c_str(), addr);
     httpDnsUnlock();
   }
   if (!dnsOk) return -11;
   WiFiClient client;
+  crashSnapMark("http.conn");
   if (!client.connect(addr, j.port, (int32_t)j.timeoutMs)) return -1;
+  crashSnapMark("http.io");
 
   String req;
   req.reserve(160 + j.body.length());
@@ -174,6 +179,8 @@ static void httpWorker(void*) {
     if (xQueueReceive(s_jobs, &j, portMAX_DELAY) != pdTRUE || !j) continue;
     s_workerBusy.store(true);
     s_slots[j->owner].startMs = millis();
+    crashSnapMark("worker.job");
+    crashSnapCapture();  // 每单留一份栈：卡在半路时至少知道从哪出发
 
     if (WiFi.status() != WL_CONNECTED) {
       httpFinishJob(j, -10, String());  // ownerBusy 由消费方收结果时清
