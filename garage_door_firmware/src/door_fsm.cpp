@@ -80,34 +80,36 @@ void DoorFsm::emitClose() {
   pulseRelay();
 }
 
-bool DoorFsm::canAutoOpenNow() const {
+void DoorFsm::setAutoOpenSuppress(uint32_t ms) {
+  suppressAutoOpenUntil_ = millis() + ms;
+}
+
+bool DoorFsm::canAutoOpenNow(bool allowDuringSuppress) const {
   if (holdOpen_) return false;
-  // 手动操作后：只挡自动开（防手动关完又被顶开），不挡离场自动关
-  if (suppressAutoOpenUntil_ && !millisReached(millis(), suppressAutoOpenUntil_))
-    return false;
-  // 不因「门已开/上次开过很久」拒绝：进场一律可再发开码（门已开再开一次无害）
+  // 弱路径：手动关后屏蔽（熄火后库内蓝牙仍亮、多径 弱→强 不许顶开）
+  // 门口持续强（出库）传 allowDuringSuppress=true，抑制期内仍允许
+  if (!allowDuringSuppress && autoOpenSuppressActive()) return false;
+  // 不因「门已开」拒绝：门已开再发开码无害
   return true;
 }
 
 bool DoorFsm::canAutoCloseNow() const {
   if (holdOpen_) return false;
-  // 不看 doorState、不看开后 hold、不看关冷却：
   // 离场判定成立就发关码（门其实关着再关一次也无妨）
   return true;
 }
 
-bool DoorFsm::tryAutoOpen(const char* why) {
-  if (!canAutoOpenNow()) {
+bool DoorFsm::tryAutoOpen(const char* why, bool allowDuringSuppress) {
+  if (!canAutoOpenNow(allowDuringSuppress)) {
     // 上送 VPS：否则远程只见 RF TX，看不出是谁在开
-    logShipf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d suppress=%d",
+    logShipf("[FSM] AUTO OPEN 拒绝 (%s) hold=%d suppress=%d strongGate=%d",
              why ? why : "?", holdOpen_ ? 1 : 0,
-             suppressAutoOpenUntil_ &&
-                     !millisReached(millis(), suppressAutoOpenUntil_)
-                 ? 1
-                 : 0);
+             autoOpenSuppressActive() ? 1 : 0,
+             allowDuringSuppress ? 1 : 0);
     return false;
   }
-  logShipf("[FSM] AUTO OPEN (%s)", why ? why : "");
+  logShipf("[FSM] AUTO OPEN (%s) suppressBypass=%d", why ? why : "",
+           allowDuringSuppress ? 1 : 0);
   pending_ = DoorAction::PULSE_OPEN;
   openSource_ = OpenSource::AUTO;
   doorState_ = DoorState::OPEN;
@@ -159,7 +161,7 @@ void DoorFsm::requestManualOpen(OpenSource src) {
   lastCmd_ = LastCmd::OPEN;
   pending_ = DoorAction::NONE;
   lastAnyActionTs_ = millis();
-  // 只挡后续自动开，不挡离场自动关
+  // 只挡后续弱路径自动开，不挡离场自动关；门口持续强仍可开（出库）
   suppressAutoOpenUntil_ = millis() + MANUAL_SUPPRESS_MS;
   logShipf("[FSM] MANUAL OPEN src=%d", (int)src);
 }
@@ -173,8 +175,10 @@ void DoorFsm::requestManualClose(OpenSource src) {
   lastCmd_ = LastCmd::CLOSE;
   pending_ = DoorAction::NONE;
   lastAnyActionTs_ = millis();
-  suppressAutoOpenUntil_ = millis() + MANUAL_SUPPRESS_MS;
-  logShipf("[FSM] MANUAL CLOSE src=%d", (int)src);
+  // 库内熄火后蓝牙仍在线数分钟：手动关后长屏蔽弱路径开，防 无→有/弱→强 误开
+  setAutoOpenSuppress(MANUAL_CLOSE_SUPPRESS_MS);
+  logShipf("[FSM] MANUAL CLOSE src=%d suppress=%ums", (int)src,
+           (unsigned)MANUAL_CLOSE_SUPPRESS_MS);
 }
 
 void DoorFsm::loop(BleTracker& bt) {

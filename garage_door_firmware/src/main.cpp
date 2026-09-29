@@ -302,11 +302,21 @@ static bool rfEmitDoor(bool open) {
 
 // 本机是否已「进库/开过门」——只有成立后才允许自动关，避免上电/库内唤醒闪断连发 close
 static bool gCloseArmed = false;
-// 开门后是否再次见过强信号（真正进库）；门外未进库不得凭渐离关
+// 开门后是否再次见过强信号（门外安装：门口出现过强）
 static bool gStrongAfterOpen = false;
 static uint32_t gLastAutoCloseMs = 0;
 static bool gLeaveQual = false;
 static bool gTrueNo = true;  // 上电视为「无」，首次有信号即可开
+
+// ===== 门外安装（ESP32 在车库门外）=====
+// 上电保守：先当「库内未知」，弱路径不开；见门口持续强才放开
+static bool gInGarage = true;
+static bool gHadDoorStrong = false;       // 曾在门口见过强信号
+static uint32_t gLastStrongMs = 0;        // 最近一次 ≥RSSI_STRONG
+static uint32_t gLostSinceStrongMs = 0;   // 强后信号丢失起始（0=当前未丢/从未强）
+static uint8_t gStrongStreak = 0;         // 连续强样本
+static uint32_t gStrongStreakSince = 0;   // 本段强样本起始时刻
+static bool gStrongOpenReady = false;     // 强信号已持续，允许自动开
 
 // 误触取证：最近 8 次信号观测（-127=无），离场资格/发关码时上送 VPS
 static int8_t gSigLog[8];
@@ -330,9 +340,9 @@ static void sigLogShip(const char* tag, int rssi) {
     off += snprintf(body + off, sizeof(body) - off, "%s%d", i ? " " : "",
                     (int)gSigLog[idx]);
   }
-  logShipf("[FSM] sig %s rssi=%d leaveQ=%d strongAfter=%d trueNo=%d | %s",
+  logShipf("[FSM] sig %s rssi=%d leaveQ=%d strongAfter=%d trueNo=%d inGar=%d | %s",
            tag, rssi, (int)gLeaveQual, (int)gStrongAfterOpen, (int)gTrueNo,
-           body);
+           (int)gInGarage, body);
 }
 
 static void clearLeaveQual(const char* why) {
@@ -340,6 +350,29 @@ static void clearLeaveQual(const char* why) {
     gLeaveQual = false;
     if (why) Serial.printf("[FSM] 清除离场资格 (%s)\n", why);
   }
+}
+
+// 弱路径开门：库内 / 手动关抑制期内一律拒绝（熄火后蓝牙仍亮会抖 无→有/弱→强）
+static bool openWeakPathAllowed() {
+  if (gInGarage) return false;
+  if (gDoor.autoOpenSuppressActive()) return false;
+  return true;
+}
+
+// 门口持续强开门：允许出库到门口；须 gStrongOpenReady
+static bool openStrongPathAllowed() { return gStrongOpenReady; }
+
+static bool autoOpenThenArm(const char* why, bool allowDuringSuppress = false) {
+  bool ok = gDoor.tryAutoOpen(why, allowDuringSuppress);
+  if (ok) {
+    gCloseArmed = true;
+    gStrongAfterOpen = false;  // 开门后须再确认门口强/离场
+    clearLeaveQual("开门重置");
+    // 开门成功 = 真在用门（出库/回场贴近）→ 解除库内弱开锁
+    gInGarage = false;
+    sigLogShip("autoOpen", gLastSigRssi);
+  }
+  return ok;
 }
 
 static bool autoCloseGuarded(const char* why) {
@@ -355,26 +388,12 @@ static bool autoCloseGuarded(const char* why) {
   return gDoor.tryAutoClose(why);
 }
 
-static bool autoOpenThenArm(const char* why) {
-  bool ok = gDoor.tryAutoOpen(why);
-  if (ok) {
-    gCloseArmed = true;
-    gStrongAfterOpen = false;  // 必须再进库变强才允许离场关
-    clearLeaveQual("开门重置");
-    // 与关码对称：开码也带上最近 RSSI 窗，否则 VPS 只见 RF TX 不知信号背景
-    sigLogShip("autoOpen", gLastSigRssi);
-  }
-  return ok;
-}
-
-// 离场/信号消失：发关码。成功或已关后必须清离场资格 + 限频，
-// 否则 leaveQual 卡住会每 ~4s 连发关码，堵死门机让原遥控失效。
+// 离场/信号消失：发关码。成功后清离场资格 + 限频，并屏蔽弱路径开
 static bool tryCloseIfOpen(const char* why) {
   gCloseArmed = true;
   const uint32_t now = millis();
   if (gLastAutoCloseMs != 0 &&
       (now - gLastAutoCloseMs) < AUTO_CLOSE_MIN_INTERVAL_MS) {
-    // 限频窗口内不发，但仍允许下一次条件评估
     return false;
   }
   bool ok = autoCloseGuarded(why);
@@ -383,17 +402,16 @@ static bool tryCloseIfOpen(const char* why) {
     gLastAutoCloseMs = now;
     clearLeaveQual("已发关码");
     gStrongAfterOpen = false;
-    Serial.printf("[FSM] 自动关已发 (%s)，离场资格已清\n", why ? why : "?");
+    // 关完门：车多半在库内或已走远，禁止库内漏扫弱路径再顶开
+    gInGarage = true;
+    gDoor.setAutoOpenSuppress(AUTO_CLOSE_SUPPRESS_MS);
+    Serial.printf("[FSM] 自动关已发 (%s)，离场资格已清 inGarage=1\n",
+                  why ? why : "?");
   }
   return ok;
 }
 
 // ===== 真无 + 离场 RSSI 趋势（开/关门共用）=====
-// 开：仅「连续真无」之后再出现（含很弱）才开；短 miss 回来不算无→有
-// 关：≥RSSI_TREND_MIN_N 个有效 RSSI 单调变弱且首末够弱；反弹否决；或长时间真无兜底
-// 关门资格：渐离趋势 + 开门后见过强信号（进过库）+ 已偏远（isFar）
-// 渐离判定语义（见 config.h）：开走=移动中连续渐弱，90s 内首末落差≥DROP；
-// 熄火=瞬消无新样本，时间窗内凑不齐落差 → 永不合格（不误关库内的人）
 struct RssiTrendWin {
   int8_t buf[6];
   uint32_t ts[6];  // 采样时刻（时间窗淘汰用）
@@ -409,7 +427,6 @@ struct RssiTrendWin {
     ts[head] = now;
     head = (uint8_t)((head + 1) % 6);
     if (n < 6) n++;
-    // 淘汰时间窗外的旧样本：熄火后样本停更，旧数据过期即失效
     while (n > 0) {
       uint8_t oldest = (uint8_t)((head - n + 12) % 6);
       if ((now - ts[oldest]) <= RSSI_TREND_WINDOW_MS) break;
@@ -419,17 +436,14 @@ struct RssiTrendWin {
   bool gradualLeave() const {
     if (n < RSSI_TREND_MIN_N) return false;
     uint8_t start = (uint8_t)((head - n + 12) % 6);
-    // 相邻回弹上限：停车多径锯齿（-85→-99→-83）在此否决；真开走每步变弱或小抖
     for (uint8_t i = 0; i + 1 < n; i++) {
       int a = buf[(start + i) % 6];
       int b = buf[(start + i + 1) % 6];
       if (b > a + RSSI_TREND_TOL_DB) return false;
     }
-    // 首末落差：整体渐离幅度
     int first = buf[start];
     int last = buf[(start + n - 1) % 6];
     if (first - last < RSSI_TREND_DROP_DB) return false;
-    // 时间窗双保险：整段落差必须发生在窗口内
     if ((ts[(start + n - 1) % 6] - ts[start]) > RSSI_TREND_WINDOW_MS)
       return false;
     return true;
@@ -456,13 +470,37 @@ static void observeSignal(bool hasSignal, int rssi) {
   if (hasSignal) {
     gNoSigSince = 0;
     gEverHadSignal = true;
-    gRssiTrend.push(rssi, now);
     if (rssi >= RSSI_STRONG) {
+      // 门口强：进库锁解除要等「持续强」，单点只更新时间戳
+      gLastStrongMs = now;
+      gLostSinceStrongMs = 0;
       gStrongAfterOpen = true;
       clearLeaveQual("回到强信号");
-      gRssiTrend.clear();  // 渐离窗口从强信号之后重算：防到达段旧弱样本污染开走判定
-      return;  // 强信号不参与离场趋势
+      gRssiTrend.clear();
+      gHadDoorStrong = true;
+      if (gStrongStreakSince == 0) gStrongStreakSince = now;
+      if (gStrongStreak < 255) gStrongStreak++;
+      if (gStrongStreak >= OPEN_STRONG_STREAK &&
+          millisReached(now, gStrongStreakSince + OPEN_STRONG_HOLD_MS)) {
+        if (!gStrongOpenReady) {
+          Serial.printf(
+              "[FSM] 门口强信号已持续 streak=%d hold=%ums inGarage=%d → 允许自动开\n",
+              (int)gStrongStreak, (unsigned)OPEN_STRONG_HOLD_MS,
+              (int)gInGarage);
+        }
+        gStrongOpenReady = true;
+        if (gInGarage) {
+          gInGarage = false;
+          Serial.println("[FSM] 持续强信号 → 出库/回场，解除库内锁");
+        }
+      }
+      return;  // 强样本不进渐离趋势
     }
+    // 弱信号：重置持续强判定（关库后多径 弱→强 单点不得开）
+    gStrongStreak = 0;
+    gStrongStreakSince = 0;
+    gStrongOpenReady = false;
+    gRssiTrend.push(rssi, now);
     if (gRssiTrend.gradualLeave()) {
       if (!gLeaveQual) {
         Serial.printf("[FSM] 离场趋势合格 rssi=%d（≥%d 点单调变弱） strongAfter=%d\n",
@@ -473,31 +511,53 @@ static void observeSignal(bool hasSignal, int rssi) {
       gLeaveQual = true;
     }
   } else {
+    gStrongStreak = 0;
+    gStrongStreakSince = 0;
+    gStrongOpenReady = false;  // 丢失即中断持续强
     if (gNoSigSince == 0) gNoSigSince = now;
+    if (gLastStrongMs != 0 && gLostSinceStrongMs == 0) {
+      gLostSinceStrongMs = now;
+      Serial.printf("[FSM] 门口强后信号丢失 t=%u\n", (unsigned)now);
+    }
     if (millisReached(now, gNoSigSince + RSSI_TRUE_SILENT_MS) && !gTrueNo) {
       gTrueNo = true;
-      // 长静默=新的一次出现，旧离场资格/旧趋势作废；否则 -127→弱信号会误关
+      // 长静默：真无确认；库内锁仍保留（弱路径开门看 gInGarage）
       clearLeaveQual("真无确认");
       gRssiTrend.clear();
-      Serial.println("[FSM] 真无确认（连续无信号满，之后有信号才再开）");
+      Serial.println("[FSM] 真无确认（弱路径开门仍受库内/抑制约束）");
     }
     if (!gStrongAfterOpen && gLeaveQual) {
       clearLeaveQual("门外消失且未进库");
     }
   }
+
+  // 强后弱/丢满 OUT_IN_GARAGE_SILENT_MS → 车在库内（熄火后蓝牙仍亮也算）
+  if (gLastStrongMs != 0 && millisReached(now, gLastStrongMs + OUT_IN_GARAGE_SILENT_MS)) {
+    if (!gInGarage) {
+      gInGarage = true;
+      Serial.println("[FSM] 强信号后持续弱/丢 → 判定车在库内（禁弱路径自动开）");
+    }
+  }
 }
 
-// 关门资格：渐离合格 + 开门后见过强信号（进过库）+ 已偏远（isFar）
-// 不看「信号消失」：进库熄火后蓝牙也会消失，那时人还在车库，关门会把人关在里面
+// 门外安装关门：
+//  1) 主路径：门口强信号后丢失满 OUT_CLOSE_SILENT_MS（开走/出库、入库）
+//  2) 旁路：渐离趋势 + 开门后见过强 + 连续偏远
 static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
-  // 真无后重新出现应走开门，绝不关
-  if (gTrueNo) return false;
-  if (!gLeaveQual || !gStrongAfterOpen) return false;
-  // 只凭连续偏远关；单纯消失（熄火/闪断）不关，人出车库后手动/远程关
-  return isFar;
+  if (!gCloseArmed) return false;
+  const uint32_t now = millis();
+  // 开走关门：强→丢失满时长（车离开门口 RF 区，或入库后人离开车库）
+  if (gHadDoorStrong && gLostSinceStrongMs != 0 && !hasSignal) {
+    if (millisReached(now, gLostSinceStrongMs + OUT_CLOSE_SILENT_MS)) {
+      return true;
+    }
+  }
+  // 旁路：仍有信号但已偏远 + 渐离合格（出门后未立刻丢扫到）
+  if (gLeaveQual && gStrongAfterOpen && isFar) return true;
+  return false;
 }
 
-// isFar 防抖：-90 凹点/跳动一次不算离场，须连续 RSSI_FAR_MIN_STREAK 次
+// isFar 防抖：-90 凹点/跳动一次不算离场
 static uint8_t gFarStreak = 0;
 static bool debounceFar(bool hasSignal, int rssi) {
   if (!hasSignal) {
@@ -1781,20 +1841,28 @@ void loop() {
 
       if (scanJustFinished) {
         Serial.printf(
-            "[BLE] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d\n",
+            "[BLE] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d inGar=%d strongOK=%d phase=%d\n",
             r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
-            (int)gLeaveQual, (int)phase);
+            (int)gLeaveQual, (int)gInGarage, (int)gStrongOpenReady, (int)phase);
 
         switch (phase) {
           case BlePhase::WAIT_SIGNAL:
             if (hasSignal && gTrueNo) {
-              Serial.printf("[FSM] 真无→有 rssi=%d，发开码\n", r);
               gTrueNo = false;
-              // 首见即强直接进 STRONG：否则下轮「有→强」会重复开一次（双开）
-              // 开失败仍进 APPEARING，保留有→强作为重试
-              phase = (autoOpenThenArm("真无→有") && isStrong)
-                          ? BlePhase::STRONG
-                          : BlePhase::APPEARING;
+              bool openOk = false;
+              if (isStrong && openStrongPathAllowed()) {
+                Serial.printf("[FSM] 真无→有-持续强 rssi=%d，发开码\n", r);
+                openOk = autoOpenThenArm("真无→有-持续强", true);
+              } else if (openWeakPathAllowed()) {
+                Serial.printf("[FSM] 真无→有 rssi=%d，发开码\n", r);
+                openOk = autoOpenThenArm("真无→有");
+              } else {
+                Serial.printf(
+                    "[FSM] 开门拒绝（真无→有） rssi=%d inGar=%d suppress=%d strongOK=%d\n",
+                    r, (int)gInGarage, (int)gDoor.autoOpenSuppressActive(),
+                    (int)gStrongOpenReady);
+              }
+              phase = (openOk && isStrong) ? BlePhase::STRONG : BlePhase::APPEARING;
               break;
             }
             if (shouldCloseBySignal(hasSignal, isFar)) {
@@ -1806,7 +1874,13 @@ void loop() {
 
           case BlePhase::APPEARING:
             if (isStrong) {
-              autoOpenThenArm("有→强");
+              if (openStrongPathAllowed()) {
+                autoOpenThenArm("有→强-持续", true);
+              } else {
+                Serial.printf(
+                    "[FSM] 开门拒绝（有→强未持续） rssi=%d inGar=%d strongOK=%d\n",
+                    r, (int)gInGarage, (int)gStrongOpenReady);
+              }
               phase = BlePhase::STRONG;
               break;
             }
@@ -1834,11 +1908,11 @@ void loop() {
             break;
 
           case BlePhase::LEAVING:
-            if (isStrong) {
+            if (isStrong && openStrongPathAllowed()) {
               phase = BlePhase::STRONG;
               gLeaveQual = false;
               gRssiTrend.clear();
-              Serial.println("[FSM] 弱→强，取消离开");
+              Serial.println("[FSM] 弱→强持续，取消离开");
               break;
             }
             if (shouldCloseBySignal(hasSignal, isFar)) {
@@ -1847,7 +1921,7 @@ void loop() {
               phase = BlePhase::WAIT_SIGNAL;
               break;
             }
-            // 丢信号=离开中断/新的一次出现，回 WAIT 以便真无→有开门
+            // 丢信号：门外安装由「强后丢失满时长」关门；弱路径开仍受库内锁
             if (!hasSignal) {
               phase = BlePhase::WAIT_SIGNAL;
               break;
@@ -1904,9 +1978,9 @@ void loop() {
       if (millis() - lastClLogMs >= 2000) {
         lastClLogMs = millis();
         Serial.printf(
-            "[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d\n",
+            "[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d inGar=%d strongOK=%d phase=%d\n",
             r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
-            (int)gLeaveQual, (int)clPhase);
+            (int)gLeaveQual, (int)gInGarage, (int)gStrongOpenReady, (int)clPhase);
         // 关键变化进日志环（VPS 可回放开车离开的 RSSI 曲线）；稳态不刷环
         static int lastShipRssi = -999;
         static int lastShipSeen = -1;
@@ -1914,22 +1988,30 @@ void loop() {
             (seen && abs(r - lastShipRssi) >= 5)) {
           lastShipSeen = (int)seen;
           lastShipRssi = seen ? r : -999;
-          logShipf("[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d phase=%d",
+          logShipf("[CLASSIC] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d inGar=%d strongOK=%d phase=%d",
                    r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
-                   (int)gLeaveQual, (int)clPhase);
+                   (int)gLeaveQual, (int)gInGarage, (int)gStrongOpenReady, (int)clPhase);
         }
       }
 
       switch (clPhase) {
         case ClPhase::WAIT_SIGNAL:
           if (hasSignal && gTrueNo) {
-            Serial.printf("[FSM] C 真无→有 rssi=%d，发开码\n", r);
             gTrueNo = false;
-            // 首见即强（实测 -65~-78）直接进 STRONG：否则下轮「有→强」再开一次
-            // （20260927 日志每次到达都双开 RF）。开失败仍进 APPEARING 重试
-            clPhase = (autoOpenThenArm("经典真无→有") && isStrong)
-                          ? ClPhase::STRONG
-                          : ClPhase::APPEARING;
+            bool openOk = false;
+            if (isStrong && openStrongPathAllowed()) {
+              Serial.printf("[FSM] C 真无→有-持续强 rssi=%d，发开码\n", r);
+              openOk = autoOpenThenArm("经典真无→有-持续强", true);
+            } else if (openWeakPathAllowed()) {
+              Serial.printf("[FSM] C 真无→有 rssi=%d，发开码\n", r);
+              openOk = autoOpenThenArm("经典真无→有");
+            } else {
+              Serial.printf(
+                  "[FSM] C 开门拒绝（真无→有） rssi=%d inGar=%d suppress=%d strongOK=%d\n",
+                  r, (int)gInGarage, (int)gDoor.autoOpenSuppressActive(),
+                  (int)gStrongOpenReady);
+            }
+            clPhase = (openOk && isStrong) ? ClPhase::STRONG : ClPhase::APPEARING;
             break;
           }
           if (closeDue) {
@@ -1940,7 +2022,13 @@ void loop() {
 
         case ClPhase::APPEARING:
           if (isStrong) {
-            autoOpenThenArm("经典有→强");
+            if (openStrongPathAllowed()) {
+              autoOpenThenArm("经典有→强-持续", true);
+            } else {
+              Serial.printf(
+                  "[FSM] C 开门拒绝（有→强未持续） rssi=%d inGar=%d strongOK=%d\n",
+                  r, (int)gInGarage, (int)gStrongOpenReady);
+            }
             clPhase = ClPhase::STRONG;
             break;
           }
@@ -1968,11 +2056,11 @@ void loop() {
           break;
 
         case ClPhase::LEAVING:
-          if (isStrong) {
+          if (isStrong && openStrongPathAllowed()) {
             clPhase = ClPhase::STRONG;
             gLeaveQual = false;
             gRssiTrend.clear();
-            Serial.println("[FSM] C 弱→强，取消离开");
+            Serial.println("[FSM] C 弱→强持续，取消离开");
             break;
           }
           if (closeDue) {

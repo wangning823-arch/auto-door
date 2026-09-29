@@ -35,10 +35,17 @@ class DoorFsm {
   void setHoldOpen(bool hold) { holdOpen_ = hold; }
 
   // 自动开/关：开/关为不同 RF 码，不依赖门磁，只按软件状态+冷却发码
-  bool tryAutoOpen(const char* why);
+  // allowDuringSuppress=true：门口持续强（出库/回场），手动关抑制期内仍允许
+  bool tryAutoOpen(const char* why, bool allowDuringSuppress = false);
   bool tryAutoClose(const char* why);
-  bool canAutoOpenNow() const;
+  bool canAutoOpenNow() const { return canAutoOpenNow(false); }
+  bool canAutoOpenNow(bool allowDuringSuppress) const;
   bool canAutoCloseNow() const;
+  bool autoOpenSuppressActive() const {
+    return suppressAutoOpenUntil_ != 0 &&
+           !millisReached(millis(), suppressAutoOpenUntil_);
+  }
+  void setAutoOpenSuppress(uint32_t ms);
   uint32_t lastAutoOpenTs() const { return lastAutoOpenTs_; }
   uint32_t lastAutoCloseTs() const { return lastAutoCloseTs_; }
 

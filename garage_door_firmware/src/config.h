@@ -192,52 +192,70 @@
 #define RSSI_WINDOW           10      // 滑动窗口点数
 #define RELAY_PULSE_MS        2000    // 遥控按压时长；1s 电机常不认，改 2s
 
+// ===== 门外安装（ESP32 在车库门外，实测 dda0）=====
+// 强弱语义与「库内安装」相反：
+//   车在门外/门口 = 强；车入库 = 弱/丢失；开走离开门口 = 强后丢失
+// 开：真无→有（远离侧回场）或门口「持续」强；库内弱漏扫/单点强不许开
+// 关：门口强后信号丢失满此时长 → 自动关（开走/出库）
+#ifndef OUT_CLOSE_SILENT_MS
+#define OUT_CLOSE_SILENT_MS   30000UL
+#endif
+// 强信号后弱/丢满此时长 → 判定车在库内，禁止弱路径自动开
+#ifndef OUT_IN_GARAGE_SILENT_MS
+#define OUT_IN_GARAGE_SILENT_MS 15000UL
+#endif
+// 手动关门后屏蔽弱路径自动开（覆盖熄火后蓝牙仍在线的几分钟）
+#ifndef MANUAL_CLOSE_SUPPRESS_MS
+#define MANUAL_CLOSE_SUPPRESS_MS 300000UL  // 5 分钟
+#endif
+// 自动关门成功后同样屏蔽弱路径开（防库内漏扫顶开）
+#ifndef AUTO_CLOSE_SUPPRESS_MS
+#define AUTO_CLOSE_SUPPRESS_MS 180000UL    // 3 分钟
+#endif
+// 门口强信号须连续样本数 + 持续时长，才允许自动开（出库/回场贴近）
+// 单点 -68~-78 多为关库后多径抖动，不得开
+#ifndef OPEN_STRONG_STREAK
+#define OPEN_STRONG_STREAK    2
+#endif
+#ifndef OPEN_STRONG_HOLD_MS
+#define OPEN_STRONG_HOLD_MS   2500UL
+#endif
+
 // ===== BLE 状态机 =====
-// 开：无→有 且 rssi < -80 → 立刻开（关着门贴近约 -90 也能开，不等渐强）
-// 例外：无→有 且 rssi ≥ -80 → 不开（库内开关蓝牙等突变，一次就很“强”）
-// 关：进库变强后离开；RSSI≤RSSI_FAR_CLOSE 连续 N 次 ≈ 走出约10m 即关
-// 实测参考（ESP32 在库内靠门侧）：
-//   车在库外远处 ~-97；库外门口 ~-75~-93（关门）；库内强 ~-70 以上
+// 开（门外安装）：
+//   1) 真无→有 且 未在库内/未处手动关抑制期 → 开（回家从远处回场）
+//   2) 门口强信号连续 ≥OPEN_STRONG_STREAK 且持续 ≥OPEN_STRONG_HOLD_MS → 开
+//      （出库到门口、或回家贴近；库内熄火后单点强/弱→强抖动不许开）
+// 关：门口强信号后丢失满 OUT_CLOSE_SILENT_MS → 开；另保留渐离趋势作旁路
 #define RSSI_APPEAR_MIN       -110    // 出现信号下限（≥此值算「有」）
-#define RSSI_STRONG           -80     // 强信号阈值（离场路径用）
-// 首见就 ≥ 此值：视为库内突变（开关蓝牙），不自动开；与 RSSI_STRONG 同为 -80
-#define RSSI_SUDDEN_STRONG    -80
-#define RSSI_FAR_CLOSE        -90     // 离场关门：≤此约走出 10m（开门时可略调 -88~-92）
-// 单次 ≤-90 只是多径凹点，须连续 N 次 far 才算离场（锯齿 -75/-90 不会触发）
+#define RSSI_STRONG           -80     // 门口强信号阈值（门外安装）
+#define RSSI_SUDDEN_STRONG    -80     // 单点强不算开门，须 OPEN_STRONG_STREAK
+#define RSSI_FAR_CLOSE        -90     // 离场旁路：≤此约走出（连续 N 次）
+// 单次 ≤-90 只是多径凹点，须连续 N 次 far 才算离场
 #ifndef RSSI_FAR_MIN_STREAK
 #define RSSI_FAR_MIN_STREAK 2
 #endif
 #define BLE_CLOSE_FAR_SCANS   2       // 连续 N 次 ≤ FAR 才关（防抖）
-#define BLE_SILENT_GAP_MS     8000    // 多久没匹配算「无」（原 15s，偏晚）
-#define BLE_MISS_FOR_LOST     2       // 连续 N 次未匹配算「丢」（原 3）
-#define BLE_TRACK_INTERVAL_MS 4000    // 跟踪扫描间隔（原 6000，反应更快）
+#define BLE_SILENT_GAP_MS     8000    // 多久没匹配算「无」
+#define BLE_MISS_FOR_LOST     2       // 连续 N 次未匹配算「丢」
+#define BLE_TRACK_INTERVAL_MS 4000    // 跟踪扫描间隔
 #define BLE_TRACK_SCAN_MS     1500    // 单次扫描时长
-// 离场关门：进入「强→弱/离开」后，最长等这么久就关（观察期可再调）
-// 另：无→有立刻开门；误开问题后续再收紧
 #define LEAVING_CLOSE_MS      10000
-// ===== 关门：渐离趋势判定（区分「开车离开」与「熄火瞬消」）=====
-// 开走：车移动中 RSSI 连续渐弱 → 窗口内首末落差 ≥DROP 且相邻回弹 ≤TOL → 合格
-// 熄火：车机蓝牙直接消失、不再产生新样本 → 90s 时间窗内永远凑不齐落差 → 不合格
-//        （熄火瞬间 isFar 也因无信号不满足——车上有人在库时绝不触发自动关）
-// 经典蓝牙 inquiry 几秒一轮、多径噪声 ±10dB：原「4点严格单调+容差3dB+落差15dB」
-// 实测全天 0 次合格（dda0 20260927 日志）→ 放宽为 首末落差+回弹上限+时间窗 三条件
+// ===== 关门：渐离趋势（旁路，门外开走主路径是「强后丢失」）=====
 #ifndef RSSI_TREND_MIN_N
-#define RSSI_TREND_MIN_N      4      // 窗口最少样本（3 点锯齿易误判）
+#define RSSI_TREND_MIN_N      4
 #endif
 #ifndef RSSI_TREND_DROP_DB
-#define RSSI_TREND_DROP_DB    12     // 首末至少弱这么多 dB（原 15）
+#define RSSI_TREND_DROP_DB    12
 #endif
 #ifndef RSSI_TREND_TOL_DB
-#define RSSI_TREND_TOL_DB     10     // 相邻允许回弹上限 dB（原 3：-82→-95→-85 一步否决）
+#define RSSI_TREND_TOL_DB     10
 #endif
 #ifndef RSSI_TREND_WINDOW_MS
-#define RSSI_TREND_WINDOW_MS  90000UL  // 渐离须发生在 90s 内：防停车后环境慢漂移误判
+#define RSSI_TREND_WINDOW_MS  90000UL
 #endif
-// 连续无信号这么久才算「真无」，之后再出现才允许无→有开（抖动 miss 不算无）
-// 注意：仅用于开门门槛；不再用于「无信号 35s 兜底关门」（车熄火会突然消失）
 #define RSSI_TRUE_SILENT_MS   20000
-// （已废弃作自动关）曾用于无渐离信号消失 35s 后强关 → 车库内熄火误关
-// #define RSSI_LEAVE_SILENT_MS  35000
+// （废弃）信号消失兜底关：门外安装下「强后丢失」才是开走出库/入库关门形态
 
 // ===== NFC 读卡（与蓝牙共存）=====
 // I2C 超时必须短：isready 空读会 NACK，Wire 超时多长就卡多久。
@@ -317,8 +335,8 @@
 #define AUTO_MIN_OPEN_HOLD_MS 20000   // 20 秒（原 60s，离场关门偏晚）
 // 上电宽限：此时间内禁止自动关（防第二块板启动即连发 close）
 #define AUTO_BOOT_GRACE_MS 15000
-// 手动 NFC/串口/网页 开关后，只短时屏蔽自动「开」（防手动关完立刻被无→有顶开）
-// 离场自动关不受此限制；真车场景：刷卡开完 10 秒就可能开走
+// 手动 NFC/串口/网页 开关后：手动开仅短时屏蔽弱路径自动开；
+// 手动关用 MANUAL_CLOSE_SUPPRESS_MS（门外安装，覆盖熄火后蓝牙仍在线）
 #define MANUAL_SUPPRESS_MS 5000
 
 // 串口调试
