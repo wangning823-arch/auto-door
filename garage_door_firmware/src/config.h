@@ -212,20 +212,23 @@
 #ifndef AUTO_CLOSE_SUPPRESS_MS
 #define AUTO_CLOSE_SUPPRESS_MS 180000UL    // 3 分钟
 #endif
-// 门口强信号须连续样本数 + 持续时长，才允许自动开（出库/回场贴近）
-// 单点 -68~-78 多为关库后多径抖动，不得开
+// 门口强信号：滑动窗口内强样本次数（经典 BT 多径会 强/弱 交替，不能要求连续）
+// 例：-65 → -90 → -65 在 8s 窗口内算 2 次强 → 允许自动开
 #ifndef OPEN_STRONG_STREAK
-#define OPEN_STRONG_STREAK    2
+#define OPEN_STRONG_STREAK    2      // 窗口内最少强样本次数
+#endif
+#ifndef OPEN_STRONG_WINDOW_MS
+#define OPEN_STRONG_WINDOW_MS 10000UL  // 强样本计数窗口
 #endif
 #ifndef OPEN_STRONG_HOLD_MS
-#define OPEN_STRONG_HOLD_MS   2500UL
+#define OPEN_STRONG_HOLD_MS   2500UL   // 兼容旧宏：窗口内首末强间隔至少这么久
 #endif
 
 // ===== BLE 状态机 =====
 // 开（门外安装）：
 //   1) 真无→有 且 未在库内/未处手动关抑制期 → 开（回家从远处回场）
-//   2) 门口强信号连续 ≥OPEN_STRONG_STREAK 且持续 ≥OPEN_STRONG_HOLD_MS → 开
-//      （出库到门口、或回家贴近；库内熄火后单点强/弱→强抖动不许开）
+//   2) 门口强信号：10s 窗口内 ≥OPEN_STRONG_STREAK 次 → 开
+//      （经典 BT 多径 强/弱 交替时仍可累计；单点强/库内漏扫弱仍不许开）
 // 关：门口强信号后丢失满 OUT_CLOSE_SILENT_MS → 开；另保留渐离趋势作旁路
 #define RSSI_APPEAR_MIN       -110    // 出现信号下限（≥此值算「有」）
 #define RSSI_STRONG           -80     // 门口强信号阈值（门外安装）
