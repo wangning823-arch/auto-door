@@ -110,6 +110,30 @@ static void i2cBusRecover(int sda, int scl) {
   }
 }
 
+// 总线卡死升级恢复：常规 recover 一轮救不活时（芯片把 SCL 按死），
+// 多轮重试 + 轮间留出让从机状态机复位的时间，再不行才动硬复位脚。
+static void i2cBusRecoverDeep(int sda, int scl) {
+  for (int i = 0; i < 3 && !(digitalRead(sda) && digitalRead(scl)); i++) {
+    i2cBusRecover(sda, scl);
+    delay(20);
+  }
+}
+
+// PN532 RSTPD 硬复位：软件恢复的尽头。未接 PIN_NFC_RST（默认 -1）时空操作——
+// 实测被芯片拉死的 SCL 只有断电/硬复位能救，接上这根线后此路才通。
+static void nfcHardwareResetIfWired() {
+#if PIN_NFC_RST >= 0
+  pinMode(PIN_NFC_RST, OUTPUT);
+  digitalWrite(PIN_NFC_RST, LOW);
+  delay(20);
+  digitalWrite(PIN_NFC_RST, HIGH);
+  delay(80);
+  logShipf("[NFC] RSTPD pulse pin=%d (硬件复位)", PIN_NFC_RST);
+#else
+  logShipf("[NFC] 无硬复位脚(PIN_NFC_RST 未接)，软件恢复已到极限");
+#endif
+}
+
 // I2C 超时后必须松手：否则 ESP 外设/从机时钟拉伸会把 SCL 按在 0.04
 // Wire.end() 不一定把脚从 I2C 矩阵断开；必须 gpio_reset_pin 才回到 GPIO 上拉
 static void releaseBus(int sda, int scl) {
@@ -565,14 +589,45 @@ bool NfcReader::hwInit() {
                 (unsigned)millis());
   // 总线仍被拉死时禁止 nfc.begin/getFirmwareVersion（会 1s 超时连打卡死 loop）
   if (!idleSda || !idleScl) {
-    Serial.println("[NFC] abort: bus not idle, will not touch PN532 cmds");
-    // 这条以前只打串口 → 远程只见 auto-retry 看不到判死原因，是这次排查的盲区
-    logShipf("[NFC] abort: bus not idle SDA=%d SCL=%d (recover失败)",
-             idleSda, idleScl);
-    ok_ = false;
-    deferred_ = true;
-    if (failStreak_ < 60000) failStreak_++;
-    return false;
+    // ===== 总线卡死自愈阶梯 =====
+    // 背景：dda0 20260929 上电后 PN532 按死 SCL，常规 recover 救不活，
+    // auto-retry 打满 255 连续 6h17m，最后靠人工断电才恢复。
+    uint32_t deadMs;
+    if (!busDeadSinceMs_) busDeadSinceMs_ = millis();
+    deadMs = millis() - busDeadSinceMs_;
+    if (deadMs >= 30000UL && !busDeadEscalated_) {
+      busDeadEscalated_ = true;
+      logShipf("[NFC] DEAD escalate t=%us → deep recover%s",
+               (unsigned)(deadMs / 1000),
+               PIN_NFC_RST >= 0 ? " + RSTPD硬复位" : " (无硬复位脚)");
+      i2cBusRecoverDeep(sda_, scl_);
+      nfcHardwareResetIfWired();
+      if (busIdle(sda_, scl_)) {
+        busDeadSinceMs_ = 0;
+        busDeadEscalated_ = false;
+        idleSda = digitalRead(sda_);
+        idleScl = digitalRead(scl_);
+      }
+    }
+    if (!idleSda || !idleScl) {
+      // 仍死：每 5min 一条醒目告警上云（可检索/可配告警），比 auto-retry 刷屏有用
+      static uint32_t s_cldDeadMs = 0;
+      if (nfcCloudOk(&s_cldDeadMs, 300000)) {
+        logShipf("[NFC] DEAD bus stuck %us SDA=%d SCL=%d (deep recover 失败)",
+                 (unsigned)(deadMs / 1000), idleSda, idleScl);
+      }
+      Serial.println("[NFC] abort: bus not idle, will not touch PN532 cmds");
+      // 这条以前只打串口 → 远程只见 auto-retry 看不到判死原因，是这次排查的盲区
+      logShipf("[NFC] abort: bus not idle SDA=%d SCL=%d (recover失败)",
+               idleSda, idleScl);
+      ok_ = false;
+      deferred_ = true;
+      if (failStreak_ < 60000) failStreak_++;
+      return false;
+    }
+  } else {
+    busDeadSinceMs_ = 0;
+    busDeadEscalated_ = false;
   }
   // 进得来说明总线空闲：把电平记上云，下次对照能看出是"芯片没焊"还是"被按死"
   if (nfcCloudOk(&s_cldHwInitMs, 15000)) {

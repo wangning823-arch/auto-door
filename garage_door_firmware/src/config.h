@@ -133,6 +133,12 @@
 #ifndef PIN_NFC_IRQ
 #define PIN_NFC_IRQ 4
 #endif
+// PN532 RSTPD 硬复位脚（可选）：接上后总线卡死可硬复位芯片自救。
+// 默认 -1 = 未接（现役两台都是 SDA16/SCL17/IRQ4 三线，RSTPD 未出线）。
+// 未接时软件恢复到极限仍救不活（dda0 实测：芯片拉死 SCL，只有断电能救）。
+#ifndef PIN_NFC_RST
+#define PIN_NFC_RST -1
+#endif
 
 // RF 抓包参数
 #define RF_CAPTURE_MAX_PULSES  512     // 最大记录脉冲数

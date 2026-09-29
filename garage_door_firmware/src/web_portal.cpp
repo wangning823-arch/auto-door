@@ -993,6 +993,9 @@ void WebPortal::startStaFromStore() {
     return;
   }
   staWanted_ = true;
+  // 配置可能刚改过（换路由/换密码）：旧 BSSID 定向必失败，先清掉
+  staHaveBssid_ = false;
+  staDirPending_ = false;
 
   // SoftAP 已开 → APSTA；否则纯 STA
   WiFi.persistent(false);
@@ -1012,6 +1015,30 @@ void WebPortal::startStaFromStore() {
   Serial.println("[WEB] WiFi.begin called");
   staTrying_ = true;
   staNextRetryMs_ = millis() + 15000;
+}
+
+// 连上时记下 AP 的 BSSID/信道，供下次定向直连
+void WebPortal::learnStaAp() {
+  const uint8_t* b = WiFi.BSSID();
+  int ch = WiFi.channel();
+  if (!b || ch <= 0) return;
+  memcpy(staBssid_, b, 6);
+  staChannel_ = (uint8_t)ch;
+  staHaveBssid_ = true;
+  staDirPending_ = false;  // 连上即重置：下一次踢线还能再试一轮定向
+}
+
+// 定向优先、广播兜底：AP 漫游/重启换了信道或 BSSID 时定向会失败，
+// 下一轮自动退回广播扫描，不会卡在错误目标上
+void WebPortal::beginSta(const String& ssid, const String& pass) {
+  if (staHaveBssid_ && !staDirPending_) {
+    staDirPending_ = true;
+    Serial.printf("[WEB] STA begin directed ch=%u bssid=%02X:..:%02X\n",
+                  (unsigned)staChannel_, staBssid_[0], staBssid_[5]);
+    WiFi.begin(ssid.c_str(), pass.c_str(), staChannel_, staBssid_);
+    return;
+  }
+  WiFi.begin(ssid.c_str(), pass.c_str());
 }
 
 void WebPortal::stopSta() {
@@ -1039,7 +1066,7 @@ void WebPortal::forceStaReconnect() {
   Serial.printf("[WEB] forceStaReconnect ssid=%s (data-path watchdog)\n",
                 ssid.c_str());
   WiFi.disconnect(false, false);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  beginSta(ssid, pass);  // 有已知 AP 就定向直连，省掉几秒全频段扫描
   staTrying_ = true;
   staNextRetryMs_ = millis() + 15000;
 }
@@ -1076,6 +1103,7 @@ void WebPortal::loopSta() {
     // 每 15s 打一次 STA/HTTP/heap：纯 STA 路径没有 AP 诊断日志，挂了要能看见
     if (staTrying_ || millis() - staLastLogMs_ > 15000) {
       staLastLogMs_ = millis();
+      learnStaAp();  // 每次连上/每15s 刷新一次，覆盖 AP 换信道的情况
       if (staTrying_) {
         staTrying_ = false;
         Serial.println("[WEB] STA connected ip=" + WiFi.localIP().toString() +
@@ -1120,7 +1148,7 @@ void WebPortal::loopSta() {
     String pass = store_ ? store_->loadStaPass() : String();
     if (ssid.length()) {
       Serial.printf("[WEB] STA retry ssid=%s st=%d\n", ssid.c_str(), (int)st);
-      WiFi.begin(ssid.c_str(), pass.c_str());
+      beginSta(ssid, pass);  // 掉线重连同样定向优先
       staTrying_ = true;
       staNextRetryMs_ = now + 20000;
     }

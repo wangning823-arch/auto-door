@@ -671,6 +671,9 @@ static void serviceStaDataWatchdog() {
 // 疑似被写坏。三件套：分配失败钩子（谁、分多大、在哪失败）+ 周期完整性自检
 // （损坏出现在哪 2 秒窗口）+ 任务栈水位（找栈溢出写坏堆的元凶）。
 static volatile uint32_t gHeapFailN = 0;
+// 共用气囊（remote_ota 的 4KB 预留）归还请求：钩子里只置位，
+// 实际 free 必须在 loop 做——钩子在分配路径里严禁碰堆
+static volatile bool gResGiveReq = false;
 // 失败事件只在钩子里记字段（无锁、不 printf），完整诊断在 loop 上下文打印
 struct HeapFailEvt {
   volatile uint32_t seq;
@@ -693,6 +696,9 @@ static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
   if (inHook) return;
   inHook = true;
   uint32_t n = ++gHeapFailN;
+  // 4KB 以内的失败（WiFi esf_buf 2308B 就是这条线）→ 请 loop 归还共用气囊。
+  // 4112B 的 BTU inquiry 超过气囊容量，帮不上，不白跑一趟。
+  if (size <= 4096) gResGiveReq = true;
   if (n <= 16 || (n & 255) == 0) {
     gFailEvt.size = (uint32_t)size;
     gFailEvt.caps = (uint32_t)caps;
@@ -749,10 +755,22 @@ static void serviceHeapDiag() {
                gFailEvt.ra5);
     }
   }
+  // 共用气囊：钩子已置位 → 这里归还 4KB 给堆（WiFi 下一帧 2308B 就能成）
+  if (gResGiveReq) {
+    gResGiveReq = false;
+    remoteOtaReserveGive();
+  }
   // 每 10s 分池水位：哪个 caps 口径在「饿」
   static uint32_t lastPool = 0;
   if (now - lastPool >= 10000) {
     lastPool = now;
+    // 气囊收回：失败风暴过去、池子重新宽裕（largest8≥8KB）才收，
+    // 且最多 60s 一次——防止"收回→又被吃→再收"在 8KB 边界来回抖动刷日志
+    static uint32_t lastRearmMs = 0;
+    if (!remoteOtaReserveHeld() && !gResGiveReq && (now - lastRearmMs) >= 60000UL) {
+      lastRearmMs = now;  // 成败都计时：池子不宽裕时也不用每 10s 白跑 malloc
+      remoteOtaReserveRearm();
+    }
     // 不再看串口缓冲：logShipf 自带串口+VPS 双通道，门闩会让 VPS 侧漏数据
     {
       multi_heap_info_t iDef, i18, i8, iIn;
@@ -1971,20 +1989,18 @@ void loop() {
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 8000) {
     lastLog = millis();
-    // 串口缓冲不空闲就跳过周期日志，避免 TX 满时 println 拖死 loop。
-    // 阈值必须小于 FIFO 深度：本框架默认无软件 TX 缓冲（仅 128B 硬件 FIFO），
-    // availableForWrite() 最大约 128 —— 旧条件 >256 永假，心跳从不输出
-    // （两台设备 67KB VPS 日志 0 条 [LOG] 实证），断网期丢失 sta/rssi 面包屑
-    if (Serial.availableForWrite() > 96) {
-      // DEF 池口径（ESP.getFreeHeap/getMaxAllocHeap 是 INTERNAL 死块口径）
-      logShipf(
-          "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s",
-          (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
-          (int)gWeb.staConnected(),
-          gWeb.staConnected() ? "up" : "down",
-          gDoor.debugLine().c_str(), gBt.debugLine().c_str(),
-          gNfc.debugLine().c_str());
-    }
+    // 心跳恒发：logShipf 内部已把"环推送"和"串口写出"分开——环必达 VPS，
+    // 串口只在 TX FIFO 有余量时打（>96 < FIFO 深度 128）。
+    // 旧写法在 logShipf 外面再包一层 availableForWrite>96：无串口主机的设备
+    // FIFO 恒满 → 心跳整段丢失（1388 8 小时 0 条 [LOG] 实证），断网期
+    // sta/rssi 面包屑全丢。现在只让串口那一半承担门控。
+    logShipf(
+        "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+        (int)gWeb.staConnected(),
+        gWeb.staConnected() ? "up" : "down",
+        gDoor.debugLine().c_str(), gBt.debugLine().c_str(),
+        gNfc.debugLine().c_str());
   }
 }

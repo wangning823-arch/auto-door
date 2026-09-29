@@ -156,11 +156,56 @@ def _touch_locked(d, fw=None):
     d["last_seen"] = _now()
     if fw:
         d["fw"] = fw
+    _note_online_state(d, True)
+
+
+# ===== 在线时序落盘 =====
+# 目的：在线率/中断次数/单次中断时长可直接统计，不用再靠设备日志空洞反推
+# （日志空洞 = 没收到日志，可能同时包含"离线"和"日志链路堵"两种情况）。
+# 行格式: time,dev,state,held_s —— held_s 是上一个状态持续了多久，
+# 服务重启会丢内存态，重启后首条记录 held_s=0（已知噪声，可忽略）。
+ONLINE_HISTORY = os.path.join(LOG_DIR, "online_history.csv")
+
+
+def _hist_append(dev_id, state, ts, held_s):
+    try:
+        if not os.path.isdir(LOG_DIR):
+            os.makedirs(LOG_DIR)
+        first = not os.path.exists(ONLINE_HISTORY)
+        with open(ONLINE_HISTORY, "a") as f:
+            if first:
+                f.write("time,dev,state,held_s\n")
+            f.write("%s,%s,%s,%.0f\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+                dev_id, state, held_s))
+    except Exception:
+        pass  # 落盘失败绝不影响主流程
+
+
+def _note_online_state(d, online, ts=None):
+    now = ts if ts is not None else _now()
+    want = "on" if online else "off"
+    if d.get("_hist_state") == want:
+        return
+    held = 0.0
+    prev_ts = d.get("_hist_ts") or 0
+    if d.get("_hist_state") is not None and prev_ts:
+        held = max(0.0, now - prev_ts)
+    d["_hist_state"] = want
+    d["_hist_ts"] = now
+    _hist_append(d.get("id", "?"), want, now, held)
 
 
 def _is_online(d, now=None):
     now = now if now is not None else _now()
-    return (now - d.get("last_seen", 0)) <= ONLINE_S
+    online = (now - d.get("last_seen", 0)) <= ONLINE_S
+    # 离线是"随时间流逝"发生的，没有事件可挂，只能在被查询到时补记；
+    # 精确时刻 = last_seen + ONLINE_S（下面用它作为状态切换时间）
+    if not online and d.get("_hist_state") is None and not d.get("last_seen"):
+        _note_online_state(d, False, now)  # 从没见过的设备：记录当前离线
+    elif not online and d.get("_hist_state") == "on":
+        _note_online_state(d, False, d.get("last_seen", now) + ONLINE_S)
+    return online
 
 
 def _expire_pending_locked(d):

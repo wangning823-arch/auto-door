@@ -89,6 +89,9 @@ class NfcReader {
   uint32_t lastSlowAckMs_ = 0;
   bool lastPollSlow_ = false;
   uint16_t emptyPolls_ = 0;
+  // 总线卡死自愈阶梯：记录卡死起点，30s 升级深恢复/硬复位，5min 起告警上云
+  uint32_t busDeadSinceMs_ = 0;
+  bool busDeadEscalated_ = false;
 
   // 异步
   TaskHandle_t task_ = nullptr;

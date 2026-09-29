@@ -44,6 +44,35 @@ void remoteOtaHold4k() {
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
+// ===== 共用气囊：这 4KB 有两个借用人 =====
+// ① OTA Update.begin（原用途，begin 内部 malloc(4KB) 要 8BIT 池）
+// ② 运行期碎片兜底：WiFi 的 esf_buf_alloc_dynamic 要 2308B 连续，
+//    碎片期 max8 实测掉到 1524~2292（就差 16B），归还这块立刻给出
+//    ≥4KB 连续区，下一帧分配成功 → 丢包/重传/netfail 连锁一起消失。
+// 归还必须由 loop 执行：分配失败钩子在分配路径里，严禁碰堆。
+// OTA 走新时序（先射频下电、池子回到 ~110KB 再 begin），缺这块也能 begin，
+// 所以 OTA 期间之外随时可借；OTA 自己在 begin 后会重新压住（553/560/596 行）。
+void remoteOtaReserveGive() {
+  if (s_active) return;  // OTA 进行中这块归 OTA 用
+  if (!s_otaRes4k) return;
+  free(s_otaRes4k);
+  s_otaRes4k = nullptr;
+  logShipf("[HEAP] reserve4k given back (碎片兜底) max8=%u",
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+
+bool remoteOtaReserveHeld() { return s_otaRes4k != nullptr; }
+
+void remoteOtaReserveRearm() {
+  if (s_active || s_otaRes4k) return;
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 8192) return;  // 池子不够宽裕不收
+  s_otaRes4k = malloc(4096);
+  if (s_otaRes4k) {
+    logShipf("[HEAP] reserve4k rearmed max8=%u",
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  }
+}
+
 static void setMsg(const char* m) {
   strncpy(s_lastMsg, m, sizeof(s_lastMsg) - 1);
   s_lastMsg[sizeof(s_lastMsg) - 1] = 0;

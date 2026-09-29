@@ -49,6 +49,17 @@
 #define LOG_SHIP_OVERHEAD 256
 #define LOG_SHIP_CHURN_SLACK 512
 
+// 发送失败后的重试退避：5/10/20s 指数、30s 封顶。
+// 旧实现 failStreak>=3 直接 60s：一次 2 秒瞬断也被放大成 1 分钟静默，
+// dda0 弱网一天几十段 >60s 中断的时长主要是这个 60s 撑起来的。
+// 真离线时不会更糟——wifiOk=false 走独立分支，根本不进这里。
+static uint32_t logShipFailBackoff(uint32_t streak) {
+  if (streak <= 1) return 5000UL;
+  if (streak == 2) return 10000UL;
+  if (streak == 3) return 20000UL;
+  return 30000UL;
+}
+
 // 按当前 8BIT 最大连续块给分片封顶。
 // 固定 1536 在碎片堆里会 reserve 失败 → chunk=0 → 一包不发，积压永远抽不干。
 //
@@ -200,11 +211,13 @@ void logShipBegin() {
 }
 
 void logShipPrintln(const String& line) {
-  Serial.println(line);
   String t = line + "\n";
   ringLock();
   ringPush(t.c_str(), t.length());
   ringUnlock();
+  // 环先收（VPS 必达），串口尽力而为：TX FIFO 不空闲时 println 会阻塞
+  // 最多 1s 拖死 loop，无串口主机时更是永远填满
+  if (Serial.availableForWrite() > 96) Serial.println(line);
 }
 
 void logShipf(const char* fmt, ...) {
@@ -213,7 +226,6 @@ void logShipf(const char* fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  Serial.println(buf);
   size_t n = strlen(buf);
   if (n + 1 < sizeof(buf)) {
     buf[n] = '\n';
@@ -222,6 +234,10 @@ void logShipf(const char* fmt, ...) {
     ringPush(buf, n + 1);
     ringUnlock();
   }
+  // 心跳/诊断必须恒发 VPS：旧实现串口 FIFO 满时整个 logShipf 被门控，
+  // 1388（无串口主机）8 小时 0 条 [LOG] 心跳，断网期 sta/rssi 面包屑全丢。
+  // 串口只在有余量时打，阻塞风险由门控承担，环推送不受影响。
+  if (Serial.availableForWrite() > 96) Serial.println(buf);
 }
 
 size_t logShipPending() {
@@ -432,7 +448,7 @@ void logShipService(bool btBusy, bool wifiOk) {
       ringLock();
       ringPrepend(s_snap.c_str(), s_snap.length());
       ringUnlock();
-      s_nextMs = millis() + (s_failStreak >= 3 ? 60000UL : LOG_SHIP_INTERVAL_MS);
+      s_nextMs = millis() + logShipFailBackoff(s_failStreak);
     }
     s_snap = "";
     return;

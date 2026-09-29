@@ -89,6 +89,14 @@ class WebPortal {
   bool otaReady_ = false;  // 桌面 espota 已移除，恒 false
   uint32_t staNextRetryMs_ = 0;
   uint32_t staLastLogMs_ = 0;
+  // 定向重连：记下上次连上的 AP BSSID/信道，踢线重连时免全频段扫描。
+  // dda0 弱网一天 30+ 次 forceStaReconnect，每次扫描几秒 = 白白多掉线几秒。
+  uint8_t staBssid_[6] = {0};
+  uint8_t staChannel_ = 0;
+  bool staHaveBssid_ = false;
+  bool staDirPending_ = false;  // 本轮已试过定向；失败则后续退回广播
+  void learnStaAp();
+  void beginSta(const String& ssid, const String& pass);
   // 强制门户：手机连上无外网 AP 时，DNS 全指到 192.168.4.1，系统才会弹/可开配置页
   DNSServer dns_;
   bool dnsOn_ = false;

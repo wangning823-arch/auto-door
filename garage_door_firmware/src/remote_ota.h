@@ -13,6 +13,11 @@ void remoteOtaBegin(ConfigStore* cfg = nullptr);
 // 运行久后 8BIT 池碎到 max8<4KB，begin 内部 malloc 必败（err=0 实锤，
 // dda0 探针 maxIn=11252 但 max8=2420）
 void remoteOtaHold4k();
+// 共用气囊：这块 4KB 同时是 WiFi 碎片兜底（见 remote_ota.cpp 注释）。
+// 分配失败钩子置位 → loop 调 Give 归还；堆宽裕时调 Rearm 收回。
+void remoteOtaReserveGive();
+void remoteOtaReserveRearm();
+bool remoteOtaReserveHeld();
 void remoteOtaSetBusyHook(OtaBusyFn fn);
 // btBusy / wifiOk 语义同 remoteCmdService
 void remoteOtaService(bool btBusy, bool wifiOk);
