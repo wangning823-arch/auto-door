@@ -4,6 +4,7 @@
 #include <WiFiClient.h>
 #include <atomic>
 #include <esp_task_wdt.h>
+#include <new>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -236,12 +237,14 @@ static bool submit(int owner, bool isPost, const String& host, uint16_t port,
   s.submitMs = millis();
   s.startMs = 0;
   s.timeoutMs = timeoutMs;
-  HttpJob* j = new HttpJob{owner, s.gen, isPost, host, port, path, body,
-                           timeoutMs};
-  // 碎片堆里 new 或 String 拷贝可能失败：new 返回空 / String 静默变空串。
-  // 若不校验就发出去，Content-Length 会变成 0，服务端判空丢弃；
-  // 但调用方（logShip）已在提交前摘过环，等于日志永久丢失。
-  // 这里按提交失败返回，调用方走既有回填路径。
+  // 必须 nothrow：本工具链异常关闭，普通 new 在 OOM 时走 std::terminate→abort→
+  // rst=4 panic，下面的 !j 保护永远走不到。dda0 实测两次 panic 的崩溃指纹都是
+  // loop 停在 ls.flush（日志提交 http）+ 堆碎片峰值（2308/4112 连续失败），
+  // 且 panic 重启不经过 OTA 静默 → PN532 卡死 → 界面误报"无芯片"。
+  // nothrow 失败返回空指针，走下面既有的回填/失败路径。
+  HttpJob* j = new (std::nothrow)
+      HttpJob{owner, s.gen, isPost, host, port, path, body, timeoutMs};
+  // String 拷贝也可能在碎片堆里失败（静默空串），一并按提交失败处理
   if (!j || j->host.length() != host.length() ||
       j->path.length() != path.length() ||
       j->body.length() != body.length()) {
