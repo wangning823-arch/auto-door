@@ -139,11 +139,11 @@
 #ifndef PIN_NFC_RST
 #define PIN_NFC_RST -1
 #endif
-// NFC I2C 速率：长线（dda0 车库布线远长于 1388）下 100kHz 边沿裕量不足，
-// 字节中途失步 → 芯片停在半截事务拉住 SCL → 卡死。降到 50kHz 换裕量，
-// PN532 标准模式完全支持；代价是单次传输略慢（探测/init 慢一点，无感）。
+// NFC I2C 速率：保持 100kHz（PN532 标准模式）。
+// 曾试过 50kHz 想给 dda0 长线换裕量，结果两台升级后探测全部 no ACK
+// （健康芯片、总线空闲），已回退——速率改动必须单独验证，不能和别的混改。
 #ifndef NFC_I2C_HZ
-#define NFC_I2C_HZ 50000
+#define NFC_I2C_HZ 100000
 #endif
 
 // RF 抓包参数
