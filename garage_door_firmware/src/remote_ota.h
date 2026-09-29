@@ -11,12 +11,23 @@ using OtaBusyFn = void (*)(bool active);
 // 用来把 NFC 总线清到空闲，避免复位落在 I2C 事务中间把 PN532 卡死
 using OtaPreResetFn = void (*)();
 
+// 共用气囊容量：必须 ≥ BTU inquiry 的 4112B（含 malloc 头余量），
+// 同时仍覆盖 WiFi esf_buf 2308B 与 OTA Update.begin 的 ~4KB。
+// 旧值 4096 盖不住 4112 → BTU 失败时钩子 even 不会请求归还（见 main.cpp）。
+#ifndef OTA_RESERVE_SIZE
+#define OTA_RESERVE_SIZE 4352
+#endif
+// 收回门槛：largest8 ≥ 气囊 + 2KB 余量（8192 在 dda0 稳态 max8≈4084 上不可达）
+#ifndef OTA_RESERVE_REARM_MIN
+#define OTA_RESERVE_REARM_MIN (OTA_RESERVE_SIZE + 2048)
+#endif
+
 void remoteOtaBegin(ConfigStore* cfg = nullptr);
-// 开机即预留 4KB 连续 8BIT 堆，OTA Update.begin 前让出——
-// 运行久后 8BIT 池碎到 max8<4KB，begin 内部 malloc 必败（err=0 实锤，
+// 开机即预留 OTA_RESERVE_SIZE 连续 8BIT 堆，OTA Update.begin 前让出——
+// 运行久后 8BIT 池碎到 max8<气囊，begin 内部 malloc 必败（err=0 实锤，
 // dda0 探针 maxIn=11252 但 max8=2420）
 void remoteOtaHold4k();
-// 共用气囊：这块 4KB 同时是 WiFi 碎片兜底（见 remote_ota.cpp 注释）。
+// 共用气囊：这块内存同时是 WiFi/BTU 碎片兜底（见 remote_ota.cpp 注释）。
 // 分配失败钩子置位 → loop 调 Give 归还；堆宽裕时调 Rearm 收回。
 void remoteOtaReserveGive();
 void remoteOtaReserveRearm();

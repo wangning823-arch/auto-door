@@ -748,7 +748,7 @@ static void serviceStaDataWatchdog() {
 // 疑似被写坏。三件套：分配失败钩子（谁、分多大、在哪失败）+ 周期完整性自检
 // （损坏出现在哪 2 秒窗口）+ 任务栈水位（找栈溢出写坏堆的元凶）。
 static volatile uint32_t gHeapFailN = 0;
-// 共用气囊（remote_ota 的 4KB 预留）归还请求：钩子里只置位，
+// 共用气囊（remote_ota 的 OTA_RESERVE_SIZE 预留）归还请求：钩子里只置位，
 // 实际 free 必须在 loop 做——钩子在分配路径里严禁碰堆
 static volatile bool gResGiveReq = false;
 // 失败事件只在钩子里记字段（无锁、不 printf），完整诊断在 loop 上下文打印
@@ -773,9 +773,11 @@ static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
   if (inHook) return;
   inHook = true;
   uint32_t n = ++gHeapFailN;
-  // 4KB 以内的失败（WiFi esf_buf 2308B 就是这条线）→ 请 loop 归还共用气囊。
-  // 4112B 的 BTU inquiry 超过气囊容量，帮不上，不白跑一趟。
-  if (size <= 4096) gResGiveReq = true;
+  // 气囊容量以内的失败 → 请 loop 归还共用气囊。
+  // 旧阈值 4096 盖不住 BTU inquiry 的 4112B（dda0 max8=4084 实锤），
+  // 导致 BTU 失败根本不触发归还；现改为 OTA_RESERVE_SIZE(4352)。
+  // 故意不做「largest 不够就跳过 inquiry」——那会推迟自动开门。
+  if (size <= OTA_RESERVE_SIZE) gResGiveReq = true;
   if (n <= 16 || (n & 255) == 0) {
     gFailEvt.size = (uint32_t)size;
     gFailEvt.caps = (uint32_t)caps;
@@ -832,7 +834,7 @@ static void serviceHeapDiag() {
                gFailEvt.ra5);
     }
   }
-  // 共用气囊：钩子已置位 → 这里归还 4KB 给堆（WiFi 下一帧 2308B 就能成）
+  // 共用气囊：钩子已置位 → 这里归还给堆（WiFi 下一帧 2308B / BTU 4112B 就能成）
   if (gResGiveReq) {
     gResGiveReq = false;
     remoteOtaReserveGive();
@@ -841,8 +843,8 @@ static void serviceHeapDiag() {
   static uint32_t lastPool = 0;
   if (now - lastPool >= 10000) {
     lastPool = now;
-    // 气囊收回：失败风暴过去、池子重新宽裕（largest8≥8KB）才收，
-    // 且最多 60s 一次——防止"收回→又被吃→再收"在 8KB 边界来回抖动刷日志
+    // 气囊收回：失败风暴过去、池子重新宽裕（largest8≥OTA_RESERVE_REARM_MIN
+    // ≈6400）才收，且最多 60s 一次——防止"收回→又被吃→再收"边界抖动刷日志
     static uint32_t lastRearmMs = 0;
     if (!remoteOtaReserveHeld() && !gResGiveReq && (now - lastRearmMs) >= 60000UL) {
       lastRearmMs = now;  // 成败都计时：池子不宽裕时也不用每 10s 白跑 malloc

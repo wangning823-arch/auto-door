@@ -32,33 +32,36 @@ static char s_lastMsg[64] = "idle";
 static char s_httpWhy[48] = "";  // httpGetStream 最近一次失败原因
 static bool s_radioDown = false;  // BT已停+省电已关：所有退出路径需重启恢复
 
-// 开机预留的 4KB 连续 8BIT 堆：Update.begin 内部 malloc(4KB) 要的是 8BIT 池，
-// getMaxAllocHeap 报的 INTERNAL 最大块（11252）malloc 用不了——dda0 实测
-// max8=2420 → probe 必败。开机时堆干净，此时切一块放着，begin 前让出。
+// 开机预留的 OTA_RESERVE_SIZE 连续 8BIT 堆：Update.begin 内部 malloc(~4KB)
+// 要的是 8BIT 池，getMaxAllocHeap 报的 INTERNAL 最大块（11252）malloc 用不了
+// ——dda0 实测 max8=2420 → probe 必败。开机时堆干净，此时切一块放着，
+// begin 前让出。容量必须盖住 BTU inquiry 的 4112B（见 remote_ota.h）。
 static void* s_otaRes4k = nullptr;
 
 void remoteOtaHold4k() {
   if (s_otaRes4k) return;
-  s_otaRes4k = malloc(4096);
+  s_otaRes4k = malloc(OTA_RESERVE_SIZE);
   logShipf("[OTA] hold4k %s free=%u max8=%u",
            s_otaRes4k ? "ok" : "FAIL", (unsigned)ESP.getFreeHeap(),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
-// ===== 共用气囊：这 4KB 有两个借用人 =====
-// ① OTA Update.begin（原用途，begin 内部 malloc(4KB) 要 8BIT 池）
+// ===== 共用气囊：这块 OTA_RESERVE_SIZE 有多个借用人 =====
+// ① OTA Update.begin（原用途，begin 内部 malloc(~4KB) 要 8BIT 池）
 // ② 运行期碎片兜底：WiFi 的 esf_buf_alloc_dynamic 要 2308B 连续，
 //    碎片期 max8 实测掉到 1524~2292（就差 16B），归还这块立刻给出
-//    ≥4KB 连续区，下一帧分配成功 → 丢包/重传/netfail 连锁一起消失。
+//    连续区，下一帧分配成功 → 丢包/重传/netfail 连锁一起消失。
+// ③ BTU inquiry 要 4112B（20260929 dda0 实测 max8=4084 恰好差 28B），
+//    归还后 inquiry 才可能拿到连续块；不跳过 inquiry（伤自动开门及时性）。
 // 归还必须由 loop 执行：分配失败钩子在分配路径里，严禁碰堆。
 // OTA 走新时序（先射频下电、池子回到 ~110KB 再 begin），缺这块也能 begin，
-// 所以 OTA 期间之外随时可借；OTA 自己在 begin 后会重新压住（553/560/596 行）。
+// 所以 OTA 期间之外随时可借；OTA 自己在 begin 后会重新压住（见下方 begin 路径）。
 void remoteOtaReserveGive() {
   if (s_active) return;  // OTA 进行中这块归 OTA 用
   if (!s_otaRes4k) return;
   free(s_otaRes4k);
   s_otaRes4k = nullptr;
-  logShipf("[HEAP] reserve4k given back (碎片兜底) max8=%u",
+  logShipf("[HEAP] reserve given back (碎片兜底) max8=%u",
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
@@ -66,10 +69,13 @@ bool remoteOtaReserveHeld() { return s_otaRes4k != nullptr; }
 
 void remoteOtaReserveRearm() {
   if (s_active || s_otaRes4k) return;
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 8192) return;  // 池子不够宽裕不收
-  s_otaRes4k = malloc(4096);
+  // 收回门槛：largest8 还能压住气囊且留出 ≥2KB。旧阈值 8192 在 dda0
+  // 稳态 max8≈4084 上永远不可达 → 气囊实际是一次性的；改到 ~6400。
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < OTA_RESERVE_REARM_MIN)
+    return;
+  s_otaRes4k = malloc(OTA_RESERVE_SIZE);
   if (s_otaRes4k) {
-    logShipf("[HEAP] reserve4k rearmed max8=%u",
+    logShipf("[HEAP] reserve rearmed max8=%u",
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   }
 }
@@ -584,8 +590,8 @@ static void doOta() {
         esp_task_wdt_reset();
       }
     }
-    // 让出开机预留的 4KB 整块给 begin 的 malloc：运行久后 8BIT 池碎成
-    // max8<4KB（探针实锤 maxIn=11252 但 max8=2420），只有这块从干净堆
+    // 让出开机预留的整块给 begin 的 malloc：运行久后 8BIT 池碎成
+    // max8<气囊（探针实锤 maxIn=11252 但 max8=2420），只有这块从干净堆
     // 切出的连续内存能救。抢在 tcpip 拆分前的微秒级窗口里完成 malloc
     if (s_otaRes4k) {
       free(s_otaRes4k);
@@ -594,7 +600,7 @@ static void doOta() {
     began = Update.begin(UPDATE_SIZE_UNKNOWN);
     if (t == 0) err1 = Update.getError();
     if (!began) {
-      s_otaRes4k = malloc(4096);  // 抢回留作下一轮（被吃则后续裸试）
+      s_otaRes4k = malloc(OTA_RESERVE_SIZE);  // 抢回留作下一轮（被吃则后续裸试）
       logShipf(
           "[OTA] begin try=%d err=%u res4k=%d free=%u maxIn=%u max8=%u",
           t, (unsigned)Update.getError(), (int)(s_otaRes4k != nullptr),
@@ -631,7 +637,7 @@ static void doOta() {
   s_active = false;
   if (s_busyFn) s_busyFn(false);
   httpResume();
-  if (!s_otaRes4k) s_otaRes4k = malloc(4096);  // 本轮没重启 → 重新压住 4KB
+  if (!s_otaRes4k) s_otaRes4k = malloc(OTA_RESERVE_SIZE);  // 本轮没重启 → 重新压住气囊
   if (s_radioDown) {
     // BT 栈已在 otaAttempt 里拆除，不重启则蓝牙跟踪永久失效
     s_radioDown = false;
