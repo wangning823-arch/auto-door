@@ -3,6 +3,7 @@
   var $ = function (id) { return document.getElementById(id); };
   var currentId = null;
   var pollTimer = null;
+  var busyCmd = false;
 
   function token() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
 
@@ -10,6 +11,37 @@
     if (!el) return;
     el.textContent = text || "";
     el.className = "tip" + (cls ? " " + cls : "");
+  }
+
+  // 浮层状态反馈：所有远程操作的成功/失败都走这里
+  function notify(text, type, ttl) {
+    var box = $("toastBox");
+    if (!box || !text) return;
+    var el = document.createElement("div");
+    el.className = "toast " + (type || "info");
+    el.textContent = text;
+    box.appendChild(el);
+    while (box.children.length > 3) box.removeChild(box.firstChild);
+    var life = ttl || (type === "err" ? 4200 : 3000);
+    setTimeout(function () {
+      el.classList.add("hide");
+      setTimeout(function () {
+        if (el.parentNode) el.parentNode.removeChild(el);
+      }, 220);
+    }, life);
+  }
+
+  function notifyOk(text, ttl) {
+    notify(text, "ok", ttl);
+  }
+  function notifyErr(text, ttl) {
+    notify(text, "err", ttl || 4500);
+  }
+  function notifyWarn(text, ttl) {
+    notify(text, "warn", ttl || 4000);
+  }
+  function notifyInfo(text, ttl) {
+    notify(text, "info", ttl || 2500);
   }
 
   function show(view) {
@@ -63,19 +95,23 @@
     var pw = $("pw").value.trim();
     if (!pw) {
       setTip($("loginTip"), "请输入密码", "err");
+      notifyErr("请输入密码");
       return;
     }
     $("loginBtn").disabled = true;
+    notifyInfo("登录中…");
     api("/api/login", { method: "POST", body: JSON.stringify({ password: pw }) })
       .then(function (j) {
         sessionStorage.setItem(TOKEN_KEY, j.token || "");
         $("pw").value = "";
-        setTip($("loginTip"), "就绪", "ok");
+        setTip($("loginTip"), "登录成功", "ok");
+        notifyOk("登录成功");
         $("statusText").textContent = "已登录";
         loadList();
       })
       .catch(function (e) {
         setTip($("loginTip"), e.message || "登录失败", "err");
+        notifyErr("登录失败：" + (e.message || "未知错误"));
       })
       .finally(function () {
         $("loginBtn").disabled = false;
@@ -130,13 +166,16 @@
             var id = btn.getAttribute("data-del");
             if (!window.confirm("删除设备 " + id + "？\n设备下次上报时会自动重新出现在列表中。")) return;
             btn.disabled = true;
+            notifyInfo("删除设备 " + id + " …");
             api("/api/devices/" + encodeURIComponent(id), { method: "DELETE" })
               .then(function () {
                 setTip($("listTip"), "已删除 " + id, "ok");
+                notifyOk("设备已删除：" + id);
                 loadList();
               })
               .catch(function (err) {
                 setTip($("listTip"), err.message || "删除失败", "err");
+                notifyErr("删除失败：" + (err.message || id));
                 btn.disabled = false;
               });
           });
@@ -150,15 +189,24 @@
             var label = cmd === "close" ? "关门" : "开门";
             btn.disabled = true;
             setTip($("listTip"), "发送" + label + "指令…");
+            notifyInfo(label + "指令下发中…");
             api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
               method: "POST",
               body: "{}"
             })
               .then(function (j) {
-                setTip($("listTip"), (j.message || (label + "已下发")) + " · " + id, "ok");
+                var msg = j.message || (label + "指令已下发");
+                setTip($("listTip"), msg + " · " + id, j.ok === 0 ? "err" : "ok");
+                if (j.ok === 0) {
+                  notifyErr(label + "失败：" + msg + " · " + id);
+                } else {
+                  notifyOk(label + "成功 · " + msg + " · " + id);
+                }
               })
               .catch(function (err) {
-                setTip($("listTip"), (err.message || (label + "失败")) + " · " + id, "err");
+                var msg = err.message || (label + "失败");
+                setTip($("listTip"), msg + " · " + id, "err");
+                notifyErr(label + "失败：" + msg + " · " + id);
               })
               .finally(function () {
                 btn.disabled = false;
@@ -172,9 +220,11 @@
           sessionStorage.removeItem(TOKEN_KEY);
           show("login");
           setTip($("loginTip"), "请重新登录", "err");
+          notifyErr("会话失效，请重新登录");
           return;
         }
         setTip($("listTip"), e.message || "加载失败", "err");
+        notifyErr("设备列表加载失败：" + (e.message || "未知错误"));
       });
   }
 
@@ -267,6 +317,7 @@
       .then(renderDetail)
       .catch(function (e) {
         setTip($("ctrlTip"), e.message || "加载失败", "err");
+        notifyWarn("设备状态刷新失败：" + (e.message || ""));
       });
   }
 
@@ -292,6 +343,7 @@
     if (!currentId) return;
     if (!window.confirm("清除该设备全部历史日志？此操作不可恢复。")) return;
     setTip($("logClearTip"), "清除中…");
+    notifyInfo("正在清除设备日志…");
     api("/api/devices/" + encodeURIComponent(currentId) + "/logs/clear", {
       method: "POST",
       body: "{}"
@@ -300,46 +352,239 @@
         $("logBox").textContent = "（暂无日志）";
         $("logMeta").textContent = "已清除 " + (j.removed || 0) + " 个日志文件";
         setTip($("logClearTip"), "已清除", "ok");
+        notifyOk("日志清除成功");
       })
       .catch(function (e) {
         setTip($("logClearTip"), e.message || "清除失败", "err");
+        notifyErr("日志清除失败：" + (e.message || ""));
       });
   }
 
+  function cmdLabel(cmd) {
+    if (cmd === "open") return "开门";
+    if (cmd === "close") return "关门";
+    if (cmd === "update") return "更新固件";
+    return cmd;
+  }
+
+  function fetchDevice(id) {
+    return api("/api/devices/" + encodeURIComponent(id || currentId));
+  }
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function doorText(st) {
+    if (st.door === 1) return "开";
+    if (st.door === 2) return "关";
+    return "未知";
+  }
+
+  // 下发后轮询设备，确认门状态真正变化 / 固件版本变化
+  function waitDoorOutcome(id, expectedDoor, timeoutMs) {
+    var label = expectedDoor === 1 ? "开门" : "关门";
+    var start = Date.now();
+    var pendingName = expectedDoor === 1 ? "open" : "close";
+
+    function tick() {
+      return fetchDevice(id).then(function (j) {
+        var d = j.device || {};
+        var st = d.status || {};
+        if (st.door === expectedDoor) {
+          renderDetail(j);
+          setTip($("ctrlTip"), label + "成功 · 门状态：" + doorText(st), "ok");
+          notifyOk(label + "成功");
+          return;
+        }
+        if (Date.now() - start < timeoutMs) {
+          return sleep(2500).then(tick);
+        }
+        renderDetail(j);
+        if (d.online === false) {
+          setTip($("ctrlTip"), label + "失败：设备离线", "err");
+          notifyErr(label + "失败：设备离线，请检查设备供电与网络");
+        } else if (st.pending === pendingName) {
+          setTip($("ctrlTip"), label + "失败：设备尚未领取指令", "err");
+          notifyErr(label + "失败：设备尚未领取指令（可能超过 8 秒 TTL）");
+        } else {
+          // 指令可能已被领取，但门状态未变化（无门磁、状态未更新）
+          setTip($("ctrlTip"), label + "指令已下发，门状态未变化，请稍后刷新", "warn");
+          notifyWarn(label + "指令已下发，但门状态未变化，请稍后刷新确认");
+        }
+        throw new Error(label + " confirm timeout");
+      });
+    }
+
+    return tick();
+  }
+
+  function waitUpdateOutcome(id, serverFw, timeoutMs) {
+    var start = Date.now();
+    var firstFw = null;
+
+    function tick() {
+      return fetchDevice(id).then(function (j) {
+        var d = j.device || {};
+        var st = d.status || {};
+        if (firstFw == null) firstFw = d.fw || null;
+        var nowFw = d.fw || st.fw || null;
+        if (serverFw && nowFw && nowFw === serverFw) {
+          renderDetail(j);
+          setTip($("ctrlTip"), "固件更新成功 · " + nowFw, "ok");
+          notifyOk("固件更新成功 · " + nowFw);
+          return;
+        }
+        if (nowFw && firstFw && nowFw !== firstFw && serverFw && nowFw !== serverFw) {
+          renderDetail(j);
+          setTip($("ctrlTip"), "固件版本已变化：" + nowFw, "ok");
+          notifyOk("固件更新成功 · " + nowFw);
+          return;
+        }
+        if (st.update_sticky || st.pending === "update") {
+          setTip($("ctrlTip"), "正在更新固件…" + (nowFw ? " 当前 " + nowFw : ""), "ok");
+          notifyInfo("正在更新固件，请耐心等待…", 2000);
+        }
+        if (Date.now() - start < timeoutMs) {
+          return sleep(4000).then(tick);
+        }
+        renderDetail(j);
+        if (d.online === false) {
+          setTip($("ctrlTip"), "更新失败：设备离线", "err");
+          notifyErr("固件更新失败：设备离线，请检查设备网络");
+        } else if (st.update_sticky || st.pending === "update") {
+          setTip($("ctrlTip"), "更新仍在进行，未确认完成", "warn");
+          notifyWarn("更新仍在进行，尚未确认完成，请稍后在设备页刷新固件版本");
+        } else {
+          setTip($("ctrlTip"), "更新结果未确认：设备固件 " + (nowFw || "-"), "warn");
+          notifyWarn("更新结果未确认，请稍后刷新查看固件版本");
+        }
+        throw new Error("update confirm timeout");
+      });
+    }
+
+    return tick();
+  }
+
+  // 详情页：开门 / 关门 / 立即更新（带状态反馈 + 结果确认）
   function sendCmd(cmd) {
-    if (!currentId) return;
-    setTip($("ctrlTip"), "发送中…");
-    api("/api/devices/" + encodeURIComponent(currentId) + "/" + cmd, {
+    if (!currentId) {
+      notifyErr("未选择设备");
+      return Promise.resolve();
+    }
+    if (busyCmd) {
+      notifyWarn("有指令正在处理，请稍候");
+      return Promise.resolve();
+    }
+    var id = currentId;
+    var label = cmdLabel(cmd);
+    var btn = cmd === "open" ? $("openBtn") : (cmd === "close" ? $("closeBtn") : $("updateBtn"));
+
+    busyCmd = true;
+    if (btn) btn.disabled = true;
+
+    var queuedMsg = label + "指令已下发，设备领取中…";
+    setTip($("ctrlTip"), queuedMsg, "ok");
+    notifyInfo(queuedMsg);
+
+    return api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
       method: "POST",
       body: "{}"
     })
       .then(function (j) {
-        setTip($("ctrlTip"), j.message || "已下发", "ok");
+        var msg = j.message || (label + "已请求");
+        if (j.ok === 0) {
+          setTip($("ctrlTip"), msg, "err");
+          notifyErr(label + "失败：" + msg);
+          throw new Error(msg);
+        }
+
+        if (cmd === "open" || cmd === "close") {
+          var expected = cmd === "open" ? 1 : 2;
+          setTip($("ctrlTip"), label + "已下发 · 等待设备执行…", "ok");
+          notifyInfo(label + "已下发，等待设备执行…");
+          return waitDoorOutcome(id, expected, 20000).catch(function () {
+            // waitDoorOutcome 内部已提示
+          });
+        }
+
+        if (cmd === "update") {
+          var serverFw = null;
+          return fetchDevice(id).then(function (d) {
+            serverFw = (j.ota && j.ota.version) || (d.ota && d.ota.version) || null;
+          }).catch(function () {}).then(function () {
+            setTip($("ctrlTip"), "更新指令已下发，设备开始下载固件…", "ok");
+            notifyOk("更新指令已下发，设备开始下载固件…（约 1–2 分钟）", 4500);
+            return waitUpdateOutcome(id, serverFw, 150000).catch(function () {});
+          });
+        }
+
+        setTip($("ctrlTip"), msg, "ok");
+        notifyOk(msg);
       })
       .catch(function (e) {
-        setTip($("ctrlTip"), e.message || "失败", "err");
+        // 已在上方提示过的不再重复
+        if ((e.message || "").indexOf("confirm timeout") >= 0) {
+          return;
+        }
+        if ((e.message || "").indexOf("已下发") >= 0) {
+          return;
+        }
+        setTip($("ctrlTip"), e.message || (label + "失败"), "err");
+        notifyErr(label + "失败：" + (e.message || "未知错误"));
+      })
+      .finally(function () {
+        busyCmd = false;
+        if (btn) btn.disabled = false;
       });
   }
 
   // 通用配置指令（替代本地网页）：POST .../cmd {"cmd":"mac AA:BB:..."}
+  function humanCmd(cmd) {
+    var map = {
+      "autotrack on": "开启经典自动跟踪",
+      "autotrack off": "关闭经典自动跟踪",
+      "pair on": "打开 BLE 配对窗口 90 秒",
+      "pair off": "关闭 BLE 配对",
+      "nfcinit": "重新初始化 NFC",
+      "web off": "关闭本地网页",
+      "web on": "开启本地网页"
+    };
+    if (map[cmd]) return map[cmd];
+    if (cmd.indexOf("mac ") === 0) return "保存车机蓝牙 MAC";
+    if (cmd.indexOf("mode ") === 0) return "切换跟踪模式（约 1.2 秒后设备重启）";
+    if (cmd.indexOf("pairpin ") === 0) return "保存手机配对 PIN";
+    if (cmd.indexOf("wifista ") === 0) return "保存并连接家庭 Wi‑Fi";
+    return cmd;
+  }
+
   function sendRawCmd(cmd) {
-    if (!currentId) return Promise.reject(new Error("no device"));
-    setTip($("cfgTip"), "下发：" + cmd);
+    if (!currentId) {
+      notifyErr("未选择设备");
+      return Promise.reject(new Error("no device"));
+    }
+    var pretty = humanCmd(cmd);
+    setTip($("cfgTip"), "下发：" + pretty + " …");
+    notifyInfo(pretty + " 下发中…");
     return api("/api/devices/" + encodeURIComponent(currentId) + "/cmd", {
       method: "POST",
       body: JSON.stringify({ cmd: cmd })
     })
       .then(function (j) {
         if (j.ok) {
-          setTip($("cfgTip"), "已下发「" + cmd + "」，约 3 秒生效", "ok");
+          setTip($("cfgTip"), "已下发「" + pretty + "」，约 3 秒生效", "ok");
+          notifyOk(pretty + " 已下发，约 3 秒生效");
           setTimeout(refreshDetail, 4500);
         } else {
-          setTip($("cfgTip"), "失败：" + (j.result || "unknown"), "err");
+          var fail = "失败：" + (j.result || j.message || "unknown");
+          setTip($("cfgTip"), fail, "err");
+          notifyErr(pretty + " 失败：" + (j.result || j.message || "unknown"));
         }
         return j;
       })
       .catch(function (e) {
         setTip($("cfgTip"), e.message || "下发失败", "err");
+        notifyErr(pretty + " 失败：" + (e.message || "未知错误"));
         throw e;
       });
   }
@@ -347,49 +592,63 @@
   function cfgWire() {
     $("cfgMacBtn").addEventListener("click", function () {
       var m = ($("cfgMac").value || "").trim().toUpperCase();
-      if (m.length !== 17) { setTip($("cfgTip"), "MAC 格式应为 AA:BB:CC:DD:EE:FF", "err"); return; }
-      sendRawCmd("mac " + m);
+      if (m.length !== 17) {
+        setTip($("cfgTip"), "MAC 格式应为 AA:BB:CC:DD:EE:FF", "err");
+        notifyErr("MAC 格式应为 AA:BB:CC:DD:EE:FF");
+        return;
+      }
+      sendRawCmd("mac " + m).catch(function () {});
     });
     $("cfgModeBtn").addEventListener("click", function () {
       var m = $("cfgMode").value;
       if (!window.confirm("切换跟踪模式会让设备约 1.2 秒后重启，继续？")) return;
-      sendRawCmd("mode " + m);
+      sendRawCmd("mode " + m).catch(function () {});
     });
-    $("cfgAutoOn").addEventListener("click", function () { sendRawCmd("autotrack on"); });
-    $("cfgAutoOff").addEventListener("click", function () { sendRawCmd("autotrack off"); });
-    $("cfgPairOn").addEventListener("click", function () { sendRawCmd("pair on"); });
-    $("cfgPairOff").addEventListener("click", function () { sendRawCmd("pair off"); });
+    $("cfgAutoOn").addEventListener("click", function () { sendRawCmd("autotrack on").catch(function () {}); });
+    $("cfgAutoOff").addEventListener("click", function () { sendRawCmd("autotrack off").catch(function () {}); });
+    $("cfgPairOn").addEventListener("click", function () { sendRawCmd("pair on").catch(function () {}); });
+    $("cfgPairOff").addEventListener("click", function () { sendRawCmd("pair off").catch(function () {}); });
     $("cfgPinBtn").addEventListener("click", function () {
       var pin = ($("cfgPin").value || "").trim();
-      if (pin && !/^\d{1,6}$/.test(pin)) { setTip($("cfgTip"), "PIN 应为 1-6 位数字", "err"); return; }
-      sendRawCmd("pairpin " + pin).then(function () { $("cfgPin").value = ""; });
+      if (pin && !/^\d{1,6}$/.test(pin)) {
+        setTip($("cfgTip"), "PIN 应为 1-6 位数字", "err");
+        notifyErr("PIN 应为 1-6 位数字");
+        return;
+      }
+      sendRawCmd("pairpin " + pin).then(function () { $("cfgPin").value = ""; }).catch(function () {});
     });
     $("cfgWifiBtn").addEventListener("click", function () {
       var ssid = ($("cfgSsid").value || "").trim();
       var pass = $("cfgPass").value || "";
-      if (!ssid) { setTip($("cfgTip"), "SSID 不能为空", "err"); return; }
+      if (!ssid) {
+        setTip($("cfgTip"), "SSID 不能为空", "err");
+        notifyErr("Wi‑Fi SSID 不能为空");
+        return;
+      }
       sendRawCmd("wifista " + ssid + (pass ? " " + pass : ""))
-        .then(function () { $("cfgPass").value = ""; });
+        .then(function () { $("cfgPass").value = ""; })
+        .catch(function () {});
     });
-    $("cfgNfcBtn").addEventListener("click", function () { sendRawCmd("nfcinit"); });
+    $("cfgNfcBtn").addEventListener("click", function () { sendRawCmd("nfcinit").catch(function () {}); });
     $("cfgWebOff").addEventListener("click", function () {
       if (!window.confirm("关闭本地网页后，车库局域网内 80 端口不再响应（远程控制不受影响）。继续？")) return;
-      sendRawCmd("web off");
+      sendRawCmd("web off").catch(function () {});
     });
-    $("cfgWebOn").addEventListener("click", function () { sendRawCmd("web on"); });
+    $("cfgWebOn").addEventListener("click", function () { sendRawCmd("web on").catch(function () {}); });
   }
 
   function uploadOta() {
     var file = ($("binInput").files || [])[0];
     if (!file) {
       setTip($("otaMsg"), "请选择 firmware.bin", "err");
+      notifyErr("请选择 firmware.bin 文件");
       return;
     }
     var ver = $("verInput").value.trim();
-    // 不带 notify：上传只落服务器，升级靠设备页「立即更新」
     var qs = "?notify=0" + (ver ? "&version=" + encodeURIComponent(ver) : "");
     $("uploadBtn").disabled = true;
     setTip($("otaMsg"), "上传中…");
+    notifyInfo("固件上传中，请稍候…");
     fetch("/api/ota/upload" + qs, {
       method: "POST",
       headers: {
@@ -406,12 +665,16 @@
       })
       .then(function (j) {
         var o = j.ota || {};
-        setTip($("otaMsg"), "已上传 " + (o.version || "") + "，请到设备页点「立即更新」", "ok");
+        var okMsg = "固件上传成功" + (o.version ? " · " + o.version : "") + "，请到设备页点「立即更新」";
+        setTip($("otaMsg"), okMsg, "ok");
+        notifyOk(okMsg, 4000);
         $("otaCurrent").textContent = "服务器固件：" + (o.version || "-") + " · " + (o.size || 0) + " bytes";
         loadList();
       })
       .catch(function (e) {
-        setTip($("otaMsg"), e.message || "上传失败", "err");
+        var msg = e.message || "上传失败";
+        setTip($("otaMsg"), msg, "err");
+        notifyErr("固件上传失败：" + msg);
       })
       .finally(function () {
         $("uploadBtn").disabled = false;
@@ -422,6 +685,7 @@
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
     currentId = null;
+    busyCmd = false;
     loadList();
   }
 
@@ -434,6 +698,7 @@
     if (pollTimer) clearInterval(pollTimer);
     show("login");
     $("statusText").textContent = "未登录";
+    notifyInfo("已退出登录");
   });
   $("refreshBtn").addEventListener("click", loadList);
   $("backBtn").addEventListener("click", backToList);

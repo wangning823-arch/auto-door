@@ -176,6 +176,77 @@ code {
   font-weight: 500;
 }
 
+/* ---------- toast 状态反馈 ---------- */
+.toast-box {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  width: min(420px, calc(100% - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  border-radius: 14px;
+  padding: 12px 14px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--ink-strong);
+  background: rgba(15, 23, 38, 0.96);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.38);
+  animation: toast-in 0.18s ease;
+}
+
+.toast.ok {
+  border-color: rgba(34, 197, 94, 0.45);
+  background:
+    linear-gradient(180deg, rgba(34, 197, 94, 0.18), transparent 55%),
+    rgba(10, 28, 18, 0.97);
+  color: #bbf7d0;
+}
+
+.toast.err {
+  border-color: rgba(239, 68, 68, 0.5);
+  background:
+    linear-gradient(180deg, rgba(239, 68, 68, 0.18), transparent 55%),
+    rgba(32, 12, 12, 0.97);
+  color: #fecaca;
+}
+
+.toast.warn {
+  border-color: rgba(245, 158, 11, 0.45);
+  background:
+    linear-gradient(180deg, rgba(245, 158, 11, 0.16), transparent 55%),
+    rgba(32, 22, 8, 0.97);
+  color: #fde68a;
+}
+
+.toast.info {
+  border-color: rgba(77, 139, 253, 0.4);
+  background:
+    linear-gradient(180deg, rgba(77, 139, 253, 0.16), transparent 55%),
+    rgba(10, 18, 34, 0.97);
+  color: #bfdbfe;
+}
+
+.toast.hide {
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 /* ---------- cards ---------- */
 .card {
   background:
