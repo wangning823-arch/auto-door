@@ -180,40 +180,46 @@
               });
           });
         });
-        // 列表页快捷开/关门：不进详情页直接下发指令
+        // 列表页快捷开/关门：入队 + 设备认领 + 射频发射确认
         Array.prototype.forEach.call(box.querySelectorAll(".quick-btn"), function (btn) {
           btn.addEventListener("click", function (e) {
             e.stopPropagation();
             var id = btn.getAttribute("data-id");
             var cmd = btn.getAttribute("data-cmd");
             var label = cmd === "close" ? "关门" : "开门";
+            if (btn.disabled) return;
             btn.disabled = true;
-            setTip($("listTip"), "发送" + label + "指令…");
-            notifyInfo(label + "指令下发中…");
-            api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
-              method: "POST",
-              body: "{}"
-            })
-              .then(function (j) {
-                var msg = j.message || (label + "指令已下发");
-                setTip($("listTip"), msg + " · " + id, j.ok === 0 ? "err" : "ok");
+            setTip($("listTip"), label + "已排队，等待设备认领并发射频…");
+            notifyInfo(label + "已排队，等待设备认领并发射频…（确认后才算成功）");
+            fetchLogs(id).then(function (baseLog) {
+              var logBase = (baseLog || "").length;
+              return api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
+                method: "POST",
+                body: "{}"
+              }).then(function (j) {
                 if (j.ok === 0) {
+                  var msg = j.message || (label + "失败");
+                  setTip($("listTip"), msg + " · " + id, "err");
                   notifyErr(label + "失败：" + msg + " · " + id);
-                } else {
-                  notifyOk(label + "成功 · " + msg + " · " + id);
+                  throw new Error(msg);
                 }
-              })
-              .catch(function (err) {
-                var msg = err.message || (label + "失败");
-                setTip($("listTip"), msg + " · " + id, "err");
-                notifyErr(label + "失败：" + msg + " · " + id);
-              })
-              .finally(function () {
-                btn.disabled = false;
+                setTip($("listTip"), "服务器已入队 · 等待设备认领并发射频…", "ok");
+                return waitDoorOutcome(id, cmd, 60000, logBase).catch(function () {});
               });
+            }).catch(function (err) {
+              if ((err.message || "").indexOf("confirm timeout") >= 0) return;
+              if ((err.message || "").indexOf("not claimed") >= 0) return;
+              if ((err.message || "").indexOf("RF fail") >= 0) return;
+              if ((err.message || "").indexOf("claimed but no rf") >= 0) return;
+              if ((err.message || "").indexOf("unconfirmed") >= 0) return;
+              setTip($("listTip"), err.message || (label + "失败"), "err");
+              notifyErr(label + "失败：" + (err.message || "未知错误") + " · " + id);
+            }).finally(function () {
+              btn.disabled = false;
+            });
           });
         });
-        setTip($("listTip"), "共 " + list.length + " 台 · 可直接点开关门");
+        setTip($("listTip"), "共 " + list.length + " 台 · 点开关门后需设备认领并发射频才算成功");
       })
       .catch(function (e) {
         if ((e.message || "").indexOf("unauthorized") >= 0) {
@@ -381,38 +387,191 @@
     return "未知";
   }
 
-  // 下发后轮询设备，确认门状态真正变化 / 固件版本变化
-  function waitDoorOutcome(id, expectedDoor, timeoutMs) {
-    var label = expectedDoor === 1 ? "开门" : "关门";
+  function fetchLogs(id) {
+    return api("/api/devices/" + encodeURIComponent(id || currentId) + "/logs?lines=180")
+      .then(function (j) { return j.text || ""; })
+      .catch(function () { return ""; });
+  }
+
+  // 开门/关门成功标准（必须同时成立）：
+  // 1) 设备认领：VPS pending 被消费，日志出现 [REMOTE] cmd=open/close
+  // 2) 真正发射频：日志出现 [FSM] RF TX open/close（不是仅仅下发成功）
+  function analyzeDoorEvidence(logText, cmd, st, d) {
+    var reRemoteCmd = cmd === "open"
+      ? /\[REMOTE\] cmd=open\b/
+      : /\[REMOTE\] cmd=close\b/;
+    var reMiao = cmd === "open"
+      ? /\[REMOTE\] open ->/
+      : /\[REMOTE\] close ->/;
+    var reRfTx = cmd === "open"
+      ? /\[FSM\] RF TX open\b/
+      : /\[FSM\] RF TX close\b/;
+    var reRfFail = /\[FSM\] RF emit fail/;
+    var reManual = cmd === "open"
+      ? /\[FSM\] MANUAL OPEN\b/
+      : /\[FSM\] MANUAL CLOSE\b/;
+    var pendingName = cmd; // "open" / "close"
+    var pending = st.pending || null;
+
+    var claimedByLog = reRemoteCmd.test(logText) || reMiao.test(logText);
+    var claimed = claimedByLog || pending !== pendingName && (pending === null || pending === undefined);
+    // pending 已空也可能是 TTL 过期未认领——需结合日志区分
+    var claimedStrict = claimedByLog || (reManual.test(logText) && pending !== pendingName);
+
+    var rfTx = reRfTx.test(logText);
+    var rfFail = reRfFail.test(logText);
+    var manualLog = reManual.test(logText);
+    var doorOk = st.door === (cmd === "open" ? 1 : 2);
+    var online = d && d.online !== false;
+
+    var success = claimedStrict && rfTx;
+    var claimedNoRf = claimedStrict && !rfTx && !rfFail;
+
+    return {
+      claimedByLog: claimedByLog,
+      claimedStrict: claimedStrict,
+      pendingStill: pending === pendingName,
+      rfTx: rfTx,
+      rfFail: rfFail,
+      manualLog: manualLog,
+      doorOk: doorOk,
+      online: online,
+      success: success,
+      claimedNoRf: claimedNoRf
+    };
+  }
+
+  // 下发后轮询：设备日志 + 状态，直到确认「已认领且已发射频」
+  // logBaseOpt：指令排队前的日志长度，只分析其后新出现的日志
+  function waitDoorOutcome(id, cmd, timeoutMs, logBaseOpt) {
+    var label = cmdLabel(cmd);
     var start = Date.now();
-    var pendingName = expectedDoor === 1 ? "open" : "close";
+    var sawClaim = false;
+    var logBase = typeof logBaseOpt === "number" ? logBaseOpt : 0;
+
+    function finish(ev, statusJ) {
+      if (statusJ) renderDetail(statusJ);
+      if (ev.success) {
+        setTip($("ctrlTip"),
+          label + "成功 · 设备已认领指令并发射频" + (ev.doorOk ? " · 门状态：" + doorText(statusJ && statusJ.device ? statusJ.device.status || {} : {}) : ""),
+          "ok");
+        notifyOk(label + "成功：设备已认领并发射频", 3500);
+        return;
+      }
+      if (ev.rfFail) {
+        setTip($("ctrlTip"), label + "失败：射频发射失败", "err");
+        notifyErr(label + "失败：设备日志显示 RF emit fail（射频未发出）", 5000);
+        throw new Error(label + " RF fail");
+      }
+      if (ev.pendingStill) {
+        setTip($("ctrlTip"), label + "失败：设备未认领指令", "err");
+        notifyErr(label + "失败：设备未认领（可能离线或指令超时 8 秒 TTL）", 5000);
+        throw new Error(label + " not claimed");
+      }
+      if (ev.claimedStrict && !ev.rfTx) {
+        setTip($("ctrlTip"), label + "已认领，但尚未确认射频发射", "warn");
+        notifyWarn(label + "已认领，但未在日志中看到本次 RF TX，请稍后刷新设备日志确认", 5000);
+        throw new Error(label + " claimed but no rf");
+      }
+      setTip($("ctrlTip"), label + "结果未确认（未在日志中看到认领+射频）", "warn");
+      notifyWarn(label + "结果未确认：请查看设备日志是否出现 [REMOTE] cmd=" + cmd + " 与 [FSM] RF TX", 5000);
+      throw new Error(label + " unconfirmed");
+    }
 
     function tick() {
-      return fetchDevice(id).then(function (j) {
+      return Promise.all([fetchDevice(id), fetchLogs(id)]).then(function (pair) {
+        var j = pair[0];
+        var logText = pair[1] || "";
+        if (logBase === 0) {
+          // 兜底：未提供基线时从第一帧建立，并继续用增量
+          logBase = logText.length;
+        }
+        var freshLog = logText.length >= logBase ? logText.slice(logBase) : logText;
+
         var d = j.device || {};
         var st = d.status || {};
-        if (st.door === expectedDoor) {
-          renderDetail(j);
-          setTip($("ctrlTip"), label + "成功 · 门状态：" + doorText(st), "ok");
-          notifyOk(label + "成功");
+        var ev = analyzeDoorEvidence(freshLog, cmd, st, d);
+        if (ev.claimedByLog) sawClaim = true;
+
+        if (ev.success) {
+          finish(ev, j);
           return;
         }
+        if (ev.rfFail) {
+          finish(ev, j);
+          return;
+        }
+
         if (Date.now() - start < timeoutMs) {
-          return sleep(2500).then(tick);
+          if (!sawClaim) {
+            setTip($("ctrlTip"), "指令已排队，等待设备认领并发射频…", "ok");
+          } else if (!ev.rfTx) {
+            setTip($("ctrlTip"), "设备已认领，等待射频发射日志（日志约 30 秒一批）…", "ok");
+          }
+          return sleep(3000).then(tick);
         }
-        renderDetail(j);
-        if (d.online === false) {
-          setTip($("ctrlTip"), label + "失败：设备离线", "err");
-          notifyErr(label + "失败：设备离线，请检查设备供电与网络");
-        } else if (st.pending === pendingName) {
-          setTip($("ctrlTip"), label + "失败：设备尚未领取指令", "err");
-          notifyErr(label + "失败：设备尚未领取指令（可能超过 8 秒 TTL）");
-        } else {
-          // 指令可能已被领取，但门状态未变化（无门磁、状态未更新）
-          setTip($("ctrlTip"), label + "指令已下发，门状态未变化，请稍后刷新", "warn");
-          notifyWarn(label + "指令已下发，但门状态未变化，请稍后刷新确认");
+        finish(ev, j);
+      });
+    }
+
+    return tick();
+  }
+
+  // 配置类指令：排队成功后轮询设备日志确认已被设备处理
+  function waitForConfigAck(id, cmd, timeoutMs, logBaseOpt) {
+    var pretty = humanCmd(cmd);
+    var patterns = [];
+    if (cmd.indexOf("mac ") === 0) patterns.push(/\[REMOTE\] mac set\+saved/i);
+    else if (cmd.indexOf("mode ") === 0) patterns.push(/\[REMOTE\] mode ->/i);
+    else if (cmd === "autotrack on") patterns.push(/\[REMOTE\] autotrack ON/i);
+    else if (cmd === "autotrack off") patterns.push(/\[REMOTE\] autotrack OFF/i);
+    else if (cmd === "pair on") patterns.push(/\[REMOTE\] pair window/i);
+    else if (cmd === "pair off") patterns.push(/\[REMOTE\] pair window closed/i);
+    else if (cmd.indexOf("pairpin ") === 0) patterns.push(/\[REMOTE\] pairpin /i);
+    else if (cmd.indexOf("wifista ") === 0) patterns.push(/\[REMOTE\] wifista ssid=.*ok=1/i, /\[REMOTE\] wifista ssid=.*ok=0/i);
+    else if (cmd === "nfcinit") patterns.push(/\[REMOTE\] nfcinit OK/i, /\[REMOTE\] nfcinit FAIL/i);
+    else if (cmd === "web off") patterns.push(/\[REMOTE\] local web OFF/i);
+    else if (cmd === "web on") patterns.push(/\[REMOTE\] local web ON/i);
+
+    var start = Date.now();
+    var logBase = typeof logBaseOpt === "number" ? logBaseOpt : 0;
+
+    function tick() {
+      return Promise.all([fetchDevice(id), fetchLogs(id)]).then(function (pair) {
+        var j = pair[0];
+        var logText = pair[1] || "";
+        if (logBase === 0) logBase = logText.length;
+        var freshLog = logText.length >= logBase ? logText.slice(logBase) : logText;
+        var d = j.device || {};
+        if (d) renderDetail(j);
+
+        if (patterns.length) {
+          for (var i = 0; i < patterns.length; i++) {
+            var m = freshLog.match(patterns[i]);
+            if (m) {
+              var line = m[0];
+              var failed = /FAIL|reject|refused|ignored/i.test(line);
+              if (failed) {
+                setTip($("cfgTip"), pretty + " 失败：" + line, "err");
+                notifyErr(pretty + " 失败：" + line, 5000);
+                throw new Error(pretty + " failed");
+              }
+              setTip($("cfgTip"), pretty + " 已被设备确认 · " + line, "ok");
+              notifyOk(pretty + " 成功：" + line, 3500);
+              return;
+            }
+          }
         }
-        throw new Error(label + " confirm timeout");
+
+        if (Date.now() - start < timeoutMs) {
+          setTip($("cfgTip"), pretty + " 已下发，等待设备日志确认…", "ok");
+          return sleep(3000).then(tick);
+        }
+
+        // 超时：没有确认日志，不宣称成功
+        setTip($("cfgTip"), pretty + " 已下发，但设备日志尚未确认", "warn");
+        notifyWarn(pretty + " 已下发，设备日志尚未出现确认标记，请稍后刷新日志", 5000);
+        throw new Error(pretty + " unconfirmed");
       });
     }
 
@@ -424,49 +583,57 @@
     var firstFw = null;
 
     function tick() {
-      return fetchDevice(id).then(function (j) {
+      return Promise.all([fetchDevice(id), fetchLogs(id)]).then(function (pair) {
+        var j = pair[0];
+        var logText = pair[1] || "";
         var d = j.device || {};
         var st = d.status || {};
         if (firstFw == null) firstFw = d.fw || null;
         var nowFw = d.fw || st.fw || null;
+
         if (serverFw && nowFw && nowFw === serverFw) {
           renderDetail(j);
-          setTip($("ctrlTip"), "固件更新成功 · " + nowFw, "ok");
-          notifyOk("固件更新成功 · " + nowFw);
+          setTip($("ctrlTip"), "固件更新成功 · " + nowFw + "（设备已上报新版本）", "ok");
+          notifyOk("固件更新成功 · " + nowFw, 4000);
           return;
         }
-        if (nowFw && firstFw && nowFw !== firstFw && serverFw && nowFw !== serverFw) {
+        if (nowFw && firstFw && nowFw !== firstFw) {
           renderDetail(j);
-          setTip($("ctrlTip"), "固件版本已变化：" + nowFw, "ok");
-          notifyOk("固件更新成功 · " + nowFw);
+          setTip($("ctrlTip"), "固件已变化：" + nowFw, "ok");
+          notifyOk("固件更新成功 · " + nowFw, 4000);
           return;
         }
-        if (st.update_sticky || st.pending === "update") {
-          setTip($("ctrlTip"), "正在更新固件…" + (nowFw ? " 当前 " + nowFw : ""), "ok");
-          notifyInfo("正在更新固件，请耐心等待…", 2000);
+
+        var otaBusy = st.update_sticky || st.pending === "update";
+        if (otaBusy) {
+          setTip($("ctrlTip"), "正在更新固件…" + (nowFw ? " 当前 " + nowFw : "") + "（版本变化前不算成功）", "ok");
+          notifyInfo("正在更新固件，请耐心等待…（约 1–2 分钟）", 2500);
+        } else if (/\[REMOTE\] cmd=update/.test(logText) || /\[OTA\]/.test(logText)) {
+          setTip($("ctrlTip"), "设备已收到更新指令，等待版本上报…", "ok");
         }
+
         if (Date.now() - start < timeoutMs) {
-          return sleep(4000).then(tick);
+          return sleep(5000).then(tick);
         }
         renderDetail(j);
         if (d.online === false) {
           setTip($("ctrlTip"), "更新失败：设备离线", "err");
-          notifyErr("固件更新失败：设备离线，请检查设备网络");
-        } else if (st.update_sticky || st.pending === "update") {
-          setTip($("ctrlTip"), "更新仍在进行，未确认完成", "warn");
-          notifyWarn("更新仍在进行，尚未确认完成，请稍后在设备页刷新固件版本");
+          notifyErr("固件更新失败：设备离线，请检查设备网络", 5000);
+        } else if (otaBusy) {
+          setTip($("ctrlTip"), "更新仍在进行，版本尚未变化", "warn");
+          notifyWarn("更新仍在进行，设备固件版本尚未变化，请稍后刷新", 5000);
         } else {
-          setTip($("ctrlTip"), "更新结果未确认：设备固件 " + (nowFw || "-"), "warn");
-          notifyWarn("更新结果未确认，请稍后刷新查看固件版本");
+          setTip($("ctrlTip"), "更新未确认：设备固件 " + (nowFw || "-"), "warn");
+          notifyWarn("更新未确认：设备上报固件仍为 " + (nowFw || "-"), 5000);
         }
-        throw new Error("update confirm timeout");
+        throw new Error("update unconfirmed");
       });
     }
 
     return tick();
   }
 
-  // 详情页：开门 / 关门 / 立即更新（带状态反馈 + 结果确认）
+  // 详情页：开门 / 关门 / 立即更新
   function sendCmd(cmd) {
     if (!currentId) {
       notifyErr("未选择设备");
@@ -483,60 +650,78 @@
     busyCmd = true;
     if (btn) btn.disabled = true;
 
-    var queuedMsg = label + "指令已下发，设备领取中…";
-    setTip($("ctrlTip"), queuedMsg, "ok");
-    notifyInfo(queuedMsg);
-
-    return api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
-      method: "POST",
-      body: "{}"
-    })
-      .then(function (j) {
-        var msg = j.message || (label + "已请求");
-        if (j.ok === 0) {
-          setTip($("ctrlTip"), msg, "err");
-          notifyErr(label + "失败：" + msg);
-          throw new Error(msg);
-        }
-
-        if (cmd === "open" || cmd === "close") {
-          var expected = cmd === "open" ? 1 : 2;
-          setTip($("ctrlTip"), label + "已下发 · 等待设备执行…", "ok");
-          notifyInfo(label + "已下发，等待设备执行…");
-          return waitDoorOutcome(id, expected, 20000).catch(function () {
-            // waitDoorOutcome 内部已提示
-          });
-        }
-
-        if (cmd === "update") {
-          var serverFw = null;
-          return fetchDevice(id).then(function (d) {
-            serverFw = (j.ota && j.ota.version) || (d.ota && d.ota.version) || null;
-          }).catch(function () {}).then(function () {
-            setTip($("ctrlTip"), "更新指令已下发，设备开始下载固件…", "ok");
-            notifyOk("更新指令已下发，设备开始下载固件…（约 1–2 分钟）", 4500);
-            return waitUpdateOutcome(id, serverFw, 150000).catch(function () {});
-          });
-        }
-
-        setTip($("ctrlTip"), msg, "ok");
-        notifyOk(msg);
-      })
-      .catch(function (e) {
-        // 已在上方提示过的不再重复
-        if ((e.message || "").indexOf("confirm timeout") >= 0) {
-          return;
-        }
-        if ((e.message || "").indexOf("已下发") >= 0) {
-          return;
-        }
+    if (cmd === "open" || cmd === "close") {
+      setTip($("ctrlTip"), "已排队，等待设备认领并发射频…（不算成功）", "ok");
+      notifyInfo(label + "已排队，等待设备认领并发射频…（确认后才算成功）");
+      return fetchLogs(id).then(function (baseLog) {
+        var logBase = (baseLog || "").length;
+        return api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
+          method: "POST",
+          body: "{}"
+        }).then(function (j) {
+          if (j.ok === 0) {
+            var m0 = j.message || (label + "失败");
+            setTip($("ctrlTip"), m0, "err");
+            notifyErr(label + "失败：" + m0);
+            throw new Error(m0);
+          }
+          setTip($("ctrlTip"), "服务器已入队 · 等待设备认领并发射频…", "ok");
+          notifyInfo("服务器已入队 · 等待设备认领并发射频…");
+          return waitDoorOutcome(id, cmd, 60000, logBase).catch(function () {});
+        });
+      }).catch(function (e) {
+        if ((e.message || "").indexOf("unconfirmed") >= 0) return;
+        if ((e.message || "").indexOf("not claimed") >= 0) return;
+        if ((e.message || "").indexOf("RF fail") >= 0) return;
+        if ((e.message || "").indexOf("claimed but no rf") >= 0) return;
         setTip($("ctrlTip"), e.message || (label + "失败"), "err");
         notifyErr(label + "失败：" + (e.message || "未知错误"));
-      })
-      .finally(function () {
+      }).finally(function () {
         busyCmd = false;
         if (btn) btn.disabled = false;
       });
+    }
+
+    if (cmd === "update") {
+      setTip($("ctrlTip"), "已下发更新指令…（版本变化前不算成功）", "ok");
+      notifyInfo("更新指令已下发，仅当设备固件版本变化才算成功（约 1–2 分钟）", 4500);
+      return api("/api/devices/" + encodeURIComponent(id) + "/update", {
+        method: "POST",
+        body: "{}"
+      })
+        .then(function (j) {
+          if (j.ok === 0) {
+            var mu = j.message || "更新失败";
+            setTip($("ctrlTip"), mu, "err");
+            notifyErr("更新失败：" + mu);
+            throw new Error(mu);
+          }
+          var serverFw = (j.ota && j.ota.version) || null;
+          return fetchDevice(id).then(function (dj) {
+            if (!serverFw && dj.ota) serverFw = dj.ota.version || null;
+            return waitUpdateOutcome(id, serverFw, 150000).catch(function () {});
+          }).catch(function () {
+            return waitUpdateOutcome(id, serverFw, 150000).catch(function () {});
+          });
+        })
+        .catch(function (e) {
+          if ((e.message || "").indexOf("unconfirmed") >= 0) return;
+          if ((e.message || "").indexOf("update") >= 0 && /失败|离线/.test(e.message || "")) {
+            notifyErr(e.message);
+            return;
+          }
+          setTip($("ctrlTip"), e.message || "更新失败", "err");
+          notifyErr("更新失败：" + (e.message || "未知错误"));
+        })
+        .finally(function () {
+          busyCmd = false;
+          if (btn) btn.disabled = false;
+        });
+    }
+
+    busyCmd = false;
+    if (btn) btn.disabled = false;
+    return Promise.resolve();
   }
 
   // 通用配置指令（替代本地网页）：POST .../cmd {"cmd":"mac AA:BB:..."}
@@ -563,30 +748,35 @@
       notifyErr("未选择设备");
       return Promise.reject(new Error("no device"));
     }
+    var id = currentId;
     var pretty = humanCmd(cmd);
-    setTip($("cfgTip"), "下发：" + pretty + " …");
-    notifyInfo(pretty + " 下发中…");
-    return api("/api/devices/" + encodeURIComponent(currentId) + "/cmd", {
-      method: "POST",
-      body: JSON.stringify({ cmd: cmd })
-    })
-      .then(function (j) {
-        if (j.ok) {
-          setTip($("cfgTip"), "已下发「" + pretty + "」，约 3 秒生效", "ok");
-          notifyOk(pretty + " 已下发，约 3 秒生效");
-          setTimeout(refreshDetail, 4500);
-        } else {
+    setTip($("cfgTip"), "下发：" + pretty + " …（等待设备确认）");
+    notifyInfo(pretty + " 下发中…（设备日志确认后才算成功）");
+    return fetchLogs(id).then(function (baseLog) {
+      var logBase = (baseLog || "").length;
+      return api("/api/devices/" + encodeURIComponent(id) + "/cmd", {
+        method: "POST",
+        body: JSON.stringify({ cmd: cmd })
+      }).then(function (j) {
+        if (!j.ok) {
           var fail = "失败：" + (j.result || j.message || "unknown");
           setTip($("cfgTip"), fail, "err");
           notifyErr(pretty + " 失败：" + (j.result || j.message || "unknown"));
+          throw new Error(fail);
         }
-        return j;
-      })
-      .catch(function (e) {
-        setTip($("cfgTip"), e.message || "下发失败", "err");
-        notifyErr(pretty + " 失败：" + (e.message || "未知错误"));
-        throw e;
+        setTip($("cfgTip"), pretty + " 已入队，等待设备日志确认…", "ok");
+        notifyInfo(pretty + " 已入队，等待设备日志确认…");
+        return waitForConfigAck(id, cmd, 45000, logBase).catch(function () {
+          // ack 失败已提示
+        });
       });
+    }).catch(function (e) {
+      if ((e.message || "").indexOf("unconfirmed") >= 0) return;
+      if ((e.message || "").indexOf("failed") >= 0) return;
+      setTip($("cfgTip"), e.message || "下发失败", "err");
+      notifyErr(pretty + " 失败：" + (e.message || "未知错误"));
+      throw e;
+    });
   }
 
   function cfgWire() {
