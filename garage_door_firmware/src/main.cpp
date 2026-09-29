@@ -1393,6 +1393,10 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   delay(50);
   Serial.println("[BOOT] WiFi forced OFF at boot (will start later if needed)");
+  // 事件时间戳：NTP 对时后每条上云日志带「发生时间」而不是上传时间
+  // （离线积压补传时两者差可达几分钟）。同步前的行不打戳，
+  // VPS 按接收时间兜底——好过打一个错误的 1970 时间。时区固定东八区无夏令时。
+  configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp1.aliyun.com", "pool.ntp.org");
   logShipBegin();  // 必须在 early SCL 日志前，否则 s_len=0 会冲掉
   crashSnapBegin();  // 崩溃快照（RTC noinit）：上一轮现场由 crashSnapReport 上报
   // 复位原因只打串口、VPS 看不到（7 次静默重启无从查），开机补报是唯一定案线索：
@@ -1982,6 +1986,21 @@ void loop() {
             break;
           }
           break;
+      }
+    }
+  }
+
+  // 时钟首次同步留证据行：远程凭这条确认「事件时间戳」已生效
+  {
+    static bool timeSyncLogged = false;
+    if (!timeSyncLogged) {
+      time_t tn = time(nullptr);
+      if (tn > 1600000000) {
+        timeSyncLogged = true;
+        struct tm tmv;
+        char b[24] = "?";
+        if (localtime_r(&tn, &tmv)) strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+        logShipf("[TIME] NTP synced (event ts on) now=%s", b);
       }
     }
   }

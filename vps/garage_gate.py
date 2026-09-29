@@ -431,9 +431,14 @@ def _append_device_log(text, dev_id=None):
     try:
         if not os.path.isdir(LOG_DIR):
             os.makedirs(LOG_DIR)
-        text = _stamp_device_log(text)
-        if not text:
+        stamped = _stamp_device_log(text)
+        if not stamped:
             return True
+        # 批次接收标记：固件 NTP 同步后的行自带「发生时间」，下面的
+        # _stamp_device_log 会跳过它们——上传时刻就只保留在这一行里，
+        # 不污染每行，也顺便把上报节奏/断流位置标出来。
+        stamped = ("--- rx %s dev=%s bytes=%d ---\n" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), dev_id, len(text))) + stamped
         day = time.strftime("%Y%m%d")
         path = os.path.join(LOG_DIR, "device-%s-%s.log" % (dev_id, day))
         # 兼容旧文件名
@@ -442,7 +447,7 @@ def _append_device_log(text, dev_id=None):
             if os.path.isfile(legacy) and not os.path.isfile(path):
                 path = legacy
         with open(path, "a") as f:
-            f.write(text)
+            f.write(stamped)
         try:
             names = sorted(
                 n for n in os.listdir(LOG_DIR)

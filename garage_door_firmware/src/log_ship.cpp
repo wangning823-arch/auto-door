@@ -210,8 +210,23 @@ void logShipBegin() {
   Serial.println("[LOGSHIP] begin url=" LOG_SHIP_URL);
 }
 
+// 事件发生时间前缀（"YYYY-MM-DD HH:MM:ss "，含尾空格）。
+// 只在 NTP 同步后打：未同步时 time() 是 1970 起算值，打出去比不打更误导，
+// 交给 VPS 用接收时间兜底。VPS 的 _stamp_device_log 见到已带时间戳的行会跳过。
+static int eventTsPrefix(char* ts, size_t cap) {
+  time_t now = time(nullptr);
+  if (now < 1600000000) return 0;  // 2020-09 之前 = 尚未同步
+  struct tm tmv;
+  if (!localtime_r(&now, &tmv)) return 0;
+  if (tmv.tm_year + 1900 < 2020) return 0;
+  return (int)strftime(ts, cap, "%Y-%m-%d %H:%M:%S ", &tmv);
+}
+
 void logShipPrintln(const String& line) {
-  String t = line + "\n";
+  char ts[24];
+  int tn = eventTsPrefix(ts, sizeof(ts));
+  String t = tn > 0 ? (String(ts) + line) : line;
+  t += "\n";
   ringLock();
   ringPush(t.c_str(), t.length());
   ringUnlock();
@@ -233,6 +248,18 @@ void logShipf(const char* fmt, ...) {
   if (n < 0) return;
   size_t len = (size_t)n;
   if (len >= sizeof(buf)) len = sizeof(buf) - 1;  // 超长：拿截断结果，也好过不发
+
+  // 事件时间戳前缀：这行日志是「什么时候发生的」，不是「什么时候传上来的」。
+  // 离线 200s 后补传的积压，用接收时间会整体错位 200s。
+  char ts[24];
+  int tn = eventTsPrefix(ts, sizeof(ts));
+  if (tn > 0) {
+    if (len + (size_t)tn > sizeof(buf) - 2) len = sizeof(buf) - 2 - tn;  // 留 \n+NUL
+    memmove(buf + tn, buf, len);
+    memcpy(buf, ts, tn);
+    len += (size_t)tn;
+  }
+
   if (len + 1 >= sizeof(buf)) {
     // 截断后连 '\n' 都放不下：压掉最后一个字符也要保证环里是完整一行
     buf[sizeof(buf) - 2] = '\n';
