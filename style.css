@@ -731,6 +731,42 @@ select option {
 
 .device-card .pill-row { margin-bottom: 12px; }
 
+/* 设备列表快捷开关：不进详情页也能开/关门 */
+.device-card .quick-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(36, 48, 72, 0.75);
+}
+
+.device-card .quick-row .btn {
+  width: 100%;
+  min-height: 44px;
+  border-radius: 12px;
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}
+
+.device-card .quick-row .btn.open {
+  min-height: 44px;
+  flex-direction: row;
+  gap: 0;
+  font-size: 0.95rem;
+}
+
+.device-card .quick-row .btn.close {
+  min-height: 44px;
+  flex-direction: row;
+  gap: 0;
+  font-size: 0.95rem;
+}
+
+.device-card .quick-row .btn:disabled {
+  opacity: 0.42;
+}
+
 .empty {
   color: var(--muted);
   text-align: center;
@@ -750,8 +786,9 @@ select option {
   align-items: start;
 }
 
-.detail-grid .card-status { grid-column: 1; grid-row: 1; }
-.detail-grid .card-control { grid-column: 2; grid-row: 1; }
+/* 门控制置顶：详情页一打开就能遥控开关门 */
+.detail-grid .card-control { grid-column: 1; grid-row: 1; }
+.detail-grid .card-status { grid-column: 2; grid-row: 1; }
 .detail-grid .card-cfg { grid-column: 1 / -1; }
 .detail-grid .log-card { grid-column: 1 / -1; }
 

@@ -112,6 +112,10 @@
               "</div>" +
               '<div class="fw">fw ' + (d.fw || "-") + "</div>" +
               '<div class="fw" style="color:var(--muted)">最后在线 ' + ago(d.last_seen_ago_s) + "</div>" +
+              '<div class="quick-row">' +
+                '<button class="btn open quick-btn" type="button" data-id="' + d.id + '" data-cmd="open">开门</button>' +
+                '<button class="btn close quick-btn" type="button" data-id="' + d.id + '" data-cmd="close">关门</button>' +
+              "</div>" +
             "</div>"
           );
         }).join("");
@@ -137,7 +141,31 @@
               });
           });
         });
-        setTip($("listTip"), "共 " + list.length + " 台");
+        // 列表页快捷开/关门：不进详情页直接下发指令
+        Array.prototype.forEach.call(box.querySelectorAll(".quick-btn"), function (btn) {
+          btn.addEventListener("click", function (e) {
+            e.stopPropagation();
+            var id = btn.getAttribute("data-id");
+            var cmd = btn.getAttribute("data-cmd");
+            var label = cmd === "close" ? "关门" : "开门";
+            btn.disabled = true;
+            setTip($("listTip"), "发送" + label + "指令…");
+            api("/api/devices/" + encodeURIComponent(id) + "/" + cmd, {
+              method: "POST",
+              body: "{}"
+            })
+              .then(function (j) {
+                setTip($("listTip"), (j.message || (label + "已下发")) + " · " + id, "ok");
+              })
+              .catch(function (err) {
+                setTip($("listTip"), (err.message || (label + "失败")) + " · " + id, "err");
+              })
+              .finally(function () {
+                btn.disabled = false;
+              });
+          });
+        });
+        setTip($("listTip"), "共 " + list.length + " 台 · 可直接点开关门");
       })
       .catch(function (e) {
         if ((e.message || "").indexOf("unauthorized") >= 0) {
