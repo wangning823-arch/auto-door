@@ -2,362 +2,224 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>固件交接报告 · 0.2.202609282351</title>
-<link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#070b14">
+  <title>车库门控制台</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <p data-aigc-mark="1" style="margin:0 0 8px;font-size:10px;line-height:1.3;color:#6b6560;font-weight:400;">AI生成</p>
 
-<main class="sheet">
-
-  <header class="head">
-    <div class="head-top">
-      <p class="eyebrow">GARAGE DOOR · ESP32 FIRMWARE HANDOVER</p>
-      <span class="ver" id="ver">0.2.202609282351</span>
-    </div>
-    <h1>dda0 日志改动交接报告</h1>
-    <p class="lede">
-      本报告回答三件事：任务遗留状态、最后烧录的固件与时间、本版相对上版的关键改动
-      及<b>可在日志里逐条对照的预期指标</b>。第三节的"实测"列是 2026-09-29 07:50
-      从 VPS 日志实际核对的结果。
-    </p>
-    <ul class="meta">
-      <li><span>对照基准</span>0.2.202609281659 → 0.2.202609282351</li>
-      <li><span>核对时刻</span>2026-09-29 07:50:41 (CST)</li>
-      <li><span>提交</span>084a0c9 · 70b54b4 · ebdf5f6</li>
-    </ul>
-  </header>
-
-  <!-- ============ 1. 任务 ============ -->
-  <section class="block" id="tasks">
-    <div class="sec-no">01</div>
-    <h2>任务清单与状态</h2>
-    <p class="note">
-      本会话共 <b>19</b> 项任务，<b>18 项已完成</b>，<b>1 项遗留</b>。
-      遗留项属早前"web 功能问题"范畴，与本次日志改动<b>无依赖关系</b>。
-    </p>
-
-    <table class="grid">
-      <thead>
-        <tr><th class="c-w6">ID</th><th>任务</th><th class="c-w14">状态</th></tr>
-      </thead>
-      <tbody>
-        <tr class="leak">
-          <td class="mono">T4</td>
-          <td>烧录并用串口回归验证（连续 GET / 不崩、页面完整）</td>
-          <td><span class="tag tag-hold">遗留 · blocked</span></td>
-        </tr>
-        <tr>
-          <td class="mono">T17</td>
-          <td>修复 OTA 并发 DNS 死锁（httpPause 返回值 + DNS 互斥 + WDT）</td>
-          <td><span class="tag tag-ok">已完成</span></td>
-        </tr>
-        <tr>
-          <td class="mono">T18</td>
-          <td>查 dda0 NFC 无芯片日志，确认原因后再推送新版本</td>
-          <td><span class="tag tag-ok">已完成</span></td>
-        </tr>
-        <tr>
-          <td class="mono">T19</td>
-          <td>补观测缺口：NFC 失败分支上云 + PANIC 栈存 RTC 随 BOOT 上报</td>
-          <td><span class="tag tag-ok">已完成</span></td>
-        </tr>
-        <tr>
-          <td class="mono">T16</td>
-          <td>编译验证并发布 OTA 到 1388</td>
-          <td><span class="tag tag-ok">已完成</span></td>
-        </tr>
-        <tr class="fold-row">
-          <td class="mono">T1–T3 · T5–T15</td>
-          <td>web 流式输出、远程配置命令、状态上报扩展、OTA 蓝牙下电、
-              HEAPFAIL 侦查、HttpJob 回填、safeChunk 自适应等</td>
-          <td><span class="tag tag-ok">已完成 ×14</span></td>
-        </tr>
-      </tbody>
-    </table>
-
-    <div class="callout">
-      <p class="co-h">遗留项说明 · T4</p>
-      <p>需要<b>串口物理接入</b>才能跑"连续 GET 不崩 + 页面完整"回归，本会话无串口访问，故 blocked。
-      该验证对象是<b>早前的 web 分块输出改动</b>，与 2351 版的日志/RTC 改动互不影响。</p>
-    </div>
-  </section>
-
-  <!-- ============ 2. 固件 ============ -->
-  <section class="block" id="fw">
-    <div class="sec-no">02</div>
-    <h2>最后烧录的固件版本与时间</h2>
-
-    <div class="fwcard">
-      <div class="fw-ver">
-        <span class="lbl">fw_version</span>
-        <code>0.2.202609282351</code>
+  <div class="bg-glow" aria-hidden="true"></div>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <span class="logo-door"></span>
+        </div>
+        <div class="brand-text">
+          <h1>车库门控制台</h1>
+          <p class="sub" id="statusText">未登录</p>
+        </div>
       </div>
-      <div class="fw-grid">
-        <div><span class="lbl">dda0 烧录完成</span><b>2026-09-28 23:57:18</b></div>
-        <div><span class="lbl">烧录方式</span><b>VPS OTA（非串口）</b></div>
-        <div><span class="lbl">触发时刻</span><b>2026-09-28 23:54</b></div>
-        <div><span class="lbl">产物大小</span><b>1 686 400 B</b></div>
+      <button id="logoutBtn" class="btn ghost sm hidden" type="button">退出</button>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <div class="login-visual" aria-hidden="true">
+        <div class="login-mark">
+          <span class="login-mark-bar"></span>
+          <span class="login-mark-bar"></span>
+          <span class="login-mark-bar"></span>
+        </div>
+        <p class="login-kicker">Smart Garage</p>
+        <h2>登录控制台</h2>
+        <p class="muted login-desc">查看设备状态与日志，在线升级固件，远程下发配置。</p>
       </div>
-    </div>
+      <form class="login-form" action="#" autocomplete="on" onsubmit="return false;">
+        <label for="pw">访问密码</label>
+        <input id="pw" type="password" autocomplete="current-password" placeholder="输入密码" enterkeyhint="go">
+        <button id="loginBtn" class="btn primary block" type="button">进入控制台</button>
+        <p class="tip" id="loginTip"></p>
+      </form>
+    </section>
 
-    <h3 class="sub">时间线（来自 dda0 当天日志）</h3>
-    <ol class="tl">
-      <li><span class="tl-t">09-28 23:53</span><span class="tl-d">固件发布到 VPS <code>/ota/firmware.bin</code></span></li>
-      <li><span class="tl-t">09-28 23:54:36</span><span class="tl-d">1388 升级完成 <code>[BOOT] rst=3</code></span></li>
-      <li class="key"><span class="tl-t">09-28 23:57:18</span>
-        <span class="tl-d"><b>dda0 升级完成</b> <code>[BOOT] rst=3</code>，首次出现 <code>[CRASH] snap ready</code></span></li>
-      <li><span class="tl-t">09-29 06:14:37</span>
-        <span class="tl-d">用户<b>断电重新上电</b> <code>[BOOT] rst=1</code>，<code>early SCL=1</code></span></li>
-      <li><span class="tl-t">09-29 06:28:06</span>
-        <span class="tl-d">首次刷卡成功 <code>card: ABDDE836 authorized → RF</code></span></li>
-    </ol>
-
-    <div class="callout ok">
-      <p class="co-h">符号表已归档（否则 [CRASH] 的 PC 无法还原）</p>
-      <p class="path">本地 <code>garage_door_firmware/firmware_backup/firmware-0.2.202609282351.elf</code>（20.09 MB）</p>
-      <p class="path">VPS <code>/opt/garage-gate/ota/firmware-0.2.202609282351.elf</code></p>
-      <p class="tiny">已用 <code>xtensa-esp32-elf-addr2line -e &lt;elf&gt; 0xPC</code> 实测可解析出
-      <code>logShipResolve</code>、<code>NfcReader::hwInit</code> 等函数名与源码行。</p>
-    </div>
-  </section>
-
-  <!-- ============ 3. 改动与预期 ============ -->
-  <section class="block" id="changes">
-    <div class="sec-no">03</div>
-    <h2>关键修改 与 预期日志指标</h2>
-
-    <div class="toolbar" role="group" aria-label="筛选验证状态">
-      <button class="fb is-on" data-f="all">全部 9</button>
-      <button class="fb" data-f="ok">已验证 8</button>
-      <button class="fb" data-f="wait">待验证 1</button>
-    </div>
-
-    <div class="tblwrap">
-    <table class="grid ev" id="ev">
-      <thead>
-        <tr>
-          <th class="c-w5">组</th>
-          <th class="c-w26">本版改动（提交）</th>
-          <th class="c-w32">预期日志指标</th>
-          <th>实测核对结果</th>
-          <th class="c-w9">状态</th>
-        </tr>
-      </thead>
-      <tbody>
-
-        <tr data-s="ok">
-          <td rowspan="3" class="grp">A<br><i>OTA 可靠性</i></td>
-          <td><b>串行化 hostByName</b><br>
-              框架 <code>hostByName</code> 是跨任务事件位握手，两次 <code>waitStatusBits</code>
-              超时返回值被丢弃，并发必互踩 → dda0 OTA 曾挂死 13.5 分钟。<br>
-              <span class="cmt">084a0c9</span></td>
-          <td>
-            <code>dnsbusy</code> 字段出现在 status，且恒为 <b>0</b><br>
-            <code>[OTA] begin idle=1</code><br>
-            <code>/ota/version</code> 立即返回 200<br>
-            不应出现 <code>[LOGSHIP] dns lock busy</code>
-          </td>
-          <td>1388 与 dda0 <code>dnsbusy=0</code>；两台
-            <code>[OTA] begin idle=1</code>；nginx 记录 <code>/ota/version 200</code>；
-            全量日志 <code>dns lock busy</code> 出现 <b>0 次</b></td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td><b>httpPause 返回值校验</b><br>
-              排空失败（4s+12s）即放弃本轮并 <code>httpResume()</code>，不带在飞未知往下走。<br>
-              <span class="cmt">084a0c9</span></td>
-          <td>worker 忙时打<br><code>[OTA] http worker busy &gt;16s -&gt; abort round</code><br>
-              且<b>不</b>卡死、可再次 update</td>
-          <td>本版 OTA 过程<b>未出现</b>该行（worker 正常排空），
-            反证排空路径通畅；两台均一次升级成功</td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td><b>status 新增 dnsbusy</b><br>
-              DNS 互斥拿锁超时累计次数，远程直接看是否在撞锁。<br>
-              <span class="cmt">084a0c9</span></td>
-          <td>status JSON 含 <code>"dnsbusy":&lt;n&gt;</code></td>
-          <td>两台均已上报 <code>dnsbusy=0</code></td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td rowspan="3" class="grp">B<br><i>崩溃现场</i></td>
-          <td><b>日志环移入 RTC noinit</b><br>
-              <code>s_ring</code>/<code>s_len</code> 改 <code>RTC_NOINIT_ATTR</code>
-              （NOLOAD 启动不清零；<code>RTC_DATA_ATTR</code> 是已初始化段会被 flash 重载清零，不能用）。<br>
-              <span class="cmt">70b54b4</span></td>
-          <td><b>软复位</b>后出现<br>
-            <code>[LOGSHIP] ==== 以下 N 字节为上一轮(rst=X)遗留 ====</code><br>
-            且随后把 N 字节发出去</td>
-          <td>1388 执行 <code>reboot</code> 后：出现
-            <code>[LOGSHIP] ==== 以下 232 字节为上一轮(rst=3)遗留 ====</code>，
-            紧接上一轮的 2 行日志 —— <b>跨复位保留成立</b></td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td><b>掉电优雅降级</b><br>
-              magic + 长度双重校验，掉电后 RTC 是随机值 → 当空环处理，不清空也不崩。<br>
-              <span class="cmt">70b54b4</span></td>
-          <td><b>上电</b>（<code>rst=1</code>）后<b>不出现</b> resume 行<br>
-              且开机日志正常、无越界崩溃</td>
-          <td>dda0 06:14:37 <code>rst=1</code>，<b>确无 resume 行</b>；
-            开机后日志流正常 —— <b>掉电清零符合设计</b></td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="wait">
-          <td><b>调用栈快照 → RTC</b><br>
-              各任务 1s 周期采样存 RTC，仅异常复位上报 task/phase/PC。<br>
-              <span class="cmt">70b54b4</span></td>
-          <td>每次开机必有<br>
-            <code>[CRASH] snap ready (rtc noinit, 672 bytes)</code><br>
-            <b>仅</b> <code>rst=4/5/6/7/9</code> 时才追加<br>
-            <code>[CRASH] task=.. phase=.. pc=..</code></td>
-          <td><code>snap ready</code> 行两台<b>均已出现</b>（模块已装载）；
-            但 <b><code>task=/pc=</code> 上报路径从未被真实 panic 触发</b> ——
-            28 日的 4 次 panic 全部发生在旧固件上，新固件上线后未再 panic</td>
-          <td><span class="tag tag-hold">待验证</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td rowspan="3" class="grp">C<br><i>NFC 可观测性</i></td>
-          <td><b>判死路径补上云</b><br>
-              <code>abort: bus not idle</code> / <code>bus low</code> /
-              <code>bus recover</code> / <code>ver 读数</code> 原先只打串口，
-              远程只见 auto-retry 看不到第一现场。<br>
-              <span class="cmt">70b54b4</span></td>
-          <td>开机出现<br>
-            <code>[NFC] boot auto-init t=.. SCL=x SDA=x</code><br>
-            <code>[NFC] idle SDA=x SCL=x → probe SCL=x</code><br>
-            <code>[NFC] bus recover pushScl=x pushAfter=x idleScl=x</code><br>
-            <code>[NFC] abort: bus not idle SDA=x SCL=x (recover失败)</code></td>
-          <td>断电前（29 日 06:13:17）实测输出<br>
-            <code>bus recover pushScl=1 pushAfter=1 idleScl=0</code><br>
-            <code>abort: bus not idle SDA=1 SCL=0 (recover失败)</code></td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td><b>高频路径 10s 节流</b><br>
-              poll 卡死时每 100~500ms 会打一条，不节流会把 2560B 日志环冲爆；串口仍全量。<br>
-              <span class="cmt">70b54b4</span></td>
-          <td>上述行频率 ≤ 1 条 / 10s<br>
-              且 hwInit 判死行<b>不被冲掉</b></td>
-          <td>29 日 <code>bus recover</code> / <code>abort</code> 行分布稀疏，
-            判死行完整可读，未见刷屏</td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-        <tr data-s="ok">
-          <td><b>阶段标记 phase</b><br>
-              <code>ota.start/version/begin/dl</code>、<code>http.dns/conn/io</code>、
-              <code>ls.dns/flush</code>、<code>nfc.hwinit/probe</code>。<br>
-              <span class="cmt">70b54b4</span></td>
-          <td>配合 <code>[CRASH] task=</code> 上报，看出崩前卡在哪一步</td>
-          <td>标记已写入 RTC（<code>s_slot</code> 672B 就位）；
-            但同样<b>依赖真实 panic 才能观察到输出</b></td>
-          <td><span class="tag tag-ok">通过</span></td>
-        </tr>
-
-      </tbody>
-    </table>
-    </div>
-
-    <h3 class="sub">根因结论 · 为什么只有断电能救 NFC</h3>
-    <div class="findings">
-      <div class="fd">
-        <p class="fd-h">决定性证据</p>
-        <code class="block">[NFC] bus recover pushScl=1 pushAfter=1 idleScl=0</code>
-        <p>推挽驱动时<b>能拉高</b>（<code>pushAfter=1</code>），松手回上拉后<b>立刻回落</b>
-        （<code>idleScl=0</code>）→ <b>排除 GPIO 对地短路</b>，是有器件在拉 SCL。</p>
+    <section id="listView" class="hidden">
+      <div class="page-head">
+        <div class="page-head-text">
+          <p class="eyebrow">Devices</p>
+          <h2>设备列表</h2>
+        </div>
+        <div class="toolbar-actions">
+          <button id="refreshBtn" class="btn ghost sm" type="button">刷新</button>
+          <button id="otaBtn" class="btn primary sm" type="button">上传固件</button>
+        </div>
       </div>
-      <div class="fd">
-        <p class="fd-h">因果链</p>
-        <p>PANIC 复位的是 <b>ESP32</b>，<b>PN532 不断电</b> → 它卡在 I2C 半截事务、
-        状态机锁死持续拉低 SCL → 此后每次开机 <code>early SCL=0</code>、
-        <code>i2cBusRecover</code> 无效（芯片内部状态没复位）。
-        <b>只有物理断电才能让 PN532 重新上电初始化。</b></p>
+
+      <div id="otaBar" class="card ota-card hidden">
+        <div class="card-head">
+          <div>
+            <h3>在线 OTA</h3>
+            <p class="muted">上传 <code>firmware.bin</code> 只写入服务器；设备<strong>不会</strong>自动升级，需在设备页点「立即更新」</p>
+          </div>
+        </div>
+        <div class="ota-row">
+          <div class="field">
+            <label for="verInput">版本号（可选）</label>
+            <input id="verInput" type="text" placeholder="如 0.2.202609241200">
+          </div>
+          <div class="field">
+            <label for="binInput">固件包</label>
+            <input id="binInput" type="file" accept=".bin">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="uploadBtn" class="btn primary sm" type="button">上传固件</button>
+          <span id="otaMsg" class="tip"></span>
+        </div>
+        <p class="muted" id="otaCurrent"></p>
       </div>
-      <div class="fd ok">
-        <p class="fd-h">断电后已验证恢复</p>
-        <p>06:14:37 <code>early SCL=1</code>、<code>idle SDA=1 SCL=1</code> →
-        06:14:40 <code>retry ver=0x32010607</code> → 06:28:06 起
-        <code>card: ABDDE836 authorized → RF</code>，刷卡正常。</p>
+
+      <div id="deviceList" class="device-list"></div>
+      <p class="tip" id="listTip"></p>
+    </section>
+
+    <section id="detailView" class="hidden">
+      <div class="page-head detail-head">
+        <div class="page-head-text">
+          <button id="backBtn" class="back-link" type="button">
+            <span class="back-icon" aria-hidden="true">←</span>
+            <span>返回设备列表</span>
+          </button>
+          <h2 id="devTitle">设备</h2>
+        </div>
+        <div class="toolbar-actions">
+          <button id="dRefreshBtn" class="btn ghost sm" type="button">刷新</button>
+        </div>
       </div>
-    </div>
-  </section>
 
-  <!-- ============ 4. 遗留 ============ -->
-  <section class="block" id="left">
-    <div class="sec-no">04</div>
-    <h2>遗留与需继续观察</h2>
+      <div class="detail-grid">
+        <div class="card card-status">
+          <div class="head-row">
+            <h3>运行状态</h3>
+            <span id="devOnline" class="pill">—</span>
+          </div>
+          <div id="statusGrid" class="status-grid"></div>
+          <div class="meta" id="devMeta"></div>
+        </div>
 
-    <table class="grid">
-      <thead><tr><th class="c-w26">项</th><th>现状</th><th class="c-w20">建议动作</th></tr></thead>
-      <tbody>
-        <tr>
-          <td><b>[CRASH] task=/pc= 上报</b></td>
-          <td>模块已装载（<code>snap ready</code> 每次开机都有），但<b>从未被真实 panic 触发</b>。
-              28 日 dda0 有 <b>4 次 PANIC</b>（18:24:17 / 22:06:49 / 22:53:51 / 23:23:35，
-              <code>rst=4</code>），全部在旧固件 1659 上，新固件上线后未再复现。</td>
-          <td>下次出现 <code>rst=4/5/6/7/9</code> 时，
-              拿 <code>pc</code> 对照归档 elf 做 addr2line</td>
-        </tr>
-        <tr>
-          <td><b>HEAPFAIL 持续</b></td>
-          <td>29 日 <b>59</b> 条，形态一致：
-              <code>sz=2308 t=wifi big8=2292</code>（仅差 16B），
-              累计计数器已到 <code>#6400</code>。属 T10 早已记录的老问题（堆碎片），
-              <b>非本次改动引入</b>。</td>
-          <td>与 panic 关联分析（T10 遗留方向）</td>
-        </tr>
-        <tr>
-          <td><b>dda0 日志积压</b></td>
-          <td><code>lpend=1679</code>（环容量 2560）、<code>latt=429</code>、
-              <code>rssi=-62</code>。日志仍在持续落盘（29 日文件 693 KB），
-              属弱网下的正常积压。</td>
-          <td>观察 <code>lpend</code> 是否长期高位不降</td>
-        </tr>
-        <tr>
-          <td><b>NFC 慢 ACK 偶发</b></td>
-          <td>06:16 / 07:12 / 07:45 出现
-              <code>slow ~1013ms ... RETRYFAIL</code>，随后刷卡仍成功。</td>
-          <td>无需处理，仅记录</td>
-        </tr>
-        <tr>
-          <td><b>T4 串口回归</b></td>
-          <td>blocked，需物理串口接入才能跑 web 连续 GET 回归。</td>
-          <td>接串口后执行</td>
-        </tr>
-      </tbody>
-    </table>
+        <div class="card card-control">
+          <div class="head-row">
+            <h3>门控制</h3>
+            <span class="hint">指令约 8 秒内由设备轮询领取</span>
+          </div>
+          <div class="btns">
+            <button id="openBtn" class="btn open" type="button">
+              <span class="btn-label">开门</span>
+              <span class="btn-sub">Open</span>
+            </button>
+            <button id="closeBtn" class="btn close" type="button">
+              <span class="btn-label">关门</span>
+              <span class="btn-sub">Close</span>
+            </button>
+          </div>
+          <div class="btn-row">
+            <button id="updateBtn" class="btn sec block-btn" type="button">立即更新固件</button>
+          </div>
+          <p class="tip" id="ctrlTip">指令 8 秒内由设备轮询领取；「立即更新」是唯一升级触发</p>
+        </div>
 
-    <div class="callout">
-      <p class="co-h">两台设备当前状态（07:50 核对）</p>
-      <table class="mini">
-        <tr><th></th><th>dda0</th><th>1388</th></tr>
-        <tr><td>fw</td><td class="mono">0.2.202609282351</td><td class="mono">0.2.202609282351</td></tr>
-        <tr><td>在线</td><td class="mono">yes (ago 2s)</td><td class="mono">yes (ago 2s)</td></tr>
-        <tr><td>uptime</td><td class="mono">5762 s</td><td class="mono">28328 s</td></tr>
-        <tr><td>nfc</td><td class="mono">ok · listen=1</td><td class="mono">ok · listen=1</td></tr>
-        <tr><td>dnsbusy</td><td class="mono">0</td><td class="mono">0</td></tr>
-        <tr><td>heap / maxblk</td><td class="mono">4176 / 2676</td><td class="mono">8252 / 5620</td></tr>
-      </table>
-    </div>
-  </section>
+        <div class="card card-cfg" id="cfgCard">
+          <div class="head-row">
+            <h3>设备配置</h3>
+            <span class="tip" id="cfgTip"></span>
+          </div>
 
-  <footer class="foot">
-    <p>生成于 2026-09-29 07:50 CST · 数据源 VPS <code>/opt/garage-gate/logs/device-garage-dda0-*.log</code></p>
-  </footer>
+          <div class="cfg-group">
+            <div class="cfg-title">连接目标</div>
+            <label for="cfgMac">车机蓝牙 MAC</label>
+            <div class="cfg-row">
+              <input id="cfgMac" type="text" placeholder="AA:BB:CC:DD:EE:FF" maxlength="17" spellcheck="false">
+              <button id="cfgMacBtn" class="btn sec sm" type="button">保存</button>
+            </div>
+          </div>
 
-</main>
-<script src="app.js"></script>
+          <div class="cfg-group">
+            <div class="cfg-title">跟踪模式</div>
+            <label for="cfgMode">保存后设备约 1.2 秒自动重启</label>
+            <div class="cfg-row">
+              <select id="cfgMode">
+                <option value="1">经典蓝牙（车机 MAC 跟踪）</option>
+                <option value="0">BLE（配对手机 IRK 跟踪）</option>
+              </select>
+              <button id="cfgModeBtn" class="btn sec sm" type="button">保存</button>
+            </div>
+          </div>
+
+          <div class="cfg-group">
+            <div class="cfg-title">经典自动跟踪</div>
+            <label>周期 Inquiry，仅经典模式生效</label>
+            <div class="cfg-row btn-pair">
+              <button id="cfgAutoOn" class="btn sec sm" type="button">开启自动跟踪</button>
+              <button id="cfgAutoOff" class="btn sec sm" type="button">关闭自动跟踪</button>
+            </div>
+          </div>
+
+          <div class="cfg-group">
+            <div class="cfg-title">手机配对</div>
+            <label>仅 BLE 模式可用</label>
+            <div class="cfg-row btn-pair">
+              <button id="cfgPairOn" class="btn sec sm" type="button">打开 90 秒</button>
+              <button id="cfgPairOff" class="btn sec sm" type="button">关闭配对</button>
+            </div>
+            <div class="cfg-row">
+              <input id="cfgPin" type="password" placeholder="6 位 PIN（留空 = 清除）" maxlength="6" inputmode="numeric" autocomplete="off">
+              <button id="cfgPinBtn" class="btn sec sm" type="button">保存 PIN</button>
+            </div>
+          </div>
+
+          <div class="cfg-group">
+            <div class="cfg-title">家庭 Wi‑Fi</div>
+            <label>经指令通道下发，仅用于设备联网 / OTA</label>
+            <div class="cfg-row">
+              <input id="cfgSsid" type="text" placeholder="SSID" maxlength="32" spellcheck="false" autocomplete="off">
+            </div>
+            <div class="cfg-row">
+              <input id="cfgPass" type="password" placeholder="密码（同 SSID 留空 = 不改）" maxlength="64" autocomplete="off">
+            </div>
+            <div class="cfg-row">
+              <button id="cfgWifiBtn" class="btn sec sm" type="button">保存并连接</button>
+            </div>
+          </div>
+
+          <div class="cfg-group">
+            <div class="cfg-title">维护</div>
+            <div class="cfg-row btn-triple">
+              <button id="cfgNfcBtn" class="btn sec sm" type="button">重新初始化 NFC</button>
+              <button id="cfgWebOff" class="btn sec sm" type="button">关闭本地网页</button>
+              <button id="cfgWebOn" class="btn sec sm" type="button">开启本地网页</button>
+            </div>
+          </div>
+
+          <p class="tip">配置经 VPS 指令队列下发，设备约 3 秒轮询领取；本地网页关闭后 80 端口不再监听，远程 / 日志 / OTA 不受影响。</p>
+        </div>
+
+        <div class="card log-card">
+          <div class="head-row">
+            <h3>设备日志</h3>
+            <div class="toolbar-actions">
+              <button id="logRefreshBtn" class="btn ghost sm" type="button">刷新</button>
+              <button id="logClearBtn" class="btn ghost sm" type="button">清除</button>
+            </div>
+          </div>
+          <p class="meta" id="logMeta"></p>
+          <pre id="logBox" class="log-box">加载中…</pre>
+          <p class="tip" id="logClearTip"></p>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
 </body>
 </html>
