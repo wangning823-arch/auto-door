@@ -1339,7 +1339,7 @@ static void handleSerial() {
           Wire.end();
           pinMode(sdaP, INPUT_PULLUP);
           pinMode(sclP, INPUT_PULLUP);
-          Wire.begin(sdaP, sclP);
+          Wire.begin(sdaP, sclP, (uint32_t)NFC_I2C_HZ);
           Wire.setTimeOut(50);
           int lvlSda = digitalRead(sdaP), lvlScl = digitalRead(sclP);
           int found = 0;
@@ -1363,7 +1363,7 @@ static void handleSerial() {
         }
         Serial.printf("[I2C] multi-scan done total=%d\n", total);
         Wire.end();
-        Wire.begin(PIN_NFC_SDA, PIN_NFC_SCL);
+        Wire.begin(PIN_NFC_SDA, PIN_NFC_SCL, (uint32_t)NFC_I2C_HZ);
         // 不调用 gNfc.begin()：会清掉已 PN532 ready 的状态
         }
       } else if (line == "sclhold") {

@@ -145,19 +145,29 @@ static void releaseBus(int sda, int scl) {
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);  // 禁止把 1000ms 超时泄漏到下一轮
 }
 
+// 松手 +（仅当总线不空闲时）把卡住的字节时钟排出去。
+// 背景：长线上字节中途超时，Wire.end 只是 ESP 松手，PN532 停在半截
+// 事务里仍拉着 SCL——裸 releaseBus 等于把一个"半个字节"的芯片留在总线上，
+// 下一轮 init 必然撞上 bus low。空闲时不做 9-clock（会弄乱空闲 PN532）。
+static void releaseAndClear(int sda, int scl) {
+  releaseBus(sda, scl);
+  if (!busIdle(sda, scl)) i2cBusRecover(sda, scl);
+}
+
 // init 失败统一收尾：松手 + 计失败
 // 必须上送 VPS：原先只打串口，远程只见 auto-retry 看不到第一现场
 static void failRelease(const char* why, int sda, int scl, uint16_t* streak) {
   int sclLv = digitalRead(scl);
   Serial.printf("[NFC] FAIL %s SCL=%d → Wire.end\n", why, sclLv);
   logShipf("[NFC] FAIL %s SCL=%d", why, sclLv);
-  releaseBus(sda, scl);
+  releaseAndClear(sda, scl);  // 失败时芯片多半停在半截字节，必须排掉
   if (*streak < 60000) (*streak)++;
 }
 
 // 在场探测：必须用「地址 ACK」，不能用读应答。
 // PN532 空闲无数据时，读 0x24 会 NACK（协议如此），曾被误判为「未接模块」
 // → absent_ + autoRetry 打满 → 永久不再 init（今早 NFC 失灵的根因）。
+static void nfcPulse9Clk();  // 定义在下方；probe 每轮结束要用它排半截字节
 bool NfcReader::probePresent() {
   if (sda_ < 0) return false;
   releaseBus(sda_, scl_);
@@ -165,7 +175,7 @@ bool NfcReader::probePresent() {
     i2cBusRecover(sda_, scl_);
     if (!busIdle(sda_, scl_)) return false;
   }
-  Wire.begin(sda_, scl_, (uint32_t)100000);
+  Wire.begin(sda_, scl_, (uint32_t)NFC_I2C_HZ);
   Wire.setTimeOut(NFC_PROBE_TIMEOUT_MS);
   forceIdlePullups(sda_, scl_);
 
@@ -175,10 +185,13 @@ bool NfcReader::probePresent() {
     Wire.beginTransmission(addr);
     // endTransmission()==0 表示从机 ACK 了地址（芯片在；与是否有数据无关）
     if (Wire.endTransmission() == 0) hits++;
+    // 长线上地址探测也可能把芯片留在半截字节：每轮结束先看总线，
+    // 不空闲就时钟排出，别让下一轮在"半个字节"上叠加错误
+    if (!busIdle(sda_, scl_)) nfcPulse9Clk();
     delay(5);
   }
   Wire.setTimeOut(200);
-  releaseBus(sda_, scl_);
+  releaseAndClear(sda_, scl_);
   forceIdlePullups(sda_, scl_);
   return hits > 0;
 }
@@ -473,7 +486,7 @@ static void pn532Drain() {
 static void nfcRewire(int sda, int scl) {
   releaseBus(sda, scl);
   delay(25);
-  Wire.begin(sda, scl, (uint32_t)100000);
+  Wire.begin(sda, scl, (uint32_t)NFC_I2C_HZ);
   Wire.setTimeOut(NFC_WIRE_TIMEOUT_MS);
   forceIdlePullups(sda, scl);
   delay(15);
@@ -525,7 +538,7 @@ bool NfcReader::recoverBusAndResync() {
       return false;
     }
   }
-  Wire.begin(sda_, scl_, (uint32_t)100000);
+  Wire.begin(sda_, scl_, (uint32_t)NFC_I2C_HZ);
   // init 可以宽一点，结束前必须收回短超时，否则 isready NACK 会拖成 1s 级慢 ACK
   Wire.setTimeOut(1000);
   delay(50);
@@ -654,7 +667,7 @@ bool NfcReader::hwInit() {
   // begin() 后芯片可能仍在 SAMConfig 忙，先松手再读 ver，避免首读固定 1.3s 超时
   releaseBus(sda_, scl_);
   delay(50);
-  Wire.begin(sda_, scl_, (uint32_t)100000);
+  Wire.begin(sda_, scl_, (uint32_t)NFC_I2C_HZ);
   Wire.setTimeOut(1000);
   gpio_set_pull_mode((gpio_num_t)sda_, GPIO_PULLUP_ONLY);
   gpio_set_pull_mode((gpio_num_t)scl_, GPIO_PULLUP_ONLY);
@@ -688,7 +701,7 @@ bool NfcReader::hwInit() {
       deferred_ = true;
       return false;
     }
-    Wire.begin(sda_, scl_, (uint32_t)100000);
+    Wire.begin(sda_, scl_, (uint32_t)NFC_I2C_HZ);
     Wire.setTimeOut(1000);
     delay(200);
     nfc.begin();
