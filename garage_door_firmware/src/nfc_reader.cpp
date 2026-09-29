@@ -832,13 +832,54 @@ void NfcReader::unlockBus() {
   if (busMux_) xSemaphoreGive(busMux_);
 }
 
+void NfcReader::busClearForReset() {
+  // 纯 GPIO 总线清洁，供软复位前调用。三条硬约束：
+  //  1) 不走 Wire、不发 PN532 命令——不会有 ACK 等待/1s 超时，不会卡死 loop/OTA；
+  //  2) 不查结果——芯片死了也照样 <2ms 结束，只求把总线交回空闲态；
+  //  3) 背景：OTA 软重启 3 次有 2 次把 PN532 卡死（SCL 被按住，只能断电救），
+  //     根因是复位落在 I2C 事务中间，芯片状态机停在半截字节后拉住 SCL。
+  //     挂起任务（suspended_）如果只停不清理，恰好制造这个条件。
+  if (sda_ < 0 || scl_ < 0) return;
+  Wire.end();
+  gpio_reset_pin((gpio_num_t)scl_);
+  gpio_reset_pin((gpio_num_t)sda_);
+  digitalWrite(scl_, HIGH);  // 先写输出寄存器再改模式，避免低毛刺
+  pinMode(scl_, OUTPUT);
+  delayMicroseconds(50);
+  digitalWrite(sda_, HIGH);
+  pinMode(sda_, OUTPUT);
+  delayMicroseconds(50);
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 9; i++) {
+      digitalWrite(scl_, LOW);
+      delayMicroseconds(80);
+      digitalWrite(scl_, HIGH);
+      delayMicroseconds(80);
+    }
+    digitalWrite(sda_, LOW);  // STOP 位
+    delayMicroseconds(80);
+    digitalWrite(sda_, HIGH);
+    delayMicroseconds(80);
+  }
+  forceIdlePullups(sda_, scl_);
+  delay(20);  // 给从机一点时间把状态机走完
+}
+
 void NfcReader::stopForOta() {
-  // 只挂起，绝不做 I2C：总线异常/场状态怪异时，这里写命令会 1s 超时，
-  // 与 NFC 任务抢 Wire 锁还可能把 loop 卡死在 OTA 下载之前。
   suspended_ = true;
   listen_ = false;
   s_inlistOpen = false;
-  Serial.println("[NFC] stopForOta: suspend only (no I2C)");
+  // 先拿总线锁（短超时）：NFC 任务可能正卡在 Wire 的 1s 超时里，
+  // 拿不到就跳过清洁——绝不和它抢 Wire。锁在手 = 没有在途事务，此时
+  // 做纯 GPIO 清洁是安全的（无 ACK 等待，不会引入新的卡死点）。
+  bool got = !busMux_ || xSemaphoreTake(busMux_, pdMS_TO_TICKS(200)) == pdTRUE;
+  if (got) {
+    busClearForReset();
+    if (busMux_) xSemaphoreGive(busMux_);
+    logShipf("[NFC] OTA quiet: bus cleared, chip idle for soft reset");
+  } else {
+    Serial.println("[NFC] stopForOta: suspended (bus busy, skip clear)");
+  }
 }
 
 void NfcReader::pushCard(const String& uid) {

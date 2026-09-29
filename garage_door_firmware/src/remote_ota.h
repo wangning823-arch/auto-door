@@ -7,6 +7,9 @@
 // 写 flash 期间暂停 Inquiry/NFC（由回调通知 main）。
 
 using OtaBusyFn = void (*)(bool active);
+// 软复位前钩子：每次 ESP.restart() 之前调用（成功/失败/BT拆栈恢复三条路径），
+// 用来把 NFC 总线清到空闲，避免复位落在 I2C 事务中间把 PN532 卡死
+using OtaPreResetFn = void (*)();
 
 void remoteOtaBegin(ConfigStore* cfg = nullptr);
 // 开机即预留 4KB 连续 8BIT 堆，OTA Update.begin 前让出——
@@ -19,6 +22,7 @@ void remoteOtaReserveGive();
 void remoteOtaReserveRearm();
 bool remoteOtaReserveHeld();
 void remoteOtaSetBusyHook(OtaBusyFn fn);
+void remoteOtaSetPreResetHook(OtaPreResetFn fn);
 // btBusy / wifiOk 语义同 remoteCmdService
 void remoteOtaService(bool btBusy, bool wifiOk);
 // 串口 ota check 立刻查一次

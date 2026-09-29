@@ -170,6 +170,7 @@ static void onRemoteCmd(const char* raw) {
       return;
     }
     logShipf("[REMOTE] reboot -> soft reset (ring kept in RTC)");
+    gNfc.stopForOta();  // 复位前清 NFC 总线，防 PN532 半截事务卡死
     delay(200);  // 让串口把这行打完，便于现场对照
     ESP.restart();
     return;
@@ -1439,6 +1440,9 @@ static void handleSerial() {
   }
 }
 
+// OTA 的三条软复位路径（成功/失败/BT拆栈恢复）在 ESP.restart() 前统一回调这里
+static void otaPreResetNfc() { gNfc.stopForOta(); }
+
 void setup() {
   Serial.begin(SerialBaud);
   delay(200);
@@ -1500,7 +1504,10 @@ void setup() {
   remoteOtaSetBusyHook([](bool on) {
     gOtaActive = on;
     if (on) {
-      gNfc.setSuspended(true);  // 不碰 I2C，避免 OTA 启动时卡死
+      // 挂起 + 清总线：只挂起不清理会把 PN532 留在半截 I2C 事务里，
+      // 软复位后它拉住 SCL（OTA 软重启 3 次卡死 2 次的根因）。
+      // stopForOta 只做纯 GPIO（无 ACK 等待/超时），不会卡死 OTA。
+      gNfc.stopForOta();
       if (gBtStackInited) {
         gBt.setInquiryPaused(true);  // 内部会 cancel discovery，非阻塞
       }
@@ -1511,6 +1518,7 @@ void setup() {
       else gNfc.kickRecover();
     }
   });
+  remoteOtaSetPreResetHook(otaPreResetNfc);
   if (gCfg.loadRemote(false)) {
     remoteCmdSetEnabled(true);
   } else {

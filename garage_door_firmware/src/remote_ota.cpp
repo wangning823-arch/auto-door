@@ -24,6 +24,7 @@
 
 static ConfigStore* s_cfg = nullptr;
 static OtaBusyFn s_busyFn = nullptr;
+static OtaPreResetFn s_preResetFn = nullptr;
 static bool s_force = false;
 static bool s_active = false;
 static bool s_done = false;
@@ -96,6 +97,12 @@ void remoteOtaBegin(ConfigStore* cfg) {
 }
 
 void remoteOtaSetBusyHook(OtaBusyFn fn) { s_busyFn = fn; }
+void remoteOtaSetPreResetHook(OtaPreResetFn fn) { s_preResetFn = fn; }
+
+// 所有 ESP.restart() 前统一收尾：先清 NFC 总线再重启
+static void preResetNfcQuiet() {
+  if (s_preResetFn) s_preResetFn();
+}
 
 void remoteOtaCheckNow() {
   s_force = true;
@@ -513,6 +520,7 @@ static void otaAttempt(const String& remoteSha) {
     // 真正 POST 出去再重启，否则日志全丢
     logShipFlushNow();
     if (s_busyFn) s_busyFn(true);
+    preResetNfcQuiet();  // 复位前把 NFC 总线清空闲，防 PN532 半截事务卡死
     delay(300);
     ESP.restart();
   }
@@ -608,6 +616,7 @@ static void doOta() {
       s_radioDown = false;
       logShipf("[OTA] begin fail -> reboot to restore BT");
       logShipFlushNow();
+      preResetNfcQuiet();
       delay(300);
       ESP.restart();
     }
@@ -628,6 +637,7 @@ static void doOta() {
     s_radioDown = false;
     logShipf("[OTA] bt down -> reboot to restore");
     logShipFlushNow();
+    preResetNfcQuiet();
     delay(300);
     ESP.restart();
   }

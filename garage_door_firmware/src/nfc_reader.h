@@ -25,7 +25,7 @@ class NfcReader {
   // OTA 写 flash / 总线占用时暂停任务
   void setSuspended(bool on) { suspended_ = on; }
   bool suspended() const { return suspended_; }
-  // OTA 前停掉片上 InList 并松总线，避免重启后 SCL 被按死
+  // OTA 写 flash / 总线占用时暂停任务，并把总线清到空闲态再交给软复位
   void stopForOta();
 
   // 是否探测到 IRQ 线
@@ -60,6 +60,8 @@ class NfcReader {
   bool detectIrqWired();
   bool lockBus(uint32_t timeoutMs = 1000);
   void unlockBus();
+  // 纯 GPIO 总线清洁：推挽 9-clock×N + STOP，不走 Wire、不等 ACK（<2ms，无超时风险）
+  void busClearForReset();
   void pushCard(const String& uid);
   static void taskTrampoline(void* arg);
   void taskLoop();

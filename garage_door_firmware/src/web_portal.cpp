@@ -1257,6 +1257,7 @@ void WebPortal::loop() {
       (int32_t)(millis() - modeRebootAtMs_) >= 0) {
     modeRebootPending_ = false;
     Serial.println("[WEB] reboot for exclusive classic/BLE stack...");
+    if (nfc_) nfc_->stopForOta();  // 复位前清 NFC 总线，防 PN532 半截事务卡死
     delay(100);
     ESP.restart();
   }
