@@ -221,23 +221,36 @@ void logShipPrintln(const String& line) {
 }
 
 void logShipf(const char* fmt, ...) {
-  char buf[192];
+  // 256 而非 192：心跳行实测 188~190B，rssi/seen/open_ts 位数一涨就 ≥191。
+  // 旧实现 192B 缓冲 + "截断就不进环"会把整条丢掉——1388 升级后 8s 一条的心跳
+  // 只发出去 3 条（恰好都是 188~190B 的短行），带 seen=87552 的全军覆没，
+  // 串口侧又因 FIFO 满不打 → 远程彻底看不到心跳。
+  char buf[256];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  size_t n = strlen(buf);
-  if (n + 1 < sizeof(buf)) {
-    buf[n] = '\n';
-    buf[n + 1] = '\0';
-    ringLock();
-    ringPush(buf, n + 1);
-    ringUnlock();
+  if (n < 0) return;
+  size_t len = (size_t)n;
+  if (len >= sizeof(buf)) len = sizeof(buf) - 1;  // 超长：拿截断结果，也好过不发
+  if (len + 1 >= sizeof(buf)) {
+    // 截断后连 '\n' 都放不下：压掉最后一个字符也要保证环里是完整一行
+    buf[sizeof(buf) - 2] = '\n';
+    buf[sizeof(buf) - 1] = '\0';
+    len = sizeof(buf) - 2;
+  } else {
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
   }
-  // 心跳/诊断必须恒发 VPS：旧实现串口 FIFO 满时整个 logShipf 被门控，
-  // 1388（无串口主机）8 小时 0 条 [LOG] 心跳，断网期 sta/rssi 面包屑全丢。
-  // 串口只在有余量时打，阻塞风险由门控承担，环推送不受影响。
-  if (Serial.availableForWrite() > 96) Serial.println(buf);
+  ringLock();
+  ringPush(buf, len + 1);
+  ringUnlock();
+  // 心跳/诊断必须恒发 VPS：串口只在 TX FIFO 有余量时打，阻塞风险由门控承担，
+  // 环推送不受影响（1388 无串口主机，旧写法把整个 logShipf 门控掉了）。
+  if (Serial.availableForWrite() > 96) {
+    buf[len] = '\0';  // println 自带换行，别打两个空行
+    Serial.println(buf);
+  }
 }
 
 size_t logShipPending() {
