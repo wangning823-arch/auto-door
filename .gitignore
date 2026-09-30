@@ -43,6 +43,7 @@ tools/logs_*.json
 tools/cmp_*.json
 tools/deep_*.json
 tools/*_snap.json
+tools/offline_*.json
 
 # 密码/密钥（VPS 上用 ui_password 文件，勿提交）
 ui_password
