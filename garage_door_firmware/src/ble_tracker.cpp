@@ -1,6 +1,7 @@
 #include "ble_tracker.h"
 #include "config.h"
 #include "http_client.h"
+#include "log_ship.h"
 #include "remote_ota.h"
 #include "BluetoothSerial.h"
 #include <esp_bt.h>
@@ -19,16 +20,42 @@ static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;
 static bool gBtReady = false;
 
-// Inquiry 起步要 BTU 连续 4112B。气囊若还占着、最大块又盖不住 → 先归还，
-// 再 start_discovery。避免「失败才救、下一轮又 rearm 收回」导致 maxblk 长期 4084。
-// 容量见 OTA_RESERVE_SIZE（20260930 起 12KB）：4352 归还后 max8 只有 ~4340
-// 会被并发分配吃掉，Give 后必须留下 >4112 的连续余量。
-static void ensureBtuHeapForInquiry() {
-  if (!remoteOtaReserveHeld()) return;
-  const uint32_t largest8 =
-      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  if (largest8 < OTA_RESERVE_SIZE + 128) remoteOtaReserveGive();
+// ===== Inquiry 同步 BT 气囊（不降低 inquiry 频率）=====
+// 根因：片内稳态最大连续块常 2804~4084，BTU inquiry 要 4112 → 总差一口气。
+// 1243「开机 hold 12KB」把外面挤到 1908，更糟；1435 停 hold 后又没有可归还块。
+// 方案：单独一块 8192，**启动 inquiry 前一定 free**（给 BTU/WiFi 连续区），
+// **inquiry 结束后尽量 re-hold**（下一轮还有缓冲）。周期仍约 3s，不降频。
+static const uint32_t kBtAirSize = 8192;
+static void* s_btAir = nullptr;
+
+static uint32_t btLargest8() {
+  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
+
+static void btAirTryHold() {
+  if (s_btAir) return;
+  // 只有池子够大才占；否则宁可空着，也不把 maxblk 再挤碎
+  if (btLargest8() < kBtAirSize + 2048) return;
+  s_btAir = malloc(kBtAirSize);
+  if (s_btAir) {
+    logShipf("[HEAP] BT air held sz=%u max8=%u", (unsigned)kBtAirSize,
+             (unsigned)btLargest8());
+  }
+}
+
+static void btAirDropForInquiry() {
+  if (s_btAir) {
+    free(s_btAir);
+    s_btAir = nullptr;
+    logShipf("[HEAP] BT air drop for inquiry max8=%u", (unsigned)btLargest8());
+  }
+  // OTA 共用气囊若还占着、也盖不住 → 一并让出（与 1435 策略兼容）
+  if (remoteOtaReserveHeld() && btLargest8() < OTA_RESERVE_SIZE + 128) {
+    remoteOtaReserveGive();
+  }
+}
+
+static void ensureBtuHeapForInquiry() { btAirDropForInquiry(); }
 
 static String macToStr(const uint8_t* bda) {
   char buf[18];
@@ -288,7 +315,10 @@ void BleTracker::onInquiryDone() {
       updateZone();
     }
   }
+  // 本轮 inquiry 结束后立刻尝试收回 BT 气囊（不降频，只为下一轮准备连续块）
+  btAirTryHold();
   if (discRunning_ && !millisReached(millis(), discEndMs_ + 1) && !inquiryPaused_) {
+    ensureBtuHeapForInquiry();
     inquiryBusy_ = true;
     inquiryStartMs_ = millis();
     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 3, 0);
@@ -444,6 +474,10 @@ void BleTracker::loop() {
   // 显式暂停时才停后台跟踪；SoftAP 慢速模式仍要扫（否则手机连热点时车走了永远不关）
   if (!autoTrack_ || inquiryPaused_ || !gBtReady || !targetSet_ || discRunning_ ||
       inquiryBusy_) {
+    // 跟踪空闲时尽量把 BT 气囊占住，供下一轮 inquiry 归还
+    if (autoTrack_ && gBtReady && targetSet_ && !inquiryBusy_ && !discRunning_) {
+      btAirTryHold();
+    }
     return;
   }
   if (millisReached(now, nextInquiryMs_)) {
@@ -466,6 +500,7 @@ void BleTracker::loop() {
     if (err != ESP_OK) {
       inquiryBusy_ = false;
       inquiryStartMs_ = 0;
+      btAirTryHold();
     }
   }
 }
