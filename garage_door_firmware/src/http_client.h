@@ -17,9 +17,9 @@ enum HttpOwner {
 using HttpBtBusyFn = bool (*)();
 
 // worker 等 inquiry/BLE 空隙的上限：超时仍忙则放弃本单（-13），不推迟 inquiry
-// 约 0.5s：对应 inquiry 3s 周期里 ~2.5s 占用后的空窗
+// 约 1.5s：inquiry 约 2.5s / 周期 4s → 空窗约 1.5s 给 HTTP
 #ifndef HTTP_BT_GAP_WAIT_MS
-#define HTTP_BT_GAP_WAIT_MS 500
+#define HTTP_BT_GAP_WAIT_MS 1500
 #endif
 
 // 连续网络层失败（code<0：DNS/connect/读超时）达此数 → 数据面看门狗强制重连

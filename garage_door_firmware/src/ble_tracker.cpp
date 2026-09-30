@@ -515,12 +515,12 @@ void BleTracker::loop() {
     return;
   }
   if (millisReached(now, nextInquiryMs_)) {
-    // Inquiry 优先：3s 节奏不被 HTTP 推迟（弱网下 poll 可能占满 radioBusy，
-    // 旧逻辑推迟 inquiry 会拖自动开门）。HTTP 在空窗发送，发不完就放弃。
+    // Inquiry 优先：4s 节奏（约 2.5s 占用 + 1.5s 空窗给 HTTP），不被 HTTP 推迟。
+    // HTTP 在空窗发送，发不完就放弃。
     ensureBtuHeapForInquiry();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
-    uint32_t gap = inquirySlow_ ? 15000 : 3000;
+    uint32_t gap = inquirySlow_ ? 15000 : 4000;
     nextInquiryMs_ = now + gap;
     uint8_t len = inquirySlow_ ? 1 : 2;  // 1≈1.28s，短一些少打网页
     esp_err_t err =

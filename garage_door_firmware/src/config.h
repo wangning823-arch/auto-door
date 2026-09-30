@@ -36,9 +36,9 @@
 #define REMOTE_POLL_URL "http://door.wzx.homes/dev/poll"
 #endif
 // 连接/读超时（HTTP 轮询）
-// 弱网策略：只在 inquiry 空窗（约 0.5s）发 HTTP；发不完就放弃，不拖 inquiry
+// 弱网策略：inquiry 约 4s 一轮（占用 ~2.5s），空窗约 1.5s 发 HTTP；发不完就放弃
 #ifndef REMOTE_POLL_TIMEOUT_MS
-#define REMOTE_POLL_TIMEOUT_MS 500
+#define REMOTE_POLL_TIMEOUT_MS 1500
 #endif
 // ===== 日志上报 / 在线 OTA（HTTP 明文，与轮询同一 nginx 放行策略）=====
 #ifndef LOG_SHIP_URL
@@ -64,8 +64,9 @@
 #define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // 保留宏，不再用于自动触发
 #endif
 // 轮询周期须明显小于服务端 TTL（60s，2026-09-27 由 25s 放宽；见 garage_gate.py）
+// 弱网 inquiry 优先：周期可略长于 inquiry 空窗，由 100ms 级重试补空窗
 #ifndef REMOTE_POLL_INTERVAL_MS
-#define REMOTE_POLL_INTERVAL_MS 3000
+#define REMOTE_POLL_INTERVAL_MS 4000
 #endif
 #ifndef REMOTE_CMD_ENABLE_DEFAULT
 #define REMOTE_CMD_ENABLE_DEFAULT 0
