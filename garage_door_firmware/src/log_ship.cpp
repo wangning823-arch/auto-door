@@ -74,6 +74,8 @@ static size_t safeChunk() {
   if (largest <= floor_need) return 0;  // 连最小片的余量都保不住，下轮再试
   size_t cap = (largest - floor_need) / 4;
   if (cap > LOG_SHIP_CHUNK) cap = LOG_SHIP_CHUNK;
+  // 弱网 inquiry 空窗只有 ~1.5s：堆不宽裕时用小片，避免 POST 撞窗被放弃
+  if (largest < 8000 && cap > 256) cap = 256;
   if (cap < LOG_SHIP_CHUNK_MIN) cap = LOG_SHIP_CHUNK_MIN;
   return cap;
 }
@@ -107,6 +109,8 @@ static String s_snap;                 // 在飞的请求快照（失败时塞回
 static SemaphoreHandle_t s_mtx = nullptr;  // NFC 任务写 / loop 读写
 static IPAddress s_shipIp;             // 预解析缓存：flush 走 IP 直连，跳过 DNS
 static bool s_shipIpOk = false;
+
+void logShipPoke() { s_nextMs = 0; }
 
 // ===== flush/service 静态缓冲（第一刀：去 String 堆分配）=====
 // 1388 周期 rst=4 panic 指纹：loopTask phase=ls.flush + nfc.probe + http.io，

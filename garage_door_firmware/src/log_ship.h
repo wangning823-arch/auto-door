@@ -12,6 +12,8 @@ void logShipPrintln(const String& line);
 // btBusy: Inquiry/BLE 扫描中 → 不发网络
 // wifiOk: STA 已连
 void logShipService(bool btBusy, bool wifiOk);
+// 堆从 thin 恢复后立刻尝试补发（s_nextMs=0）
+void logShipPoke();
 // 同步 flush：立刻 HTTP POST（OTA 重启前 / 串口 logs flush）
 void logShipFlushNow();
 // 预解析日志服务器 IP 并缓存（OTA 开始时网络正常时调用）：

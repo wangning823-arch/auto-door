@@ -1793,6 +1793,14 @@ void loop() {
     const bool heapThin = maxblkNow < 4600;
     const bool btQuiet =
         gBtStackInited && (btBusy || gBt.btQuietForHttp() || heapThin);
+    // 堆从 thin 恢复：立刻 poke log_ship，避免弱网下 30s 周期一直错过空窗
+    static bool wasHeapThin = false;
+    if (heapThin) {
+      wasHeapThin = true;
+    } else if (wasHeapThin) {
+      wasHeapThin = false;
+      logShipPoke();
+    }
     remoteCmdService(btQuiet, gWeb.staConnected());
     logShipService(btQuiet, gWeb.staConnected());
     remoteOtaService(btBusy, gWeb.staConnected());
