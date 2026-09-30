@@ -16,8 +16,10 @@
 // 自动 Inquiry 回调丢失时的强清超时（len≈2 → 约 2.6s；留足余量）
 static const uint32_t INQUIRY_STUCK_MS = 8000;
 // 方向A：inquiry 结束后再静默一小段，给 BTU 异步 malloc(4112) 留连续块
-// dda0 实测 800ms 后数据面仍抢块 → 拉到 1500ms
-static const uint32_t POST_INQUIRY_QUIET_MS = 1500;
+// 注意：inquiry 周期 4000ms、len=2≈2560ms，quiet 必须 < 4000-2560，
+// 否则 HTTP/status/log 窗口被吃光（1388 OTA 0.2.202610010712 实锤：
+// quiet=1500 后 20min 零日志；恢复 800ms 才有空窗）。
+static const uint32_t POST_INQUIRY_QUIET_MS = 800;
 
 static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;

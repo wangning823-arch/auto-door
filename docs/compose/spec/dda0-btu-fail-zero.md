@@ -62,9 +62,9 @@ dda0 关键现象：
    - `autoTrack` 期间继续禁止 OTA 气囊 rearm（保持现状）。
 
 4. **配套**
-   - `POST_INQUIRY_QUIET_MS`：`800 → 1500`，给 BTU 异步 malloc + 减少静默窗内数据面抢块。
+   - `POST_INQUIRY_QUIET_MS` 保持 **800ms**（勿改 1500）：inquiry 周期 4000ms、len=2≈2560ms，静默必须留出 HTTP 空窗；否则 status/log 全堵（1388 实锤）。
    - inquiry 前堆薄路径：继续暂停 `log/status/remoteCmd`（已有）；应急 free 后若仍薄，**同一 inquiry 内不再二次分配大包**。
-   - 1388 健康路径：`largest8≥4112` 时**不释放**应急块，避免无谓碎片与行为回退。
+   - 1388 健康路径：`largest8≥4112` 时**不释放**应急块；静默窗恢复后日志可继续上报。
 
 5. **OTA / 验证流程**
    - 版本号继续走 `bump_version.py` → `FW_VERSION`，与 `version.json` 一致。
