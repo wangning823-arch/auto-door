@@ -40,10 +40,11 @@
 #define LOG_SHIP_CHUNK_MIN 96
 #endif
 
-// 分配期的固定开销：4 份 String 各 ~16B 块头 + req 的 160B 请求头 = 256。
-// 并发余量 CHURN_SLACK：测量 largest 与实际 4 次分配之间，wifi/NFC 任务可能
+// 分配期的固定开销：flush/service 路径已改静态缓冲后，剩余堆分配主要在
+// httpSubmitPost 的 HttpJob（已 nothrow）与 WiFiClient 内部。
+// 仍保留 CHURN_SLACK：测量 largest 与实际发送之间，wifi/NFC 任务可能
 // 已经吃掉一部分（dda0 弱网时每天 80 次 forceStaReconnect + NFC 无休止
-// auto-retry 持续搅动堆）。零余量公式 cap=(L-192)/4 会让 need 恰好等于 L，
+// auto-retry 持续搅动堆）。零余量公式会让 need 恰好等于 L，
 // 测量值稍一变化就拷贝失败 → 提交前 return → 一包不出网且永不自愈
 // （20260928 dda0：重启后 1-2 分钟有日志，之后 38 分钟零 POST）。
 #define LOG_SHIP_OVERHEAD 256
@@ -102,10 +103,26 @@ static RTC_NOINIT_ATTR uint32_t s_rtcMagic;
 static uint32_t s_nextMs = 0;
 static int s_failStreak = 0;
 static bool s_inFlight = false;      // 快照已提交、结果未收
-static String s_snap;                 // 在飞的请求快照（失败时塞回）
+static String s_snap;                 // 在飞的请求快照（失败时塞回）；仅 service 路径用
 static SemaphoreHandle_t s_mtx = nullptr;  // NFC 任务写 / loop 读写
 static IPAddress s_shipIp;             // 预解析缓存：flush 走 IP 直连，跳过 DNS
 static bool s_shipIpOk = false;
+
+// ===== flush/service 静态缓冲（第一刀：去 String 堆分配）=====
+// 1388 周期 rst=4 panic 指纹：loopTask phase=ls.flush + nfc.probe + http.io，
+// maxblk≈3KB 时 String host/path/body/req/raw 在碎片堆上可能走库内 abort。
+// logShipf 本身已是栈缓冲；这里把 flush 整条链和 service 的环拷贝改成静态块。
+// body 用 RTC 段旁的普通静态即可：flush 与 service 不会并发拷环（同在 loopTask）。
+#define LOG_SHIP_HOST_CAP 64
+#define LOG_SHIP_PATH_CAP 128
+#define LOG_SHIP_HDR_CAP 288
+#define LOG_SHIP_RAW_CAP 512
+
+static char s_hostBuf[LOG_SHIP_HOST_CAP];
+static char s_pathBuf[LOG_SHIP_PATH_CAP];
+static char s_hdrBuf[LOG_SHIP_HDR_CAP];
+static char s_rawBuf[LOG_SHIP_RAW_CAP];
+static char s_bodyBuf[LOG_SHIP_RING_BYTES];  // 环头拷贝；service 回填也用它
 
 // RTC 段合法性：magic 对且长度在界内（掉电后两者都是垃圾）
 static bool rtcRingOk() {
@@ -287,32 +304,53 @@ size_t logShipPending() {
   return n;
 }
 
-// 解析 LOG_SHIP_URL → host/port/path
-static void parseLogUrl(String* host, uint16_t* port, String* path) {
-  *host = LOG_SHIP_HOST;
-  *port = 80;
-  *path = "/dev/logs";
-  String url = LOG_SHIP_URL;
-  if (!url.startsWith("http://")) return;
-  String rest = url.substring(7);
-  int slash = rest.indexOf('/');
-  String hp = slash >= 0 ? rest.substring(0, slash) : rest;
-  *path = slash >= 0 ? rest.substring(slash) : String("/dev/logs");
-  int c = hp.indexOf(':');
-  if (c >= 0) {
-    *host = hp.substring(0, c);
-    *port = (uint16_t)atoi(hp.substring(c + 1).c_str());
-  } else {
-    *host = hp;
+// 解析 LOG_SHIP_URL → host/port/path（纯 char，不碰堆）
+static void parseLogUrlBuf(char* host, size_t hostCap, uint16_t* port,
+                           char* path, size_t pathCap) {
+  if (hostCap) {
+    strncpy(host, LOG_SHIP_HOST, hostCap - 1);
+    host[hostCap - 1] = '\0';
+  }
+  if (port) *port = 80;
+  if (pathCap) {
+    strncpy(path, "/dev/logs", pathCap - 1);
+    path[pathCap - 1] = '\0';
+  }
+  const char* url = LOG_SHIP_URL;
+  if (strncmp(url, "http://", 7) != 0) return;
+  const char* rest = url + 7;
+  const char* slash = strchr(rest, '/');
+  const char* hpEnd = slash ? slash : (rest + strlen(rest));
+  const char* colon = (const char*)memchr(rest, ':', (size_t)(hpEnd - rest));
+  if (hostCap) {
+    const char* hBegin = rest;
+    const char* hEnd = colon ? colon : hpEnd;
+    size_t hl = (size_t)(hEnd - hBegin);
+    if (hl >= hostCap) hl = hostCap - 1;
+    memcpy(host, hBegin, hl);
+    host[hl] = '\0';
+  }
+  if (port && colon) *port = (uint16_t)atoi(colon + 1);
+  if (pathCap && slash) {
+    strncpy(path, slash, pathCap - 1);
+    path[pathCap - 1] = '\0';
   }
 }
 
-static void buildPath(String* path) {
-  if (path->indexOf("id=") < 0) {
-    *path += (path->indexOf('?') >= 0 ? '&' : '?');
-    *path += "id=";
-    *path += deviceId();
-  }
+static void buildPathBuf(char* path, size_t cap) {
+  if (!path || cap < 2) return;
+  if (strstr(path, "id=")) return;
+  size_t len = strlen(path);
+  if (len + 16 >= cap) return;
+  const char* sep = strchr(path, '?') ? "&" : "?";
+  snprintf(path + len, cap - len, "%sid=%s", sep, deviceId());
+}
+
+// 从 HTTP 响应行取状态码："HTTP/1.1 200 OK" → 200
+static int parseHttpStatusBuf(const char* raw) {
+  const char* sp = strchr(raw, ' ');
+  if (!sp) return -1;
+  return atoi(sp + 1);
 }
 
 // 预解析日志服务器 IP：必须在网络正常、非停滞上下文调用（如 OTA 入口）。
@@ -349,29 +387,49 @@ void logShipResolve() {
   }
 }
 
+// 受控发送：200ms 一片、每片喂狗，总预算 3s；发不完返回 false（日志留环）
+static bool shipSendAll(int sfd, const char* data, size_t total, uint32_t budgetMs) {
+  size_t sent = 0;
+  uint32_t st0 = millis();
+  while (sent < total) {
+    esp_task_wdt_reset();
+    if (millis() - st0 > budgetMs) return false;
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(sfd, &wset);
+    struct timeval tv = {0, 200000};
+    int r = select(sfd + 1, nullptr, &wset, nullptr, &tv);
+    if (r < 0) return false;
+    if (r > 0 && FD_ISSET(sfd, &wset)) {
+      int n = send(sfd, data + sent, total - sent, MSG_DONTWAIT);
+      if (n > 0) {
+        sent += (size_t)n;
+      } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // 同步刷出（OTA 重启前专用）：worker 可能还有在飞，重复发一遍无害（幂等追加）
 // [FLUSH] 打点用于定位 TWT：崩溃时串口最后一条 FLUSH 行 = 卡住的段
+// 第一刀：整条链去 String —— host/path/body/req/raw 全走静态缓冲，
+// 头与 body 分开发，不再拼成一块大 req（碎片堆上 String 拼接是 abort 源之一）。
 void logShipFlushNow() {
   uint32_t t0 = millis();
   crashSnapMark("ls.flush");
   Serial.printf("[FLUSH] enter t=%u\n", (unsigned)t0);
   s_nextMs = 0;
-  String host, path;
   uint16_t port = 80;
-  parseLogUrl(&host, &port, &path);
-  buildPath(&path);
+  parseLogUrlBuf(s_hostBuf, sizeof(s_hostBuf), &port, s_pathBuf,
+                 sizeof(s_pathBuf));
+  buildPathBuf(s_pathBuf, sizeof(s_pathBuf));
 
   ringLock();
-  String body;
-  // 同样分片 + 自适应上限：整环 2560B 或固定 1536 在碎片堆 OOM 会 early-skip，
-  // OTA 重启前一段日志全丢
   const size_t fmax = safeChunk();
   size_t fchunk = s_len > fmax ? fmax : s_len;
-  if (fchunk > 0) {
-    body.reserve(fchunk);
-    body.concat(s_ring, fchunk);
-    if (body.length() != fchunk) fchunk = 0;
-  }
+  if (fchunk > 0) memcpy(s_bodyBuf, s_ring, fchunk);
   ringUnlock();
   if (fchunk == 0 || WiFi.status() != WL_CONNECTED) {
     Serial.printf("[FLUSH] early skip dt=%u\n", (unsigned)(millis() - t0));
@@ -392,65 +450,50 @@ void logShipFlushNow() {
   Serial.printf("[FLUSH] conn=%d dt=%u\n", (int)conn, (unsigned)(millis() - t0));
   if (!conn) return;
   esp_task_wdt_reset();
-  String req;
-  req.reserve(160 + body.length());
-  req += "POST ";
-  req += path;
-  req += " HTTP/1.1\r\nHost: ";
-  req += host;
-  req += "\r\nUser-Agent: garage-esp32\r\nContent-Type: text/plain\r\n";
-  req += "Content-Length: ";
-  req += String((unsigned)body.length());
-  req += "\r\nConnection: close\r\n\r\n";
-  req += body;
-  // WiFiClient::write 内部是 1s select × 10 轮，网络卡顿时最坏阻塞 10s
-  // ＞ TWT 5s → loopTask 崩溃。自写受控发送：200ms 一片、每片喂狗，
-  // 总预算 3s；发不完就放弃（日志留在环里，恢复后补发）
-  {
-    const char* p = req.c_str();
-    size_t total = req.length();
-    size_t sent = 0;
-    uint32_t st0 = millis();
-    int sfd = client.fd();
-    while (sent < total) {
-      esp_task_wdt_reset();
-      if (millis() - st0 > 3000) break;
-      fd_set wset;
-      FD_ZERO(&wset);
-      FD_SET(sfd, &wset);
-      struct timeval tv = {0, 200000};
-      int r = select(sfd + 1, nullptr, &wset, nullptr, &tv);
-      if (r < 0) break;
-      if (r > 0 && FD_ISSET(sfd, &wset)) {
-        int n = send(sfd, p + sent, total - sent, MSG_DONTWAIT);
-        if (n > 0) {
-          sent += (size_t)n;
-        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-          break;
-        }
-      }
-    }
-    Serial.printf("[FLUSH] sent %u/%u dt=%u\n", (unsigned)sent,
-                  (unsigned)total, (unsigned)(millis() - t0));
-    if (sent < total) {
-      client.stop();
-      return;
-    }
+
+  int hdrLen = snprintf(s_hdrBuf, sizeof(s_hdrBuf),
+                        "POST %s HTTP/1.1\r\nHost: %s\r\n"
+                        "User-Agent: garage-esp32\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Content-Length: %u\r\n"
+                        "Connection: close\r\n\r\n",
+                        s_pathBuf, s_hostBuf, (unsigned)fchunk);
+  if (hdrLen <= 0 || hdrLen >= (int)sizeof(s_hdrBuf)) {
+    client.stop();
+    return;
   }
+
+  // 头 + body 分两段 send：避免再拼一块连续 req
+  // WiFiClient::write 内部是 1s select × 10 轮，网络卡顿时最坏阻塞 10s
+  // ＞ TWT 5s → loopTask 崩溃。自写受控发送，总预算 3s
+  int sfd = client.fd();
+  bool sentOk = shipSendAll(sfd, s_hdrBuf, (size_t)hdrLen, 3000) &&
+                shipSendAll(sfd, s_bodyBuf, fchunk, 3000);
+  Serial.printf("[FLUSH] sent hdr=%d body=%u ok=%d dt=%u\n", hdrLen,
+                (unsigned)fchunk, (int)sentOk, (unsigned)(millis() - t0));
+  if (!sentOk) {
+    client.stop();
+    return;
+  }
+
   uint32_t start = millis();
-  String raw;
+  size_t rawN = 0;
+  s_rawBuf[0] = '\0';
   while (client.connected() || client.available()) {
     if (millis() - start > LOG_SHIP_TIMEOUT_MS) break;
-    while (client.available()) raw += (char)client.read();
-    if (raw.indexOf("\r\n\r\n") >= 0 && !client.connected()) break;
+    while (client.available() && rawN + 1 < sizeof(s_rawBuf)) {
+      int ch = client.read();
+      if (ch < 0) break;
+      s_rawBuf[rawN++] = (char)ch;
+    }
+    s_rawBuf[rawN] = '\0';
+    if (strstr(s_rawBuf, "\r\n\r\n") && !client.connected()) break;
+    if (rawN + 1 >= sizeof(s_rawBuf)) break;
     delay(1);
     esp_task_wdt_reset();
-    if (raw.length() > 512) break;
   }
   client.stop();
-  int sp1 = raw.indexOf(' ');
-  int sp2 = raw.indexOf(' ', sp1 + 1);
-  int code = (sp1 >= 0 && sp2 >= 0) ? raw.substring(sp1 + 1, sp2).toInt() : -1;
+  int code = rawN > 0 ? parseHttpStatusBuf(s_rawBuf) : -1;
   Serial.printf("[FLUSH] done code=%d dt=%u\n", code, (unsigned)(millis() - t0));
   if (code == 200) {
     ringLock();
@@ -504,16 +547,16 @@ void logShipService(bool btBusy, bool wifiOk) {
     return;
   }
 
-  String host, path;
   uint16_t port = 80;
-  parseLogUrl(&host, &port, &path);
+  parseLogUrlBuf(s_hostBuf, sizeof(s_hostBuf), &port, s_pathBuf,
+                 sizeof(s_pathBuf));
 
   // 快照环头 ≤自适应上限，见 safeChunk()/LOG_SHIP_CHUNK 注释的空包死循环；
-  // 摘环仅在拷贝成功后执行——OOM 时内容留环里下轮再试（旧实现先清环会丢日志）
+  // 摘环仅在拷贝成功后执行——拷贝失败时内容留环里下轮再试（旧实现先清环会丢日志）
+  // 环拷贝走静态 s_bodyBuf，不再在 loopTask 上 reserve String
   const size_t s_chunkMax = safeChunk();
   s_largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   s_cap = (uint32_t)s_chunkMax;
-  String body;
   size_t chunk = 0;
   if (s_chunkMax == 0) {
     // 堆碎片到连小片都放不下：别摘环，3s 后重试（30s 会让黑窗拖太久）
@@ -525,25 +568,34 @@ void logShipService(bool btBusy, bool wifiOk) {
   if (s_len > 0) {
     s_attempt++;
     chunk = s_len > s_chunkMax ? s_chunkMax : s_len;
-    body.reserve(chunk);
-    body.concat(s_ring, chunk);
-    if (body.length() == chunk) {
-      memmove(s_ring, s_ring + chunk, s_len - chunk);
-      s_len -= chunk;
-    } else {
-      s_why = 6;  // body 拷贝 OOM → 不摘环，3s 重试
-      chunk = 0;
-    }
+    if (chunk > sizeof(s_bodyBuf)) chunk = sizeof(s_bodyBuf);
+    memcpy(s_bodyBuf, s_ring, chunk);
+    memmove(s_ring, s_ring + chunk, s_len - chunk);
+    s_len -= chunk;
   }
   ringUnlock();
 
   if (chunk == 0) {
-    // 环为空（正常静默）或 reserve 失败（留环重试）：都等下一轮
-    if (s_why != 6) s_why = 5;
+    // 环为空（正常静默）：等下一轮
+    s_why = 5;
     s_nextMs = now + LOG_SHIP_INTERVAL_MS;
     return;
   }
-  buildPath(&path);
+  buildPathBuf(s_pathBuf, sizeof(s_pathBuf));
+  // 提交给 worker 仍走 String（httpSubmitPost API）；从静态块构造，
+  // 长度不符则回填。HttpJob 已 nothrow new，此处失败不会 terminate。
+  String body;
+  body.reserve(chunk);
+  body.concat(s_bodyBuf, chunk);
+  if (body.length() != chunk) {
+    s_why = 6;  // body String 构造不完整 → 不认摘环，回填静态块
+    body = "";
+    ringLock();
+    ringPrepend(s_bodyBuf, chunk);
+    ringUnlock();
+    s_nextMs = now + 3000;
+    return;
+  }
   // 回填用的 s_snap 必须在提交前拷贝成功：环已在上面摘走，
   // 若 s_snap 拷贝 OOM 变空串，非 200 时 ringPrepend 会回填空气，日志照丢。
   s_snap = body;
@@ -551,12 +603,12 @@ void logShipService(bool btBusy, bool wifiOk) {
     s_why = 7;
     s_snap = "";
     ringLock();
-    ringPrepend(body.c_str(), body.length());
+    ringPrepend(s_bodyBuf, chunk);
     ringUnlock();
     s_nextMs = now + 3000;
     return;
   }
-  if (httpSubmitPost(HTTP_OWNER_LOGS, host, port, path, body,
+  if (httpSubmitPost(HTTP_OWNER_LOGS, s_hostBuf, port, s_pathBuf, body,
                      LOG_SHIP_TIMEOUT_MS)) {
     s_why = 8;  // 已入队，等 worker 发出
     s_inFlight = true;
@@ -565,7 +617,7 @@ void logShipService(bool btBusy, bool wifiOk) {
     s_why = 11;
     s_snap = "";
     ringLock();
-    ringPrepend(body.c_str(), body.length());
+    ringPrepend(s_bodyBuf, chunk);
     ringUnlock();
     s_nextMs = now + 3000;
   }
