@@ -38,6 +38,8 @@ test_*.py
 ble_logs/
 drive_test*
 firmware_backup/
+# 本地诊断用的设备日志快照（HTTPS 拉下来的临时分析输入，勿入库）
+tools/logs_*.json
 
 # 密码/密钥（VPS 上用 ui_password 文件，勿提交）
 ui_password
