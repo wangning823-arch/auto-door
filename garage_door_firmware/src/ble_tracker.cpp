@@ -52,13 +52,12 @@ static void btAirTryHoldForce() {
 static void btAirTryHold() {
   if (s_btAir) return;
   const uint32_t largest = btLargest8();
-  // 门槛放宽：池子只要能塞下气囊+少量余量就占；dda0 稳态常只有 ~4084，
-  // 再要求 10KB 就永远 hold 不上，inquiry 前也没东西可 drop。
-  if (largest >= kBtAirSize + 512) {
-    s_btAir = malloc(kBtAirSize);
-  } else if (largest >= kBtAirSizeMin + 256) {
-    s_btAir = malloc(kBtAirSizeMin);
-  }
+  // 1913 实测：drop 后 maxblk 常 ~5620，若门槛过低会立刻 re-hold 抢回，
+  // BTU 异步 malloc(4112) 时又只剩 4084 → fail 反升。
+  // 跟踪期只在池子真正宽裕（≥12KB）时收回；否则宁可空着给 BTU/WiFi。
+  if (largest < 12288) return;
+  s_btAir = malloc(kBtAirSize);
+  if (!s_btAir) s_btAir = malloc(kBtAirSizeMin);
   if (s_btAir) {
     logShipf("[HEAP] BT air held max8=%u", (unsigned)btLargest8());
   }
