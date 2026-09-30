@@ -67,6 +67,11 @@ static String buildJson() {
   j += ",\"pin\":" + String(gBits.pairHasPin ? 1 : 0) + "}";
   j += ",\"car_rssi\":" + String(gBits.carRssi);
   j += ",\"trend\":" + String(gBits.trend);
+  // 精确 fail 统计（status 比 HEAPFAIL 抽样可靠）
+  j += ",\"failn\":" + String((unsigned long)gBits.heapFailN);
+  j += ",\"btufail\":" + String((unsigned long)gBits.btuFailN);
+  j += ",\"thin\":" + String((unsigned long)gBits.thinN);
+  j += ",\"inq\":" + String((unsigned long)gBits.inqN);
   // 日志发送阻塞点诊断：远程直接看 why，不用猜卡在哪一步
   {
     uint8_t why = 0;

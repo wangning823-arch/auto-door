@@ -22,6 +22,18 @@ static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;
 static bool gBtReady = false;
 
+volatile uint32_t BleTracker::s_inqCount = 0;
+volatile uint32_t BleTracker::s_thinCount = 0;
+volatile uint32_t BleTracker::s_btuFailCount = 0;
+
+void BleTracker::noteAllocFail(size_t size, const char* task) {
+  // 钩子内：只计数，严禁分配/printf
+  // BTU inquiry 要 4112；任务名含 BTU 也算
+  if (size == 4112 || (task && (strstr(task, "BTU") || strstr(task, "btu")))) {
+    s_btuFailCount++;
+  }
+}
+
 // ===== Inquiry 同步 BT 气囊（不降低 inquiry 频率）=====
 // 根因：片内稳态最大连续块常 2804~4084，BTU inquiry 要 4112 → 总差一口气。
 // 1243「开机 hold 12KB」把外面挤到 1908，更糟；1435 停 hold 后又没有可归还块。
@@ -90,7 +102,11 @@ static void ensureBtuHeapForInquiry() {
   btAirDropForInquiry();
   const uint32_t l = btLargest8();
   if (l < 4112) {
-    logShipf("[HEAP] BT thin before inq max8=%u", (unsigned)l);
+    BleTracker::noteThin();
+    // 精确统计：thin 次数 + 当前 BTU 累计失败 + 总 fail，不依赖 HEAPFAIL 抽样
+    logShipf("[HEAP] BT thin before inq max8=%u thin=%u btufail=%u",
+             (unsigned)l, (unsigned)BleTracker::thinCount(),
+             (unsigned)BleTracker::btuFailCount());
   }
 }
 
@@ -531,6 +547,7 @@ void BleTracker::loop() {
     // Inquiry 优先：4s 节奏（约 2.5s 占用 + 1.5s 空窗给 HTTP），不被 HTTP 推迟。
     // HTTP 在空窗发送，发不完就放弃。
     ensureBtuHeapForInquiry();
+    BleTracker::noteInquiryStart();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
     uint32_t gap = inquirySlow_ ? 15000 : 4000;

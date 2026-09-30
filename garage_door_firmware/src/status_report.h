@@ -37,6 +37,11 @@ struct StatusBits {
   int bleRssi = -127;    // 已配对手机（BLE 模式）
   int carRssi = -127;    // 车机（经典模式）
   int trend = 0;         // SignalTrend
+  // 精确堆统计（开机累计，非 HEAPFAIL 抽样）
+  uint32_t heapFailN = 0;   // 所有 malloc 失败
+  uint32_t btuFailN = 0;    // BTU 4112 / BTU_TASK 失败
+  uint32_t thinN = 0;       // inquiry 前 maxblk<4112 次数
+  uint32_t inqN = 0;        // inquiry 启动次数
 };
 
 void statusReportSetBits(const StatusBits& b);

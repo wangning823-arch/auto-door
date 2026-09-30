@@ -49,6 +49,16 @@ class BleTracker {
   bool inquiryBusy() const { return inquiryBusy_ || discRunning_; }
   // 方向A：inquiry 中或刚结束后保护窗 → log/status 不发大包（poll 仍可试）
   bool btQuietForHttp() const;
+
+  // ===== 精确堆/BTU 统计（不依赖 HEAPFAIL 抽样）=====
+  // inquiry 次数 / thin 次数 / BTU 4112 失败次数（分配钩子里累加）
+  static uint32_t inqCount() { return s_inqCount; }
+  static uint32_t thinCount() { return s_thinCount; }
+  static uint32_t btuFailCount() { return s_btuFailCount; }
+  // onAllocFailed 里调用：size/task 判定 BTU 失败，仅计数不分配
+  static void noteAllocFail(size_t size, const char* task);
+  static void noteThin() { s_thinCount++; }
+  static void noteInquiryStart() { s_inqCount++; }
   // 超过 20s 未再扫到 → 返回 -127，避免网页显示卡住的旧 RSSI
   int lastRssi() const;
   int lastRssiRaw() const { return lastRssi_; }
@@ -121,6 +131,11 @@ class BleTracker {
   bool autoTrack_ = false;
   uint8_t missCount_ = 0;
   bool ready_ = false;
+
+  // 精确统计（静态，钩子/loop 共用；volatile 防优化）
+  static volatile uint32_t s_inqCount;
+  static volatile uint32_t s_thinCount;
+  static volatile uint32_t s_btuFailCount;
 };
 
 // OTA 专用：彻底关 BT 射频（SerialBT.end + btStop，bluedroid/controller 全拆）。

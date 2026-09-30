@@ -773,6 +773,16 @@ static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
   if (inHook) return;
   inHook = true;
   uint32_t n = ++gHeapFailN;
+  // 精确 BTU 失败计数：始终取任务名（不依赖抽样），钩子内只累加
+  {
+    const char* tnm = "?";
+    TaskHandle_t h = xTaskGetCurrentTaskHandle();
+    if (h) {
+      const char* nm = pcTaskGetName(h);
+      if (nm) tnm = nm;
+    }
+    BleTracker::noteAllocFail(size, tnm);
+  }
   // 气囊容量以内的失败 → 请 loop 归还共用气囊。
   // 旧阈值 4096 盖不住 BTU inquiry 的 4112B（dda0 max8=4084 实锤），
   // 导致 BTU 失败根本不触发归还；现改为 OTA_RESERVE_SIZE(4352)。
@@ -834,6 +844,20 @@ static void serviceHeapDiag() {
                gFailEvt.ra5);
     }
   }
+  // 精确 BTU 失败日志：计数变化就打，不依赖 HEAPFAIL 抽样
+  {
+    static uint32_t lastBtu = 0;
+    uint32_t btu = BleTracker::btuFailCount();
+    if (btu != lastBtu) {
+      lastBtu = btu;
+      multi_heap_info_t i8bit;
+      heap_caps_get_info(&i8bit, MALLOC_CAP_8BIT);
+      logShipf("[BTUFAIL] n=%u big8=%u thin=%u inq=%u fail=%u",
+               (unsigned)btu, (unsigned)i8bit.largest_free_block,
+               (unsigned)BleTracker::thinCount(),
+               (unsigned)BleTracker::inqCount(), (unsigned)gHeapFailN);
+    }
+  }
   // 共用气囊：钩子已置位 → 这里归还给堆（WiFi 下一帧 2308B / BTU 4112B 就能成）
   if (gResGiveReq) {
     gResGiveReq = false;
@@ -871,6 +895,12 @@ static void serviceHeapDiag() {
                (unsigned)i8.largest_free_block,
                (unsigned)iIn.total_free_bytes,
                (unsigned)iIn.largest_free_block, (unsigned)gHeapFailN);
+      // 精确 BTU/thin 统计：与 HEAPFAIL 抽样无关，status 同步上报
+      logShipf("[BTSTAT] inq=%u thin=%u btufail=%u fail=%u maxblk=%u",
+               (unsigned)BleTracker::inqCount(),
+               (unsigned)BleTracker::thinCount(),
+               (unsigned)BleTracker::btuFailCount(), (unsigned)gHeapFailN,
+               (unsigned)i8.largest_free_block);
     }
   }
   if (now - lastStack >= 10000) {
@@ -1849,6 +1879,10 @@ void loop() {
       gBleScan.matchLabel().toCharArray(sb.bleLab, sizeof(sb.bleLab));
       sb.carRssi = gBt.lastRssi();
       sb.trend = (int)gBt.trend();
+      sb.heapFailN = gHeapFailN;
+      sb.btuFailN = BleTracker::btuFailCount();
+      sb.thinN = BleTracker::thinCount();
+      sb.inqN = BleTracker::inqCount();
 #ifdef DEVICE_ROLE
       sb.role = DEVICE_ROLE;
 #endif
