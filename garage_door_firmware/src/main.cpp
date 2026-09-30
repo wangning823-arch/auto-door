@@ -1781,14 +1781,19 @@ void loop() {
     }
   }
 
-  // poll：仅 inquiry 空闲时发；log/status：inquiry+刚结束保护窗内不发
+  // poll：inquiry 空闲且堆不薄时才发；log/status：inquiry/保护窗/堆薄时不发
   {
     gRf.service();  // 异步 RF 发射到点后清 busy
     const bool btBusy =
         gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
+    // 弱网 dda0：maxblk 常在 4852↔1500 震荡；堆薄时连 poll 也停，
+    // 避免 WiFi 数据面继续把连续块打碎到 <4112（BTU 4112）
+    const uint32_t maxblkNow =
+        heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    const bool heapThin = maxblkNow < 4600;
     const bool btQuiet =
-        gBtStackInited && (btBusy || gBt.btQuietForHttp());
-    remoteCmdService(btBusy, gWeb.staConnected());
+        gBtStackInited && (btBusy || gBt.btQuietForHttp() || heapThin);
+    remoteCmdService(btQuiet, gWeb.staConnected());
     logShipService(btQuiet, gWeb.staConnected());
     remoteOtaService(btBusy, gWeb.staConnected());
     serviceStaDataWatchdog();
