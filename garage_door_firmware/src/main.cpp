@@ -863,6 +863,8 @@ static void serviceHeapDiag() {
     gResGiveReq = false;
     remoteOtaReserveGive();
   }
+  // BTU 专用应急堆：BTU 分配失败钩子置位 → 这里 free（钩子内严禁碰堆）
+  BleTracker::serviceBtuReserve();
   // 每 10s 分池水位：哪个 caps 口径在「饿」
   static uint32_t lastPool = 0;
   if (now - lastPool >= 10000) {

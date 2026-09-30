@@ -16,7 +16,8 @@
 // 自动 Inquiry 回调丢失时的强清超时（len≈2 → 约 2.6s；留足余量）
 static const uint32_t INQUIRY_STUCK_MS = 8000;
 // 方向A：inquiry 结束后再静默一小段，给 BTU 异步 malloc(4112) 留连续块
-static const uint32_t POST_INQUIRY_QUIET_MS = 800;
+// dda0 实测 800ms 后数据面仍抢块 → 拉到 1500ms
+static const uint32_t POST_INQUIRY_QUIET_MS = 1500;
 
 static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;
@@ -25,12 +26,63 @@ static bool gBtReady = false;
 volatile uint32_t BleTracker::s_inqCount = 0;
 volatile uint32_t BleTracker::s_thinCount = 0;
 volatile uint32_t BleTracker::s_btuFailCount = 0;
+volatile bool BleTracker::s_btuResGiveReq = false;
+
+static uint32_t btLargest8() {
+  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+}
+
+// ===== BTU 专用应急堆（20260930 dda0）=====
+// 根因：BT air / OTA 气囊在 inquiry 前一次性给完，autoTrack 下不再 rearm；
+// dda0 碎片期 max8 常 2292~4084，BTU 4112 必挂且 thin≈btufail。
+// 应急块与 OTA 气囊分离：只在 largest8<4112（或 BTU 失败）时释放，
+// 稳态 maxblk≈4340/5620 时禁止 rearm，避免 4340-8192 把 BTU 又饿死。
+static const uint32_t kBtuReserveSize = 8192;  // ≥4112，WiFi 2308 抢走后仍可能剩 ≥4112
+static const uint32_t kBtuReserveRearmMin = 12288;
+static void* s_btuReserve = nullptr;
 
 void BleTracker::noteAllocFail(size_t size, const char* task) {
-  // 钩子内：只计数，严禁分配/printf
+  // 钩子内：只计数+置位，严禁分配/printf/free
   // BTU inquiry 要 4112；任务名含 BTU 也算
   if (size == 4112 || (task && (strstr(task, "BTU") || strstr(task, "btu")))) {
     s_btuFailCount++;
+    s_btuResGiveReq = true;  // loop 里释放应急堆，供下一轮 inquiry
+  }
+}
+
+bool BleTracker::btuReserveHeld() { return s_btuReserve != nullptr; }
+
+static void btuReserveDrop(const char* why) {
+  if (!s_btuReserve) return;
+  free(s_btuReserve);
+  s_btuReserve = nullptr;
+  logShipf("[HEAP] BTU reserve dropped why=%s max8=%u", why,
+           (unsigned)btLargest8());
+}
+
+static void btuReserveTryHoldForce() {
+  if (s_btuReserve) return;
+  s_btuReserve = heap_caps_malloc(kBtuReserveSize, MALLOC_CAP_8BIT);
+  if (s_btuReserve) {
+    logShipf("[HEAP] BTU reserve held force sz=%u max8=%u",
+             (unsigned)kBtuReserveSize, (unsigned)btLargest8());
+  }
+}
+
+static void btuReserveTryRearm() {
+  if (s_btuReserve) return;
+  const uint32_t largest = btLargest8();
+  if (largest < kBtuReserveRearmMin) return;
+  s_btuReserve = heap_caps_malloc(kBtuReserveSize, MALLOC_CAP_8BIT);
+  if (s_btuReserve) {
+    logShipf("[HEAP] BTU reserve rearmed max8=%u", (unsigned)btLargest8());
+  }
+}
+
+void BleTracker::serviceBtuReserve() {
+  if (s_btuResGiveReq) {
+    s_btuResGiveReq = false;
+    btuReserveDrop("btu_fail");
   }
 }
 
@@ -44,10 +96,6 @@ void BleTracker::noteAllocFail(size_t size, const char* task) {
 static const uint32_t kBtAirSize = 8192;
 static const uint32_t kBtAirSizeMin = 4608;  // 至少盖住 BTU 4112
 static void* s_btAir = nullptr;
-
-static uint32_t btLargest8() {
-  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-}
 
 static void btAirTryHoldForce() {
   if (s_btAir) return;
@@ -94,13 +142,21 @@ static void btAirDropForInquiry() {
 }
 
 // 方向A：inquiry 前尽量腾出 ≥4112 连续块给 BTU
-// OTA 气囊只要占着就先归还；BT air drop；仍 <4112 时打日志
+// OTA 气囊只要占着就先归还；BT air drop；
+// 仍 <4112 时释放 BTU 专用应急块（与 OTA 气囊分离，避免一次给完就没）；
+// free 后仍薄则 noteThin，但不推迟 inquiry。
 static void ensureBtuHeapForInquiry() {
   if (remoteOtaReserveHeld()) {
     remoteOtaReserveGive();
   }
   btAirDropForInquiry();
-  const uint32_t l = btLargest8();
+  uint32_t l = btLargest8();
+  if (l < 4112) {
+    if (s_btuReserve) {
+      btuReserveDrop("thin_before_inq");
+      l = btLargest8();
+    }
+  }
   if (l < 4112) {
     BleTracker::noteThin();
     // 精确统计：thin 次数 + 当前 BTU 累计失败 + 总 fail，不依赖 HEAPFAIL 抽样
@@ -244,6 +300,8 @@ bool BleTracker::begin(const char* macStr) {
   // BT 栈起来后立刻抢 BT 气囊：此时堆还干净，dda0 后期 maxblk 常只剩 4084，
   // 等“宽裕再 hold”会永远 hold 不上。
   btAirTryHoldForce();
+  // 同时持 BTU 专用应急块（与 OTA 气囊分离）：inquiry 前仅在 max8<4112 时释放
+  btuReserveTryHoldForce();
 
   Serial.printf("[BT] target MAC %s -> %s\n", macStr, targetSet_ ? "OK" : "INVALID");
   nextInquiryMs_ = millis() + 1000;
@@ -380,6 +438,8 @@ void BleTracker::onInquiryDone() {
   }
   // 本轮 inquiry 结束后立刻尝试收回 BT 气囊（不降频，只为下一轮准备连续块）
   btAirTryHold();
+  // BTU 应急堆：仅 largest8≥12288 才 rearm，稳态碎片期禁止，避免再打碎 4112
+  btuReserveTryRearm();
   if (discRunning_ && !millisReached(millis(), discEndMs_ + 1) && !inquiryPaused_) {
     ensureBtuHeapForInquiry();
     inquiryBusy_ = true;

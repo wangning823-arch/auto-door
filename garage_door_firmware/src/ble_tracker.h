@@ -59,6 +59,9 @@ class BleTracker {
   static void noteAllocFail(size_t size, const char* task);
   static void noteThin() { s_thinCount++; }
   static void noteInquiryStart() { s_inqCount++; }
+  // BTU 专用应急堆：begin 时持有；largest8<4112 或 BTU 失败时释放；≥12288 才收回
+  static bool btuReserveHeld();
+  static void serviceBtuReserve();
   // 超过 20s 未再扫到 → 返回 -127，避免网页显示卡住的旧 RSSI
   int lastRssi() const;
   int lastRssiRaw() const { return lastRssi_; }
@@ -136,6 +139,8 @@ class BleTracker {
   static volatile uint32_t s_inqCount;
   static volatile uint32_t s_thinCount;
   static volatile uint32_t s_btuFailCount;
+  // BTU 分配失败钩子置位 → loop 释放应急堆（钩子内严禁 free）
+  static volatile bool s_btuResGiveReq;
 };
 
 // OTA 专用：彻底关 BT 射频（SerialBT.end + btStop，bluedroid/controller 全拆）。
