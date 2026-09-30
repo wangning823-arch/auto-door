@@ -165,9 +165,9 @@ static void httpFinishJob(HttpJob* j, int code, const String& resp) {
     s.body = resp;
     s.ready.store(true);  // 数据先写，ready 后置
   }
-  if (code < 0) {
-    s_netFail++;  // DNS/connect/超时等网络层失败
-  } else {
+  if (code < 0 && code != -13) {
+    s_netFail++;  // DNS/connect/超时等网络层失败；-13=inquiry 保护放弃，不计入
+  } else if (code >= 0) {
     s_netFail = 0;
   }
   delete j;
@@ -188,13 +188,18 @@ static void httpWorker(void*) {
       continue;
     }
 
-    // 先占射频标志（BleTracker 见状推迟新 inquiry），再等空隙：
-    //  本地网页响应优先（最长 15s，覆盖整页发送），其次等蓝牙 inquiry 让路
+    // Inquiry 优先：只在空窗发送；短等后仍 btBusy → 放弃本单（-13），
+    // 不推迟 inquiry，也不把放弃算进 netfail（否则会误触发 force STA reconnect）
     s_radioBusy.store(true);
     uint32_t t0 = millis();
     while (s_webBusy.load() || (s_btBusy && s_btBusy())) {
-      if (millis() - t0 > HTTP_WEB_WAIT_MAX_MS) break;
-      vTaskDelay(pdMS_TO_TICKS(50));
+      if (millis() - t0 > HTTP_BT_GAP_WAIT_MS) break;
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_btBusy && s_btBusy()) {
+      httpFinishJob(j, -13, String());
+      s_radioBusy.store(false);
+      continue;
     }
 
     String resp;
@@ -230,6 +235,8 @@ static bool submit(int owner, bool isPost, const String& host, uint16_t port,
                    uint32_t timeoutMs) {
   if (!s_jobs || owner < 0 || owner >= HTTP_OWNER_COUNT) return false;
   if (s_paused.load()) return false;  // OTA 排空期拒新单
+  // Inquiry/BLE 占用时不入队：只在 inquiry 空窗发 HTTP，避免挤掉 BTU 4112 连续块
+  if (s_btBusy && s_btBusy()) return false;
   if (s_ownerBusy[owner].load()) return false;  // 该 owner 已有在飞请求
   s_ownerBusy[owner].store(true);
   HttpSlot& s = s_slots[owner];

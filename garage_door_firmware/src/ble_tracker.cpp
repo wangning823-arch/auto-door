@@ -515,12 +515,8 @@ void BleTracker::loop() {
     return;
   }
   if (millisReached(now, nextInquiryMs_)) {
-    // 射频交替：HTTP worker 正在发送（或等空隙后即将发送）→ 推迟一轮，
-    // 两边都不打断对方，避免 Inquiry 抢包导致 DNS/连接失败
-    if (httpClientBusy()) {
-      nextInquiryMs_ = now + 300;
-      return;
-    }
+    // Inquiry 优先：3s 节奏不被 HTTP 推迟（弱网下 poll 可能占满 radioBusy，
+    // 旧逻辑推迟 inquiry 会拖自动开门）。HTTP 在空窗发送，发不完就放弃。
     ensureBtuHeapForInquiry();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;

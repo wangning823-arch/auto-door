@@ -36,8 +36,9 @@
 #define REMOTE_POLL_URL "http://door.wzx.homes/dev/poll"
 #endif
 // 连接/读超时（HTTP 轮询）
+// 弱网策略：只在 inquiry 空窗（约 0.5s）发 HTTP；发不完就放弃，不拖 inquiry
 #ifndef REMOTE_POLL_TIMEOUT_MS
-#define REMOTE_POLL_TIMEOUT_MS 5000
+#define REMOTE_POLL_TIMEOUT_MS 500
 #endif
 // ===== 日志上报 / 在线 OTA（HTTP 明文，与轮询同一 nginx 放行策略）=====
 #ifndef LOG_SHIP_URL

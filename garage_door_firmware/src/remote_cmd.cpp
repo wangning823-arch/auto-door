@@ -193,6 +193,7 @@ void remoteCmdService(bool btBusy, bool wifiOk) {
                     REMOTE_POLL_TIMEOUT_MS)) {
     s_inFlight = true;
   } else {
-    s_nextMs = now + 1000;  // 队列忙，1s 后再试
+    // inquiry 忙/队列忙：短重试，争取下一拍空窗（0.5s 级）
+    s_nextMs = now + 100;
   }
 }

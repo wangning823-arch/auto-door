@@ -146,7 +146,8 @@ void statusReportService(bool btBusy, bool wifiOk) {
     s_inFlight = true;
     s_force = false;
   } else {
+    // inquiry 忙时拒提交：短重试争取下一拍空窗
     s_force = false;
-    s_nextMs = now + 3000;
+    s_nextMs = now + 200;
   }
 }
