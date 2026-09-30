@@ -1490,7 +1490,10 @@ void setup() {
   logShipf("[BOOT] rst=%d t=%ums", (int)esp_reset_reason(), (unsigned)millis());
   // 崩溃现场（RTC noinit 跨复位保留）：仅 PANIC/WDT/BROWNOUT 时上报
   crashSnapReport((int)esp_reset_reason());
-  remoteOtaHold4k();  // 堆还干净时预留 4KB 连续块，OTA begin 前让出（防8BIT碎片）
+  // 20260930 1388 实测：开机 hold 大气囊（12KB）后稳态 maxblk 掉到 1908，
+  // WiFi 2308 / BTU 4112 一起 fail，fail 速率反升到 ~2.4/s。
+  // OTA begin 本就有「射频下电 → 池子变大」路径，跟踪期不再开机占大块。
+  // remoteOtaHold4k();  // 已停用：见上
 
   // 最早期测 SDA/SCL 电平（尚未碰 I2C/WiFi/BT）——排除软件把脚拉死
   gpio_reset_pin((gpio_num_t)PIN_NFC_SDA);
