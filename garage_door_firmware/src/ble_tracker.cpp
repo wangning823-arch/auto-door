@@ -21,7 +21,8 @@ static bool gBtReady = false;
 
 // Inquiry 起步要 BTU 连续 4112B。气囊若还占着、最大块又盖不住 → 先归还，
 // 再 start_discovery。避免「失败才救、下一轮又 rearm 收回」导致 maxblk 长期 4084。
-// OTA begin 路径本就会让出气囊（射频下电后池子更大），跟踪期不占这块。
+// 容量见 OTA_RESERVE_SIZE（20260930 起 12KB）：4352 归还后 max8 只有 ~4340
+// 会被并发分配吃掉，Give 后必须留下 >4112 的连续余量。
 static void ensureBtuHeapForInquiry() {
   if (!remoteOtaReserveHeld()) return;
   const uint32_t largest8 =

@@ -14,10 +14,12 @@ using OtaPreResetFn = void (*)();
 // 共用气囊容量：必须 ≥ BTU inquiry 的 4112B（含 malloc 头余量），
 // 同时仍覆盖 WiFi esf_buf 2308B 与 OTA Update.begin 的 ~4KB。
 // 旧值 4096 盖不住 4112 → BTU 失败时钩子 even 不会请求归还（见 main.cpp）。
+// 20260930 1388 实测：4352 归还后 max8 只有 ~4340，立刻被 WiFi/BTU 抢吃，
+// 稳态仍回落 4084，BTU 4112 继续 fail → 抬到 12KB，Give 后留出连续余量。
 #ifndef OTA_RESERVE_SIZE
-#define OTA_RESERVE_SIZE 4352
+#define OTA_RESERVE_SIZE 12288
 #endif
-// 收回门槛：largest8 ≥ 气囊 + 2KB 余量（8192 在 dda0 稳态 max8≈4084 上不可达）
+// 收回门槛：largest8 ≥ 气囊 + 2KB 余量（跟踪期已禁止 rearm，此处主要兜 OTA 路径）
 #ifndef OTA_RESERVE_REARM_MIN
 #define OTA_RESERVE_REARM_MIN (OTA_RESERVE_SIZE + 2048)
 #endif
