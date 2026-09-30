@@ -845,8 +845,12 @@ static void serviceHeapDiag() {
     lastPool = now;
     // 气囊收回：失败风暴过去、池子重新宽裕（largest8≥OTA_RESERVE_REARM_MIN
     // ≈6400）才收，且最多 60s 一次——防止"收回→又被吃→再收"边界抖动刷日志
+    // 经典跟踪开启时禁止 rearm：气囊归还后留给 BTU inquiry 4112B / WiFi 2308B；
+    // 否则「give→短暂 maxblk 变大→rearm 抢回→BTU 再 fail」会把 fail 刷上去。
+    // OTA begin 前本就有让出路径，跟踪期不占这块。
     static uint32_t lastRearmMs = 0;
-    if (!remoteOtaReserveHeld() && !gResGiveReq && (now - lastRearmMs) >= 60000UL) {
+    if (!gBt.autoTrack() && !remoteOtaReserveHeld() && !gResGiveReq &&
+        (now - lastRearmMs) >= 60000UL) {
       lastRearmMs = now;  // 成败都计时：池子不宽裕时也不用每 10s 白跑 malloc
       remoteOtaReserveRearm();
     }

@@ -1,10 +1,12 @@
 #include "ble_tracker.h"
 #include "config.h"
 #include "http_client.h"
+#include "remote_ota.h"
 #include "BluetoothSerial.h"
 #include <esp_bt.h>
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
+#include <esp_heap_caps.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error "Classic Bluetooth not enabled"
@@ -16,6 +18,16 @@ static const uint32_t INQUIRY_STUCK_MS = 8000;
 static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;
 static bool gBtReady = false;
+
+// Inquiry 起步要 BTU 连续 4112B。气囊若还占着、最大块又盖不住 → 先归还，
+// 再 start_discovery。避免「失败才救、下一轮又 rearm 收回」导致 maxblk 长期 4084。
+// OTA begin 路径本就会让出气囊（射频下电后池子更大），跟踪期不占这块。
+static void ensureBtuHeapForInquiry() {
+  if (!remoteOtaReserveHeld()) return;
+  const uint32_t largest8 =
+      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (largest8 < OTA_RESERVE_SIZE + 128) remoteOtaReserveGive();
+}
 
 static String macToStr(const uint8_t* bda) {
   char buf[18];
@@ -190,6 +202,7 @@ void BleTracker::startDiscovery(uint32_t durationMs) {
   discList_.clear();
   discRunning_ = true;
   discEndMs_ = millis() + durationMs;
+  ensureBtuHeapForInquiry();
   inquiryBusy_ = true;
   inquiryStartMs_ = millis();
   // length 单位 1.28s，0x01–0x30；用 8 ≈ 10s
@@ -439,6 +452,7 @@ void BleTracker::loop() {
       nextInquiryMs_ = now + 300;
       return;
     }
+    ensureBtuHeapForInquiry();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
     uint32_t gap = inquirySlow_ ? 15000 : 3000;
