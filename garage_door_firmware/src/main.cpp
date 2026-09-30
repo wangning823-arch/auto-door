@@ -1781,13 +1781,15 @@ void loop() {
     }
   }
 
-  // 远程令：蓝牙忙（Inquiry/BLE 扫描）绝不发 HTTP；STA 已连才轮询
+  // poll：仅 inquiry 空闲时发；log/status：inquiry+刚结束保护窗内不发
   {
     gRf.service();  // 异步 RF 发射到点后清 busy
     const bool btBusy =
         gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
+    const bool btQuiet =
+        gBtStackInited && (btBusy || gBt.btQuietForHttp());
     remoteCmdService(btBusy, gWeb.staConnected());
-    logShipService(btBusy, gWeb.staConnected());
+    logShipService(btQuiet, gWeb.staConnected());
     remoteOtaService(btBusy, gWeb.staConnected());
     serviceStaDataWatchdog();
     serviceHeapDiag();
@@ -1838,7 +1840,7 @@ void loop() {
       sb.role = DEVICE_ROLE;
 #endif
       statusReportSetBits(sb);
-      statusReportService(btBusy, gWeb.staConnected());
+      statusReportService(btQuiet, gWeb.staConnected());
     }
   }
 

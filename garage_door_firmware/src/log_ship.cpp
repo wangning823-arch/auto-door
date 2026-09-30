@@ -509,7 +509,11 @@ void logShipFlushNow() {
 }
 
 void logShipService(bool btBusy, bool wifiOk) {
-  (void)btBusy;  // 射频仲裁在 http_client worker
+  // 方向A：inquiry 中或刚结束保护窗 → 不发日志大包，堆留给 BTU
+  if (btBusy) {
+    s_why = 12;
+    return;
+  }
 
   // 收结果：成功=快照已发走（ring 提交时已摘掉）；失败=塞回队头重试
   if (s_inFlight) {

@@ -15,6 +15,8 @@
 
 // 自动 Inquiry 回调丢失时的强清超时（len≈2 → 约 2.6s；留足余量）
 static const uint32_t INQUIRY_STUCK_MS = 8000;
+// 方向A：inquiry 结束后再静默一小段，给 BTU 异步 malloc(4112) 留连续块
+static const uint32_t POST_INQUIRY_QUIET_MS = 800;
 
 static BluetoothSerial SerialBT;
 static BleTracker* gTracker = nullptr;
@@ -79,13 +81,25 @@ static void btAirDropForInquiry() {
     s_btAir = nullptr;
     logShipf("[HEAP] BT air drop for inquiry max8=%u", (unsigned)btLargest8());
   }
-  // OTA 共用气囊若还占着、也盖不住 → 一并让出（与 1435 策略兼容）
-  if (remoteOtaReserveHeld() && btLargest8() < OTA_RESERVE_SIZE + 128) {
+}
+
+// 方向A：inquiry 前尽量腾出 ≥4112 连续块给 BTU
+// OTA 气囊只要占着就先归还；BT air drop；仍 <4112 时打日志
+static void ensureBtuHeapForInquiry() {
+  if (remoteOtaReserveHeld()) {
     remoteOtaReserveGive();
+  }
+  btAirDropForInquiry();
+  const uint32_t l = btLargest8();
+  if (l < 4112) {
+    logShipf("[HEAP] BT thin before inq max8=%u", (unsigned)l);
   }
 }
 
-static void ensureBtuHeapForInquiry() { btAirDropForInquiry(); }
+bool BleTracker::btQuietForHttp() const {
+  if (inquiryBusy_ || discRunning_) return true;
+  return postQuietUntilMs_ != 0 && millisBefore(millis(), postQuietUntilMs_);
+}
 
 static String macToStr(const uint8_t* bda) {
   char buf[18];
@@ -336,6 +350,7 @@ void BleTracker::onDeviceName(const String& mac, const String& name) {
 void BleTracker::onInquiryDone() {
   inquiryBusy_ = false;
   inquiryStartMs_ = 0;
+  postQuietUntilMs_ = millis() + POST_INQUIRY_QUIET_MS;
   Serial.printf("[BT] inquiry stopped, list=%u miss=%u rssi=%d\n",
                 (unsigned)discList_.size(), missCount_, lastRssi_);
   // 漏扫不清零：连续 3 轮未见才算不可见

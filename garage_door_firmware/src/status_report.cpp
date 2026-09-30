@@ -101,7 +101,10 @@ void statusReportNow() {
 }
 
 void statusReportService(bool btBusy, bool wifiOk) {
-  (void)btBusy;  // 射频仲裁在 http_client worker
+  // 方向A：inquiry 中或刚结束保护窗 → 不发 status 大包
+  if (btBusy) {
+    return;
+  }
 
   if (s_inFlight) {
     int code = 0;
