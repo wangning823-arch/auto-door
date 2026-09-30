@@ -23,23 +23,44 @@ static bool gBtReady = false;
 // ===== Inquiry 同步 BT 气囊（不降低 inquiry 频率）=====
 // 根因：片内稳态最大连续块常 2804~4084，BTU inquiry 要 4112 → 总差一口气。
 // 1243「开机 hold 12KB」把外面挤到 1908，更糟；1435 停 hold 后又没有可归还块。
-// 方案：单独一块 8192，**启动 inquiry 前一定 free**（给 BTU/WiFi 连续区），
-// **inquiry 结束后尽量 re-hold**（下一轮还有缓冲）。周期仍约 3s，不降频。
+// 1844 方案：单独一块，**BT 栈起来后立刻抢一块**（此时堆还干净），
+// **启动 inquiry 前一定 free**，**结束后尽量 re-hold**。周期仍约 3s，不降频。
+// dda0 实测：稳态 maxblk 常 4084，若 hold 门槛要求 largest8≥10KB 则永远占不到
+// → 必须在 begin() 时 force malloc，而不是等池子“宽裕”。
 static const uint32_t kBtAirSize = 8192;
+static const uint32_t kBtAirSizeMin = 4608;  // 至少盖住 BTU 4112
 static void* s_btAir = nullptr;
 
 static uint32_t btLargest8() {
   return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
 
+static void btAirTryHoldForce() {
+  if (s_btAir) return;
+  s_btAir = malloc(kBtAirSize);
+  uint32_t sz = kBtAirSize;
+  if (!s_btAir) {
+    s_btAir = malloc(kBtAirSizeMin);
+    sz = kBtAirSizeMin;
+  }
+  if (s_btAir) {
+    logShipf("[HEAP] BT air held force sz=%u max8=%u", (unsigned)sz,
+             (unsigned)btLargest8());
+  }
+}
+
 static void btAirTryHold() {
   if (s_btAir) return;
-  // 只有池子够大才占；否则宁可空着，也不把 maxblk 再挤碎
-  if (btLargest8() < kBtAirSize + 2048) return;
-  s_btAir = malloc(kBtAirSize);
+  const uint32_t largest = btLargest8();
+  // 门槛放宽：池子只要能塞下气囊+少量余量就占；dda0 稳态常只有 ~4084，
+  // 再要求 10KB 就永远 hold 不上，inquiry 前也没东西可 drop。
+  if (largest >= kBtAirSize + 512) {
+    s_btAir = malloc(kBtAirSize);
+  } else if (largest >= kBtAirSizeMin + 256) {
+    s_btAir = malloc(kBtAirSizeMin);
+  }
   if (s_btAir) {
-    logShipf("[HEAP] BT air held sz=%u max8=%u", (unsigned)kBtAirSize,
-             (unsigned)btLargest8());
+    logShipf("[HEAP] BT air held max8=%u", (unsigned)btLargest8());
   }
 }
 
@@ -182,6 +203,10 @@ bool BleTracker::begin(const char* macStr) {
     Serial.println("[BT] Classic ready, NON_DISCOVERABLE (仅按需 inquiry)");
   }
   ready_ = true;
+
+  // BT 栈起来后立刻抢 BT 气囊：此时堆还干净，dda0 后期 maxblk 常只剩 4084，
+  // 等“宽裕再 hold”会永远 hold 不上。
+  btAirTryHoldForce();
 
   Serial.printf("[BT] target MAC %s -> %s\n", macStr, targetSet_ ? "OK" : "INVALID");
   nextInquiryMs_ = millis() + 1000;
