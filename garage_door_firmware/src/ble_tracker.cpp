@@ -54,12 +54,22 @@ static void btAirTryHold() {
   const uint32_t largest = btLargest8();
   // 1913 实测：drop 后 maxblk 常 ~5620，若门槛过低会立刻 re-hold 抢回，
   // BTU 异步 malloc(4112) 时又只剩 4084 → fail 反升。
-  // 跟踪期只在池子真正宽裕（≥12KB）时收回；否则宁可空着给 BTU/WiFi。
-  if (largest < 12288) return;
-  s_btAir = malloc(kBtAirSize);
-  if (!s_btAir) s_btAir = malloc(kBtAirSizeMin);
+  // 20260930 dda0 弱网：1934 门槛 12KB 在 drop 后 maxblk≈8180 时永远收不回，
+  // WiFi 把大块吃碎到 4084，下一轮 BTU 4112 必挂。
+  // 跟踪空闲（非 inquiryBusy）时：largest≥8000 优先收回 4608（盖住 BTU，
+  // 仍给 WiFi 留 ~2308 余量）；largest≥12288 仍收回 8192。
+  // 只在 inquiry 空闲时调用；启动 inquiry 前一律 drop（ensureBtuHeapForInquiry）。
+  if (largest < 8000) return;
+  if (largest >= 12288) {
+    s_btAir = malloc(kBtAirSize);
+    if (s_btAir) {
+      logShipf("[HEAP] BT air held max8=%u", (unsigned)btLargest8());
+      return;
+    }
+  }
+  s_btAir = malloc(kBtAirSizeMin);
   if (s_btAir) {
-    logShipf("[HEAP] BT air held max8=%u", (unsigned)btLargest8());
+    logShipf("[HEAP] BT air held min max8=%u", (unsigned)btLargest8());
   }
 }
 
