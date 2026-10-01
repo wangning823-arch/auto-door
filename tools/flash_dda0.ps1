@@ -1,4 +1,4 @@
-# dda0 USB 烧录脚本（坏 OTA 后恢复 / 新版直刷）
+﻿# dda0 USB 烧录脚本（坏 OTA 后恢复 / 新版直刷）
 # 用法: .\flash_dda0.ps1 -Port COM3 [-App .\path\firmware.bin]
 # 分区: app0@0x10000 / app1@0x200000 / otadata@0xe000
 # 双槽写入同一 app + 擦除 otadata，保证不论 ota 选择哪个槽都启动新固件。
