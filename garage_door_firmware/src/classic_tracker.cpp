@@ -21,6 +21,23 @@ static const uint32_t INQUIRY_STUCK_MS = 8000;
 // quiet=1500 后 20min 零日志；恢复 800ms 才有空窗）。
 static const uint32_t POST_INQUIRY_QUIET_MS = 800;
 
+// ===== 两态纪元调度常量（20261002）=====
+// IDLE 探针周期：晨间出库信号窗 ~10s，扣车机 BT 启动 ~3s 后有效窗 ~7s；
+// 探针 2.56s + 7s > 8s → 任意相位必重叠（零漏检）。占空比 2.56/8 = 32%
+//（原 4s 轮流 64%）。周期再拉长（如15s）会漏检晨窗——上一轮实测推演过。
+static const uint32_t PROBE_PERIOD_MS = 8000;
+// ACTIVE 内回调丢失/起动失败时的兜底周期（正常节奏由 done 续扫+整窗接管）
+static const uint32_t ACTIVE_GAP_FALLBACK_MS = 4000;
+// ACTIVE 每轮连续 inquiry 次数 → 11s 连续观测块（判靠近/离开），5 点回归够用
+static const uint8_t BURST_N = 5;
+// ACTIVE 的 HTTP 整窗：日志环（~1min 容量）/远程指令/状态都挤在这里排水。
+// 不做「HTTP 全断」——1388 quiet=1500 断 20 分钟日志的教训在前。
+static const uint32_t HTTP_WINDOW_MS = 3000;
+// 门开后始终没见到信号的降级时限（人走路开门等场景别烧 82% 占空比）
+static const uint32_t ACTIVE_NO_SIGNAL_TIMEOUT_MS = 120000;
+// 本纪元见过信号后，连续 N 次探不到 → 判定信号消失，退 IDLE
+static const uint8_t EPOCH_EXIT_MISS = 3;
+
 static BluetoothSerial SerialBT;
 static ClassicTracker* gTracker = nullptr;
 static bool gBtReady = false;
@@ -230,6 +247,8 @@ static void ensureBtuHeapForInquiry() {
 
 bool ClassicTracker::btQuietForHttp() const {
   if (inquiryBusy_ || discRunning_) return true;
+  // ACTIVE 整窗：放行 HTTP（即便窗开启瞬间有残留 quiet）
+  if (inHttpWindow()) return false;
   return postQuietUntilMs_ != 0 && millisBefore(millis(), postQuietUntilMs_);
 }
 
@@ -463,6 +482,9 @@ void ClassicTracker::onClassicDevice(const String& mac, int rssi, const String& 
     computeSlope();
     classifyTrend(true, rssi);
     updateZone();
+    // 目标出现 → 立刻进 ACTIVE（开门触发的走 setDoorOpen，这里兜底信号触发）
+    epochSawSignal_ = true;
+    enterActiveEpoch("signal");
   }
 }
 
@@ -480,6 +502,50 @@ void ClassicTracker::onDeviceName(const String& mac, const String& name) {
   if (discRunning_ && discList_.size() < 32) {
     discList_.push_back({m, -90, name});
   }
+}
+
+// ===== 两态纪元（IDLE 8s 探针 / ACTIVE 5+1）=====
+
+void ClassicTracker::setDoorOpen(bool open) {
+  // 开门沿触发（NFC/远程/自动开全部汇到 doorState_ 软件态）；
+  // 关沿不直接退——退出由 loop 的三条件统一判定，避免门态抖动来回切
+  if (open && !doorOpen_) enterActiveEpoch("door");
+  doorOpen_ = open;
+}
+
+void ClassicTracker::enterActiveEpoch(const char* why) {
+  if (epochActive_) return;
+  epochActive_ = true;
+  // 初值用经典纪元口径（>8s 探针最坏见面间隔）；首次 burst 扫到会立即纠正
+  epochSawSignal_ =
+      lastSeenMs_ != 0 && (millis() - lastSeenMs_) < CLASSIC_SEEN_GAP_MS;
+  epochStartMs_ = millis();
+  burstDone_ = 0;
+  windowUntilMs_ = 0;
+  epochWhy_ = why;
+  nextInquiryMs_ = millis();  // 立即起 burst 第一发
+}
+
+void ClassicTracker::exitActiveEpoch(const char* why) {
+  if (!epochActive_) return;
+  epochActive_ = false;
+  epochSawSignal_ = false;
+  burstDone_ = 0;
+  windowUntilMs_ = 0;
+  epochWhy_ = why;
+  // 正在 inquiry 时不抢锚点：done 后按 IDLE 节奏走（最多提前一拍，无害）
+  if (!inquiryBusy_) nextInquiryMs_ = millis() + PROBE_PERIOD_MS;
+}
+
+void ClassicTracker::openHttpWindow() {
+  burstDone_ = 0;
+  windowUntilMs_ = millis() + HTTP_WINDOW_MS;
+  postQuietUntilMs_ = 0;                   // 整窗放行 HTTP（清掉续扫残留 quiet）
+  nextInquiryMs_ = windowUntilMs_ + 200;    // 窗满由 loop 起下一轮 burst
+}
+
+bool ClassicTracker::inHttpWindow() const {
+  return windowUntilMs_ != 0 && millisBefore(millis(), windowUntilMs_);
 }
 
 void ClassicTracker::onInquiryDone() {
@@ -509,13 +575,38 @@ void ClassicTracker::onInquiryDone() {
     inquiryBusy_ = true;
     inquiryStartMs_ = millis();
     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 3, 0);
+    return;
   }
+
+  // ===== ACTIVE 纪元：第 2..5 发立即续扫 / 第 5 发后开 HTTP 整窗 =====
+  if (!epochActive_ || inquiryPaused_ || !gBtReady || !autoTrack_ || !targetSet_) {
+    return;  // IDLE：不续扫，loop 按 start+PROBE_PERIOD 锚定下一发
+  }
+  if (inquirySlow_) return;  // SoftAP 有客户端：让出射频，维持慢速节奏
+  burstDone_++;
+  if (burstDone_ < BURST_N) {
+    // 立即续扫：busy 不落地（postQuiet 已挡住 HTTP 从微缝挤入）
+    ensureBtuHeapForInquiry();
+    inquiryBusy_ = true;
+    inquiryStartMs_ = millis();
+    nextInquiryMs_ = millis() + ACTIVE_GAP_FALLBACK_MS;  // 回调丢失兜底
+    esp_err_t err =
+        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 2, 0);
+    if (err != ESP_OK) {
+      inquiryBusy_ = false;
+      inquiryStartMs_ = 0;
+      openHttpWindow();  // 起不动就退到整窗，别原地死循环
+    }
+    return;
+  }
+  openHttpWindow();  // 第 5 发完成 → HTTP 整窗，窗满由 loop 续下一轮
 }
 
 std::vector<ClassicDeviceItem> ClassicTracker::discoveryResults() const { return discList_; }
 
 void ClassicTracker::pushSample(bool visible, int rssi) {
   hist_[histHead_] = visible ? (int8_t)constrain(rssi, -127, 0) : (int8_t)-127;
+  histMs_[histHead_] = millis();
   histHead_ = (histHead_ + 1) % WIN;
   if (histCount_ < WIN) histCount_++;
 }
@@ -548,16 +639,35 @@ int ClassicTracker::tsExport(uint32_t* tSec, int16_t* rssi, int maxN) const {
 }
 
 void ClassicTracker::computeSlope() {
+  // x = 真实时间（秒），y = dBm → slope 单位 dBm/s。
+  // 旧实现用样本序号当 x，隐含按 4s 节奏校准 SLOPE_MIN=0.6/样本；
+  // 纪元调度后间隔非均匀（burst 内 2.8s、跨窗 17s），必须按时间归一，
+  // 否则判定松紧随节奏漂移（推演过 5+1 下灵敏度会偏 ~+20%）。
+  // SLOPE_MIN 同步改为 0.15 dBm/s（= 旧 0.6/样本 ÷ 4s，行为等价）。
   if (histCount_ < 3) {
     slope_ = 0;
     return;
   }
+  int firstIdx = -1;
+  for (int i = 0; i < histCount_; i++) {
+    int idx = (histHead_ - histCount_ + i + WIN * 2) % WIN;
+    if (hist_[idx] > -127) {
+      firstIdx = idx;
+      break;
+    }
+  }
+  if (firstIdx < 0) {
+    slope_ = 0;
+    return;
+  }
+  const uint32_t t0 = histMs_[firstIdx];
   float sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
   int n = 0;
   for (int i = 0; i < histCount_; i++) {
     int idx = (histHead_ - histCount_ + i + WIN * 2) % WIN;
     if (hist_[idx] <= -127) continue;
-    float x = (float)n;
+    // 无符号差值：millis 回绕时依然正确（样本跨度 << 2^32 ms）
+    float x = (float)(histMs_[idx] - t0) / 1000.0f;  // 秒
     float y = (float)hist_[idx];
     sumX += x;
     sumY += y;
@@ -571,6 +681,7 @@ void ClassicTracker::computeSlope() {
   }
   float denom = n * sumXX - sumX * sumX;
   if (fabsf(denom) < 1e-6f) {
+    // 所有样本同一时刻（或跨度过小）
     slope_ = 0;
     return;
   }
@@ -658,6 +769,28 @@ void ClassicTracker::loop() {
     inquiryStartMs_ = 0;
   }
 
+  // ===== 纪元转换日志（统一在 loop 上下文上送，回调里不碰 logShip）=====
+  if (epochActive_ != epochLoggedActive_) {
+    epochLoggedActive_ = epochActive_;
+    logShipf("[BT] EPOCH %s why=%s", epochActive_ ? "ACTIVE" : "IDLE",
+             epochWhy_);
+  }
+
+  // ===== 纪元退出三条件 =====
+  // ① 本纪元见过信号 → 连续 EPOCH_EXIT_MISS 次未见 = 信号消失（晨出/离场）
+  // ② 没见过信号 + 门已关 = 纯开门事件结束（人走路开门等）
+  // ③ 没见过信号 + 门开超过超时 = 降级回探针（防长开门烧占空比）
+  if (epochActive_) {
+    if (epochSawSignal_ && missCount_ >= EPOCH_EXIT_MISS) {
+      exitActiveEpoch("sig_lost");
+    } else if (!epochSawSignal_ && !doorOpen_) {
+      exitActiveEpoch("door_closed");
+    } else if (!epochSawSignal_ &&
+               (now - epochStartMs_) >= ACTIVE_NO_SIGNAL_TIMEOUT_MS) {
+      exitActiveEpoch("timeout");
+    }
+  }
+
   // 显式暂停时才停后台跟踪；SoftAP 慢速模式仍要扫（否则手机连热点时车走了永远不关）
   if (!autoTrack_ || inquiryPaused_ || !gBtReady || !targetSet_ || discRunning_ ||
       inquiryBusy_) {
@@ -668,13 +801,16 @@ void ClassicTracker::loop() {
     return;
   }
   if (millisReached(now, nextInquiryMs_)) {
-    // Inquiry 优先：4s 节奏（约 2.5s 占用 + 1.5s 空窗给 HTTP），不被 HTTP 推迟。
-    // HTTP 在空窗发送，发不完就放弃。
+    // Inquiry 优先，不被 HTTP 推迟；HTTP 只在纪元空窗/整窗发送。
+    // 节奏：IDLE = start+8s 探针（空窗 ~4.6s 给 HTTP）；
+    //       ACTIVE = 正常由 done 续扫/整窗接管，这里只是首发起点+回调丢失兜底。
     ensureBtuHeapForInquiry();
     ClassicTracker::noteInquiryStart();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
-    uint32_t gap = inquirySlow_ ? 15000 : 4000;
+    uint32_t gap = inquirySlow_ ? 15000
+                                : (epochActive_ ? ACTIVE_GAP_FALLBACK_MS
+                                                : PROBE_PERIOD_MS);
     nextInquiryMs_ = now + gap;
     uint8_t len = inquirySlow_ ? 1 : 2;  // 1≈1.28s，短一些少打网页
     esp_err_t err =

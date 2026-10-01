@@ -326,10 +326,15 @@
 // 以下仅保留给趋势/分区调试，门控不再单靠渐变
 #define RSSI_OPEN             -80     // （旧渐近开阈值，门控已统一）
 #define RSSI_FADE             -90     // 渐离弱信号阈值
-#define SLOPE_MIN             0.6f    // 渐变最小斜率 dBm/s
+#define SLOPE_MIN             0.15f   // 渐变最小斜率 dBm/s（20261002 按真实时间归一：
+                                      // 旧实现按样本序号=4s节奏时 0.6/样本 ≈ 0.15dBm/s，行为等价）
 #define T_CLEAR_MS            100000  // 门洞清空等待 100s
 #define T_SILENT_GAP_MS       10000   // 间隔多久算「突然出现」
 #define T_LOSS_BLIP_MS        4000    // 连续丢包多久算「突然消失」
+// 经典模式「仍算在线」窗口：必须 > IDLE 探针周期(8s) + inquiry(2.56s) +
+// 检出相位差(≤2.56s) ≈ 10.6s，否则探针节奏下 seen 会周期性闪 false
+// （BLE_SILENT_GAP_MS=8000 是 BLE 扫描节奏的口径，经典纪元调度不能复用）
+#define CLASSIC_SEEN_GAP_MS   12000
 
 // ===== 跟踪模式（二选一）=====
 // BLE_MODE: SU7 等有 BLE 广播的车

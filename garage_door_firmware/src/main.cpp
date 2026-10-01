@@ -45,7 +45,10 @@ static volatile bool gOtaActive = false;
 // http worker 发送前查询：蓝牙正在占射频（Inquiry/BLE 扫描）就等空隙
 static bool httpBtRadioBusy() {
   if (!gBtStackInited) return false;
-  return gBt.inquiryBusy() || gBleScan.busy();
+  // btQuietForHttp 含 inquiry + postQuiet 保护窗(800ms)：worker 不在保护窗里
+  // 起发——否则请求跨进下一发 inquiry（4s 时代跨窗打架、堆抖动的病根）。
+  // ACTIVE 整窗内 btQuietForHttp=false → 照常放行。
+  return gBt.inquiryBusy() || gBt.btQuietForHttp() || gBleScan.busy();
 }
 
 // 经典 BT + BLE 配对栈：SoftAP 调试时推迟，优先让网页先出来
@@ -728,17 +731,30 @@ static void serviceBootLongPress() {
 // 背景：dda0 曾在路由器侧网络正常时静默 33 分钟——WiFi.status() 一直报已连接，
 // 但 DNS/connect 全失败（deauth 漏收/DHCP 黑洞）。loopSta 只要 WL_CONNECTED 就
 // 提前 return，永远不会自救。这里补上数据面校验：发送结果说"网络层失败"才动手。
+// 20261002 弱网退避：dda0 实测 120s 限频下仍 76 次/2天 强制重连——每次重连的
+// 扫描+DHCP 瞬时吃掉最后几 KB（8BIT 总水位 p50 仅 7.5KB），是 BTU 4112 竞态
+// 的头号尖峰源。改为 120s→300s→600s 封顶逐级退避；HTTP 收到成功（streak 归零）
+// 即降回 1 级。踢完不再主动清 streak：留着它才能升级，成功自然会清。
 static void serviceStaDataWatchdog() {
   static uint32_t lastKickMs = 0;
+  static uint8_t kickLevel = 0;
   if (!gWeb.staConnected()) return;  // 真断开由 loopSta 节流重连，不归这里管
   if (httpClientWebBusy()) return;   // 本地网页正占射频发大响应：失败多半是自己造成的，别拆 WiFi
   int streak = httpClientNetFailStreak();
+  if (streak == 0) {
+    kickLevel = 0;  // 有成功 → 退避等级归零
+    return;
+  }
   if (streak < HTTP_NET_FAIL_KICK) return;
+  static const uint32_t kKickIntervalsMs[] = {120000UL, 300000UL, 600000UL};
   uint32_t now = millis();
-  if (lastKickMs != 0 && (now - lastKickMs) < 120000UL) return;  // 限频防抖
+  if (lastKickMs != 0 && (now - lastKickMs) < kKickIntervalsMs[kickLevel]) {
+    return;  // 限频防抖（逐级拉长）
+  }
   lastKickMs = now;
-  httpClientResetNetFail();
-  logShipf("[WEB] datagate sta=1 netfail=%d -> force STA reconnect", streak);
+  if (kickLevel < 2) kickLevel++;
+  logShipf("[WEB] datagate sta=1 netfail=%d lvl=%u -> force STA reconnect",
+           streak, (unsigned)kickLevel);
   gWeb.forceStaReconnect();
 }
 
@@ -898,11 +914,13 @@ static void serviceHeapDiag() {
                (unsigned)iIn.total_free_bytes,
                (unsigned)iIn.largest_free_block, (unsigned)gHeapFailN);
       // 精确 BTU/thin 统计：与 HEAPFAIL 抽样无关，status 同步上报
-      logShipf("[BTSTAT] inq=%u thin=%u btufail=%u fail=%u maxblk=%u",
+      // mode: 0=IDLE(8s探针) 1=ACTIVE(5+1) —— 验收按时段分开统计用
+      logShipf("[BTSTAT] inq=%u thin=%u btufail=%u fail=%u maxblk=%u mode=%u",
                (unsigned)ClassicTracker::inqCount(),
                (unsigned)ClassicTracker::thinCount(),
                (unsigned)ClassicTracker::btuFailCount(), (unsigned)gHeapFailN,
-               (unsigned)i8.largest_free_block);
+               (unsigned)i8.largest_free_block,
+               (unsigned)(gBt.epochActive() ? 1 : 0));
     }
   }
   if (now - lastStack >= 10000) {
@@ -1784,6 +1802,8 @@ void loop() {
   if (gBtStackInited) {
     // 二选一：经典模式才跑 Inquiry 调度；BLE 模式 gBt 未 begin，loop 空转即可
     if (gWeb.trackMode() == TRACK_MODE_CLASSIC) {
+      // 门态喂入：开门沿 → ACTIVE 纪元（晨间出库的信号窗由事件锚定）
+      gBt.setDoorOpen(gDoor.doorState() == DoorState::OPEN);
       gBt.loop();
     }
     gBleBond.service();  // 内部 begun_ 门闩：经典模式直接 return
@@ -2055,7 +2075,9 @@ void loop() {
     if (gBtStackInited && gWeb.trackMode() == TRACK_MODE_CLASSIC &&
         gBt.ready() && gBt.autoTrack() && gBt.hasTarget()) {
       int r = gBt.lastRssi();
-      bool seen = gBt.seenRecently(BLE_SILENT_GAP_MS);
+      // 经典纪元调度下 IDLE 探针 8s 一发 → 见面间隔最坏 ~10.6s，
+      // 用 BLE 的 8s 阈值会周期性误判丢失（见 CLASSIC_SEEN_GAP_MS 注释）
+      bool seen = gBt.seenRecently(CLASSIC_SEEN_GAP_MS);
       bool hasSignal = seen && r >= RSSI_APPEAR_MIN;
       bool isStrong = hasSignal && r >= RSSI_STRONG;
       bool isFar = false;

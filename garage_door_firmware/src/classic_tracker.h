@@ -27,10 +27,22 @@ struct ClassicDeviceItem {
 
 // 经典蓝牙搜索 + 目标车机 RSSI 跟踪
 // 手机「可被搜索」/车机蓝牙 用经典 BT Inquiry，不是 BLE 广播
+//
+// 两态纪元调度（20261002）：
+//  IDLE  — 每 PROBE_PERIOD_MS(8s) 一发 len=2 探针。8s 周期保证接住晨间
+//          ~10s 出库信号窗（有效窗7s + 探针2.56s > 8s → 零漏检），占空比 32%。
+//  ACTIVE — 开门事件（NFC/远程/自动开）或探针命中目标触发；5 次连续
+//          inquiry + 3s HTTP 整窗循环（5+1）。信号消失/门关/超时退出。
+//  交替只发生在纪元边界：IDLE 内 HTTP 与 inquiry 不再每 4s 交错互踩，
+//  ACTIVE 内 HTTP 只在整窗出现（不跨窗打架）。
 class ClassicTracker {
  public:
   bool begin(const char* macStr);
   void loop();
+  // 门状态喂入（main 每轮调用）：开门沿进入 ACTIVE 纪元——晨间出库的
+  // 信号窗由开门事件锚定，不依赖探针相位
+  void setDoorOpen(bool open);
+  bool epochActive() const { return epochActive_; }
   // 是否已真正 init（网页扫描前判断，避免未起栈就 Inquiry）
   bool ready() const { return ready_; }
 
@@ -100,12 +112,20 @@ class ClassicTracker {
   void computeSlope();
   void classifyTrend(bool visible, int rssi);
   void updateZone();
+  // 纪元调度（实现见 .cpp 常量区）
+  void enterActiveEpoch(const char* why);
+  void exitActiveEpoch(const char* why);
+  void openHttpWindow();
+  bool inHttpWindow() const;  // 实现在 .cpp（millisBefore 在 config.h）
 
   String targetMac_;
   bool targetSet_ = false;
 
   static constexpr int WIN = 10;
   int8_t hist_[WIN] = {0};
+  // 采样时刻（毫秒）：slope 按真实时间归一成 dBm/s——纪元调度后采样间隔
+  // 非均匀（burst 内 2.8s / 跨窗 17s），按样本序号算会随节奏漂移灵敏度
+  uint32_t histMs_[WIN] = {0};
   uint8_t histCount_ = 0;
   uint8_t histHead_ = 0;
 
@@ -139,6 +159,16 @@ class ClassicTracker {
   bool autoTrack_ = false;
   uint8_t missCount_ = 0;
   bool ready_ = false;
+
+  // ===== 两态纪元状态 =====
+  bool epochActive_ = false;      // false=IDLE(8s探针) / true=ACTIVE(5+1)
+  bool epochSawSignal_ = false;   // 本纪元内是否见过目标（退出条件用）
+  bool doorOpen_ = false;         // main 喂入的门态（边沿触发开门进 ACTIVE）
+  uint8_t burstDone_ = 0;         // 本 burst 已完成次数（0..BURST_N-1 续扫）
+  uint32_t epochStartMs_ = 0;
+  uint32_t windowUntilMs_ = 0;    // ACTIVE 的 HTTP 整窗截止；0=不在窗内
+  const char* epochWhy_ = "boot"; // 最近一次纪元切换原因（loop 统一打日志）
+  bool epochLoggedActive_ = false; // loop 侧：epochWhy_ 是否已上送
 
   // 精确统计（静态，钩子/loop 共用；volatile 防优化）
   static volatile uint32_t s_inqCount;
