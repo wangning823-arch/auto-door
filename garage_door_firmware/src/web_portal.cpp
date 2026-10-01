@@ -1,12 +1,14 @@
 #include "web_portal.h"
 #include "config.h"
 #include "http_client.h"
+#include "log_ship.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include "ble_bond.h"
 #include <lwip/sockets.h>
 #include <errno.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 
 static WebServer server(80);
 static WebPortal* gPortal = nullptr;
@@ -1010,9 +1012,14 @@ void WebPortal::startStaFromStore() {
   WiFi.setSleep(true);
 
   // 已去 mDNS（产品不需要，且 ESPmDNS+BT 易崩）：web/OTA 一律用 STA IP
-  Serial.println("[WEB] STA begin ssid=" + ssid);
+  // 进环：WiFi.begin 若再挂（dda0 1246 教训），VPS 能看到挂之前的堆水位
+  logShipf("[WEB] STA begin ssid=%s max8=%u heap=%u ap=%d",
+           ssid.c_str(),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+           (int)apActive_);
   WiFi.begin(ssid.c_str(), pass.c_str());
-  Serial.println("[WEB] WiFi.begin called");
+  logShipf("[WEB] WiFi.begin called ok");
   staTrying_ = true;
   staNextRetryMs_ = millis() + 15000;
 }
@@ -1033,11 +1040,14 @@ void WebPortal::learnStaAp() {
 void WebPortal::beginSta(const String& ssid, const String& pass) {
   if (staHaveBssid_ && !staDirPending_) {
     staDirPending_ = true;
-    Serial.printf("[WEB] STA begin directed ch=%u bssid=%02X:..:%02X\n",
-                  (unsigned)staChannel_, staBssid_[0], staBssid_[5]);
+    logShipf("[WEB] STA begin directed ch=%u bssid=%02X:..:%02X max8=%u",
+             (unsigned)staChannel_, staBssid_[0], staBssid_[5],
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
     WiFi.begin(ssid.c_str(), pass.c_str(), staChannel_, staBssid_);
     return;
   }
+  logShipf("[WEB] STA begin broadcast max8=%u",
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
   WiFi.begin(ssid.c_str(), pass.c_str());
 }
 
@@ -1106,8 +1116,11 @@ void WebPortal::loopSta() {
       learnStaAp();  // 每次连上/每15s 刷新一次，覆盖 AP 换信道的情况
       if (staTrying_) {
         staTrying_ = false;
-        Serial.println("[WEB] STA connected ip=" + WiFi.localIP().toString() +
-                       " http=" + String(serverStarted_ ? "up" : "down"));
+        logShipf("[WEB] STA connected ip=%s http=%s heap=%u maxblk=%u",
+                 WiFi.localIP().toString().c_str(),
+                 serverStarted_ ? "up" : "down",
+                 (unsigned)ESP.getFreeHeap(),
+                 (unsigned)ESP.getMaxAllocHeap());
       } else if (Serial.availableForWrite() > 160) {
         Serial.printf("[WEB] sta=up ip=%s http=%s heap=%u maxblk=%u\n",
                       WiFi.localIP().toString().c_str(),

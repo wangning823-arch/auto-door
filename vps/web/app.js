@@ -283,7 +283,13 @@
       statusItem("门状态", st.door === 1 ? "开" : (st.door === 2 ? "关" : "未知"), ""),
       statusItem("跟踪模式", modeS, ""),
       statusItem("配对", pairS, st.pair && st.pair.open ? "warn" : ""),
-      statusItem("车机 RSSI", st.car_rssi != null ? st.car_rssi : "-", ""),
+      statusItem(
+        st.mode === 0 ? "BLE RSSI" : "车机 RSSI",
+        st.mode === 0
+          ? (st.ble && st.ble.rssi != null ? st.ble.rssi : "-")
+          : (st.car_rssi != null ? st.car_rssi : "-"),
+        ""
+      ),
       statusItem("堆内存", st.heap != null ? st.heap : "-", ""),
       statusItem("最大块", st.maxblk != null ? st.maxblk : "-", ""),
       statusItem("WiFi RSSI", st.rssi != null ? st.rssi : "-", ""),

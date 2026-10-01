@@ -88,9 +88,9 @@ static void initBtStacks() {
     }
   }
   gBtStackInited = true;
-  Serial.printf("[BT] init stacks COMPLETE heap=%u begun=%d classic_ready=%d\n",
-                (unsigned)ESP.getFreeHeap(), (int)gBleBond.begun(),
-                (int)gBt.ready());
+  logShipf("[BT] init stacks COMPLETE heap=%u begun=%d classic_ready=%d",
+           (unsigned)ESP.getFreeHeap(), (int)gBleBond.begun(),
+           (int)gBt.ready());
 }
 
 static void serviceBtStackInit() {
@@ -1645,8 +1645,9 @@ void setup() {
     Serial.println("[BOOT] WIFI_DEBUG_BOOT_ON=1 → 忽略 NVS wifi_on=0，强制开 SoftAP");
   }
 #endif
-  Serial.println("[BOOT] wifiOn=" + String(wifiOn ? 1 : 0) +
-                 " debug_boot=" + String(WIFI_DEBUG_BOOT_ON ? 1 : 0));
+  logShipf("[BOOT] wifiOn=%d debug_boot=%d max8=%u",
+           wifiOn ? 1 : 0, WIFI_DEBUG_BOOT_ON ? 1 : 0,
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
   // NFC：上电约 5s 后自动 init（原先永久 deferred，断电后刷卡会失效）
   Serial.println("[BOOT] NFC auto-init scheduled (~5s)");
@@ -1683,25 +1684,26 @@ void setup() {
 
   // SoftAP=0：先 BT 栈，再 STA（并行会 SW_CPU_RESET）
   if (wifiOn) {
-    Serial.println("[BOOT] SoftAP on → BT/BLE 栈推迟到关热点后；NFC 空闲时自动 init");
+    logShipf("[BOOT] SoftAP on → BT/BLE 栈推迟到关热点后；NFC 空闲时自动 init");
   } else {
-    Serial.println("[BOOT] BT first (no STA), then start STA...");
+    logShipf("[BOOT] BT first (no STA), then start STA...");
     delay(200);
     initBtStacks();
-    Serial.println("[BOOT] after initBtStacks, before STA...");
+    logShipf("[BOOT] after initBtStacks, before STA... max8=%u",
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
     delay(1500);
     if (gWeb.staConfigured()) {
-      Serial.println("[BOOT] startStaFromStore...");
+      logShipf("[BOOT] startStaFromStore...");
       gWeb.startStaFromStore();
-      Serial.println("[BOOT] startStaFromStore returned");
+      logShipf("[BOOT] startStaFromStore returned");
     } else {
-      Serial.println("[BOOT] No STA configured.");
+      logShipf("[BOOT] No STA configured.");
     }
   }
 
-  Serial.println("[BOOT] ready. fw=" FW_VERSION " wifi=" +
-                 String(wifiOn ? 1 : 0) +
-                 " bt_inited=" + String(gBtStackInited ? 1 : 0));
+  logShipf("[BOOT] ready. fw=%s wifi=%d bt_inited=%d max8=%u",
+           FW_VERSION, wifiOn ? 1 : 0, (int)(gBtStackInited ? 1 : 0),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
   Serial.printf("[BOOT] ready t=%ums SDA16=%d SCL17=%d\n", (unsigned)millis(),
                 digitalRead(PIN_NFC_SDA), digitalRead(PIN_NFC_SCL));
   if (wifiOn) {
@@ -1928,6 +1930,18 @@ void loop() {
             "[BLE] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d inGar=%d strongOK=%d phase=%d\n",
             r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
             (int)gLeaveQual, (int)gInGarage, (int)gStrongOpenReady, (int)phase);
+        // 关键变化进日志环（VPS 可回放 BLE RSSI 曲线）；与经典路径的节流一致
+        static int lastShipBleRssi = -999;
+        static int lastShipBleSeen = -1;
+        if ((int)seen != lastShipBleSeen ||
+            (seen && abs(r - lastShipBleRssi) >= 5)) {
+          lastShipBleSeen = (int)seen;
+          lastShipBleRssi = seen ? r : -999;
+          logShipf("[BLE] rssi=%d strong=%d far=%d lost=%d trueNo=%d leaveQ=%d inGar=%d strongOK=%d phase=%d",
+                   r, (int)isStrong, (int)isFar, (int)lost, (int)gTrueNo,
+                   (int)gLeaveQual, (int)gInGarage, (int)gStrongOpenReady,
+                   (int)phase);
+        }
 
         switch (phase) {
           case BlePhase::WAIT_SIGNAL:
@@ -2186,13 +2200,29 @@ void loop() {
     // 旧写法在 logShipf 外面再包一层 availableForWrite>96：无串口主机的设备
     // FIFO 恒满 → 心跳整段丢失（1388 8 小时 0 条 [LOG] 实证），断网期
     // sta/rssi 面包屑全丢。现在只让串口那一半承担门控。
+    // rssi 段按跟踪模式取信号源：经典→gBt；BLE→gBleScan（否则 BLE 模式下
+    // 心跳永远显示经典路径的旧值/-127）。
+    String rssiSeg;
+    if (trackMode == TRACK_MODE_BLE) {
+      char b[96];
+      int r = gBleScan.matchRssi();
+      bool seen = gBleScan.lastMatchMs() != 0 &&
+                  (millis() - gBleScan.lastMatchMs()) < BLE_SILENT_GAP_MS;
+      snprintf(b, sizeof(b), "rssi=%d raw=%d seen=%d label=%s", r, r,
+               seen ? 1 : 0,
+               gBleScan.matchLabel().length() ? gBleScan.matchLabel().c_str()
+                                              : "-");
+      rssiSeg = b;
+    } else {
+      rssiSeg = gBt.debugLine();
+    }
     logShipf(
         "[LOG] heap=%u maxblk=%u sta=%d http=%s | %s | %s | %s",
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
         (int)gWeb.staConnected(),
         gWeb.staConnected() ? "up" : "down",
-        gDoor.debugLine().c_str(), gBt.debugLine().c_str(),
+        gDoor.debugLine().c_str(), rssiSeg.c_str(),
         gNfc.debugLine().c_str());
   }
 }

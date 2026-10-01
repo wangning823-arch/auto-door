@@ -8,6 +8,7 @@
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
 #include <esp_heap_caps.h>
+#include <WiFi.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error "Classic Bluetooth not enabled"
@@ -42,6 +43,14 @@ static uint32_t btLargest8() {
 static const uint32_t kBtuReserveSize = 8192;  // ≥4112，WiFi 2308 抢走后仍可能剩 ≥4112
 static const uint32_t kBtuReserveRearmMin = 12288;
 static void* s_btuReserve = nullptr;
+// 首持推迟：begin() 只置 armed，真正 force hold 在 serviceBtuReserve（loop 阶段，
+// 且等 STA 连上或开机 30s）——setup 里 startStaFromStore→WiFi.begin 之前堆里
+// 绝不能多钉 8192。20261001 dda0 实锤：1246 在 begin() 就 hold → WiFi.begin 时
+// max8=40948 差一口气 → wifi:ieee80211_ioctl.c 1612 → wifi task WDT 死循环；
+// 1388 同镜像 max8=45044 侥幸过。同镜像同配置，纯碎片阈值差异。
+static bool s_btuResArmed = false;
+static bool s_btuResEverHeld = false;  // 持过一次后不再 force 抢，交给 rearm 规则
+static uint32_t s_btuResNextTryMs = 0;
 
 void BleTracker::noteAllocFail(size_t size, const char* task) {
   // 钩子内：只计数+置位，严禁分配/printf/free
@@ -66,6 +75,7 @@ static void btuReserveTryHoldForce() {
   if (s_btuReserve) return;
   s_btuReserve = heap_caps_malloc(kBtuReserveSize, MALLOC_CAP_8BIT);
   if (s_btuReserve) {
+    s_btuResEverHeld = true;
     logShipf("[HEAP] BTU reserve held force sz=%u max8=%u",
              (unsigned)kBtuReserveSize, (unsigned)btLargest8());
   }
@@ -85,7 +95,17 @@ void BleTracker::serviceBtuReserve() {
   if (s_btuResGiveReq) {
     s_btuResGiveReq = false;
     btuReserveDrop("btu_fail");
+    return;
   }
+  // 首持（仅一次）：STA 连上或开机 30s 后才 force hold；
+  // 之前 WiFi.begin 已安全返回，堆最坏也就是稳态碎片，与 2318 持平
+  if (!s_btuResArmed || s_btuResEverHeld || s_btuReserve) return;
+  const bool staUp = WiFi.status() == WL_CONNECTED;
+  if (!staUp && millis() < 30000UL) return;
+  const uint32_t now = millis();
+  if (now < s_btuResNextTryMs) return;
+  s_btuResNextTryMs = now + 5000UL;  // malloc 失败（碎片期）每 5s 重试
+  btuReserveTryHoldForce();
 }
 
 // ===== Inquiry 同步 BT 气囊（不降低 inquiry 频率）=====
@@ -302,8 +322,9 @@ bool BleTracker::begin(const char* macStr) {
   // BT 栈起来后立刻抢 BT 气囊：此时堆还干净，dda0 后期 maxblk 常只剩 4084，
   // 等“宽裕再 hold”会永远 hold 不上。
   btAirTryHoldForce();
-  // 同时持 BTU 专用应急块（与 OTA 气囊分离）：inquiry 前仅在 max8<4112 时释放
-  btuReserveTryHoldForce();
+  // BTU 应急块：只置 armed，真正 hold 推迟到 STA 连上后（serviceBtuReserve）。
+  // setup 期 WiFi.begin 前多钉 8192 会把 dda0 推过 wifi WDT 阈值（见常量处注释）。
+  s_btuResArmed = true;
 
   Serial.printf("[BT] target MAC %s -> %s\n", macStr, targetSet_ ? "OK" : "INVALID");
   nextInquiryMs_ = millis() + 1000;
