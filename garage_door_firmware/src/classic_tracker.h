@@ -63,6 +63,10 @@ class ClassicTracker {
   static bool btuReserveHeld();
   // staUp: STA 是否已连（由 main 传入，本模块不依赖 WiFi）
   static void serviceBtuReserve(bool staUp);
+  // 我们主动钉住的堆字节数（BT air 气囊 + BTU 应急堆）。
+  // main 判 heapThin 时要把它加回 maxblk：hold 是设计行为不是碎片，
+  // 否则 1743 实锤——每轮 hold 把 maxblk 压到 4084 <4600 → 日志/status 被静默。
+  static uint32_t pinnedHeapBytes();
   // 超过 20s 未再扫到 → 返回 -127，避免网页显示卡住的旧 RSSI
   int lastRssi() const;
   int lastRssiRaw() const { return lastRssi_; }

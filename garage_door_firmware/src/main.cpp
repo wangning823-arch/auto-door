@@ -1822,8 +1822,12 @@ void loop() {
         gBtStackInited && (gBt.inquiryBusy() || gBleScan.busy());
     // 弱网 dda0：maxblk 常在 4852↔1500 震荡；堆薄时连 poll 也停，
     // 避免 WiFi 数据面继续把连续块打碎到 <4112（BTU 4112）
+    // 20261001 1743 实锤：BT air/BTU reserve 每轮 inquiry 后主动 hold 4608，
+    // 把 maxblk 压到 4084 <4600 → heapThin 恒真 → 日志/status 全程被静默、
+    // 环挤满丢行。hold 是设计行为不是碎片——把钉住的字节加回再判薄。
     const uint32_t maxblkNow =
-        heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+        heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT) +
+        ClassicTracker::pinnedHeapBytes();
     const bool heapThin = maxblkNow < 4600;
     const bool btQuiet =
         gBtStackInited && (btBusy || gBt.btQuietForHttp() || heapThin);

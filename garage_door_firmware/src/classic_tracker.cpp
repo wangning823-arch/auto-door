@@ -34,6 +34,18 @@ static uint32_t btLargest8() {
   return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
 
+// held/drop 行节流：1743 实测每 4s 一对 held/drop + reserve 对，
+// 日志产量 ~3× 把 2560B RTC 环 1 分钟挤满 → 最旧行被 ringPush 挤掉（永久丢日志），
+// 同时 maxblk 被主动 hold 压到 4084 误触发 main 的 heapThin 静默（见 pinnedHeapBytes）。
+// 纯时间节流：60s 内最多一条 churn 行（hold/drop 共享计数，交替尺寸无法靠 sz 区分）。
+static uint32_t s_airLogMs = 0;
+static bool airLogDue() {
+  uint32_t now = millis();
+  if (s_airLogMs != 0 && (int32_t)(now - s_airLogMs) < 60000) return false;
+  s_airLogMs = now;
+  return true;
+}
+
 // ===== BTU 专用应急堆（20260930 dda0；20261001 尺寸自适应）=====
 // 根因：BT air / OTA 气囊在 inquiry 前一次性给完，autoTrack 下不再 rearm；
 // dda0 碎片期 max8 常 2292~4084，BTU 4112 必挂且 thin≈btufail。
@@ -69,8 +81,11 @@ static void btuReserveDrop(const char* why) {
   free(s_btuReserve);
   s_btuReserve = nullptr;
   s_btuReserveSz = 0;
-  logShipf("[HEAP] BTU reserve dropped why=%s max8=%u", why,
-           (unsigned)btLargest8());
+  // btu_fail 低频且是关键事件 → 必打；thin_before_inq 可能每轮交替 → 走节流
+  if (strcmp(why, "btu_fail") == 0 || airLogDue()) {
+    logShipf("[HEAP] BTU reserve dropped why=%s max8=%u", why,
+             (unsigned)btLargest8());
+  }
 }
 
 // 自适应尺寸 hold：从大到小试，每档要求 largest ≥ sz+2308（给 WiFi 2308 留位），
@@ -85,8 +100,10 @@ static bool btuReserveTryHoldAdaptive() {
     s_btuReserve = heap_caps_malloc(sz, MALLOC_CAP_8BIT);
     if (s_btuReserve) {
       s_btuReserveSz = sz;
-      logShipf("[HEAP] BTU reserve held sz=%u max8=%u", (unsigned)sz,
-               (unsigned)btLargest8());
+      if (airLogDue()) {
+        logShipf("[HEAP] BTU reserve held sz=%u max8=%u", (unsigned)sz,
+                 (unsigned)btLargest8());
+      }
       return true;
     }
   }
@@ -122,6 +139,11 @@ void ClassicTracker::serviceBtuReserve(bool staUp) {
 static const uint32_t kBtAirSize = 8192;
 static const uint32_t kBtAirSizeMin = 4608;  // 至少盖住 BTU 4112
 static void* s_btAir = nullptr;
+static uint32_t s_btAirSz = 0;
+
+uint32_t ClassicTracker::pinnedHeapBytes() {
+  return (s_btAir ? s_btAirSz : 0) + s_btuReserveSz;
+}
 
 static void btAirTryHoldForce() {
   if (s_btAir) return;
@@ -132,6 +154,7 @@ static void btAirTryHoldForce() {
     sz = kBtAirSizeMin;
   }
   if (s_btAir) {
+    s_btAirSz = sz;
     logShipf("[HEAP] BT air held force sz=%u max8=%u", (unsigned)sz,
              (unsigned)btLargest8());
   }
@@ -151,14 +174,20 @@ static void btAirTryHold() {
   if (largest >= 12288) {
     s_btAir = malloc(kBtAirSize);
     if (s_btAir) {
-      logShipf("[HEAP] BT air held max8=%u", (unsigned)btLargest8());
+      s_btAirSz = kBtAirSize;
+      if (airLogDue()) {
+        logShipf("[HEAP] BT air held max8=%u", (unsigned)btLargest8());
+      }
       return;
     }
   }
   if (largest < 4608 + kBtuReserveWifiGap) return;
   s_btAir = malloc(kBtAirSizeMin);
   if (s_btAir) {
-    logShipf("[HEAP] BT air held min max8=%u", (unsigned)btLargest8());
+    s_btAirSz = kBtAirSizeMin;
+    if (airLogDue()) {
+      logShipf("[HEAP] BT air held min max8=%u", (unsigned)btLargest8());
+    }
   }
 }
 
@@ -166,7 +195,11 @@ static void btAirDropForInquiry() {
   if (s_btAir) {
     free(s_btAir);
     s_btAir = nullptr;
-    logShipf("[HEAP] BT air drop for inquiry max8=%u", (unsigned)btLargest8());
+    if (airLogDue()) {
+      logShipf("[HEAP] BT air drop for inquiry max8=%u",
+               (unsigned)btLargest8());
+    }
+    s_btAirSz = 0;
   }
 }
 
