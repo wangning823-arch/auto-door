@@ -12,6 +12,14 @@ commits: 7a50a16..
 
 ## Report
 
+**当前进度（2026-10-01 08:21）**
+
+- 分支：`fix/dda0-btu-fail-zero`（基线 `7a50a16`）
+- 固件：`0.2.202610010737`（commit `6c0570f`）
+- **garage-1388**：已 OTA，15min 窗口 `btufail_delta=0`（0.0/10min）**PASS**；日志/status 正常；NFC ok。
+- **garage-dda0**：07:55/08:06 下发 update；08:04:18 `dev poll consumed cmd=update fw=0.2.202609302318` 后 **失联**（至 08:21 仍 offline，`last_seen_ago≈950s`）。固件已挂在 VPS `/ota/`，设备回来后 sticky/重发即可升级。**dda0 归零验收未完成。**
+- 过程教训：`POST_INQUIRY_QUIET_MS=1500` 会吃光 inquiry 周期内的 HTTP 空窗 → 1388 日志全断；已回退 800ms。
+
 ## [S1] Problem
 
 目标：`garage-dda0` 的 BTU fail 速率降到 **每 10 分钟 ≤ 2 次**（日志 `[BTUFAIL]` / `BTSTAT.btufail` 口径）。
@@ -103,4 +111,4 @@ dda0 关键现象：
 - [ ] T2: 实现 BTU 专用应急堆 + quiet 延长 + 释放/收回契约 — acceptance: `ble_tracker.*` 有 reserve held/dropped/rearmed 日志；thin 时释放 8192；`largest8<4112` 才释放；≥12288 才 rearm；POST_INQUIRY_QUIET_MS=1500 (covers: S2)
 - [ ] T3: 编译固件并 commit 到 `fix/dda0-btu-fail-zero` — acceptance: `platformio run -e esp32dev` 成功；`FW_VERSION` 更新；git 有可追溯 commit (covers: S2; depends: T2)
 - [ ] T4: OTA 发布并先验证 garage-1388 — acceptance: 1388 fw 变为新版本；≥15min 日志 btufail≤2/10min 且无回归；问题则回退重改 (covers: S2; depends: T3)
-- [ ] T5: OTA 到 garage-dda0 并验证 BTU 归零 — acceptance: dda0 fw 升级；≥15min `btufail` 增量≤2/10min；若仍超则迭代 (covers: S2; depends: T4)
+- [ ] T5: OTA 到 garage-dda0 并验证 BTU 归零 — acceptance: dda0 fw 升级；≥15min `btufail` 增量≤2/10min；若仍超则迭代 (covers: S2; depends: T4) — **BLOCKED**: 设备在 consume update 后失联，无法 OTA/验收；固件已在 VPS，待 dda0 恢复联网后重发 update
