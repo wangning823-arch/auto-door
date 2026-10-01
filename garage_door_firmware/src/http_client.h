@@ -27,6 +27,11 @@ using HttpBtBusyFn = bool (*)();
 #define HTTP_NET_FAIL_KICK 4
 #endif
 
+// NFC probe/hwInit 期间禁止出向 HTTP：1388 panic 指纹是 nfc.probe+ls.flush+http.io
+// 同时碰碎片堆；probe 闸打开后新单拒绝、在飞单在 job 入口放弃（不计入 netfail）
+void httpSetNfcBusy(bool busy);
+bool httpNfcBusy();
+
 // 提交后这么久仍未被 worker 取走（结果必丢）→ 合成失败释放该 owner
 #ifndef HTTP_STUCK_UNPICKED_MS
 #define HTTP_STUCK_UNPICKED_MS 300000UL
