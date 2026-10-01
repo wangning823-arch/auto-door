@@ -970,6 +970,12 @@ void NfcReader::maybeRecover() {
       return;
     }
     if (!millisReached(now, bootInitAt_)) return;
+    // STA 配置了但还没连上：最多等到 20s 再 probe。
+    // 1388 panic 指纹 nfc.probe 与 WiFi/HTTP 并发；探测延后到 STA 就绪更安全。
+    if (WiFi.status() != WL_CONNECTED && millis() < 20000UL) {
+      bootInitAt_ = now + 500;
+      return;
+    }
     // STA 网页未起来时再等一会：无芯片探测也别和 DHCP/HTTP 抢 loop
     // （有 STA 配置且未连上时最多等到 15s；无 STA 则按原 5s）
     // 注：探测本身仅 ~120ms，这里主要让 HTTP 先出日志/可访问
