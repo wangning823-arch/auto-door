@@ -35,21 +35,23 @@ static uint32_t btLargest8() {
   return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 }
 
-// ===== BTU 专用应急堆（20260930 dda0）=====
+// ===== BTU 专用应急堆（20260930 dda0；20261001 尺寸自适应）=====
 // 根因：BT air / OTA 气囊在 inquiry 前一次性给完，autoTrack 下不再 rearm；
 // dda0 碎片期 max8 常 2292~4084，BTU 4112 必挂且 thin≈btufail。
-// 应急块与 OTA 气囊分离：只在 largest8<4112（或 BTU 失败）时释放，
-// 稳态 maxblk≈4340/5620 时禁止 rearm，避免 4340-8192 把 BTU 又饿死。
-static const uint32_t kBtuReserveSize = 8192;  // ≥4112，WiFi 2308 抢走后仍可能剩 ≥4112
-static const uint32_t kBtuReserveRearmMin = 12288;
+// 应急块与 OTA 气囊分离：只在 largest8<4112（或 BTU 失败）时释放。
+// 20261001 实测：固定 8192 在 dda0 稳态（maxblk 2292~7156）永远抓不到
+// → 自适应降级：8192 失败试 6144，再失败试 4608（仍 ≥ BTU 的 4112）。
+// 每档都要求 largest ≥ sz+2308（给 WiFi 2308 留位置），抓到哪档算哪档。
+static const uint32_t kBtuReserveSizes[] = {8192, 6144, 4608};
+static const uint32_t kBtuReserveWifiGap = 2308;
 static void* s_btuReserve = nullptr;
+static uint32_t s_btuReserveSz = 0;
 // 首持推迟：begin() 只置 armed，真正 force hold 在 serviceBtuReserve（loop 阶段，
 // 且等 STA 连上或开机 30s）——setup 里 startStaFromStore→WiFi.begin 之前堆里
-// 绝不能多钉 8192。20261001 dda0 实锤：1246 在 begin() 就 hold → WiFi.begin 时
+// 绝不能多钉大块。20261001 dda0 实锤：1246 在 begin() 就 hold → WiFi.begin 时
 // max8=40948 差一口气 → wifi:ieee80211_ioctl.c 1612 → wifi task WDT 死循环；
 // 1388 同镜像 max8=45044 侥幸过。同镜像同配置，纯碎片阈值差异。
 static bool s_btuResArmed = false;
-static bool s_btuResEverHeld = false;  // 持过一次后不再 force 抢，交给 rearm 规则
 static uint32_t s_btuResNextTryMs = 0;
 
 void BleTracker::noteAllocFail(size_t size, const char* task) {
@@ -67,28 +69,29 @@ static void btuReserveDrop(const char* why) {
   if (!s_btuReserve) return;
   free(s_btuReserve);
   s_btuReserve = nullptr;
+  s_btuReserveSz = 0;
   logShipf("[HEAP] BTU reserve dropped why=%s max8=%u", why,
            (unsigned)btLargest8());
 }
 
-static void btuReserveTryHoldForce() {
-  if (s_btuReserve) return;
-  s_btuReserve = heap_caps_malloc(kBtuReserveSize, MALLOC_CAP_8BIT);
-  if (s_btuReserve) {
-    s_btuResEverHeld = true;
-    logShipf("[HEAP] BTU reserve held force sz=%u max8=%u",
-             (unsigned)kBtuReserveSize, (unsigned)btLargest8());
-  }
-}
-
-static void btuReserveTryRearm() {
-  if (s_btuReserve) return;
+// 自适应尺寸 hold：从大到小试，每档要求 largest ≥ sz+2308（给 WiFi 2308 留位），
+// 抓到哪档算哪档。drop 后 4608 空间即可盖住 BTU 4112。
+static bool btuReserveTryHoldAdaptive() {
+  if (s_btuReserve) return true;
   const uint32_t largest = btLargest8();
-  if (largest < kBtuReserveRearmMin) return;
-  s_btuReserve = heap_caps_malloc(kBtuReserveSize, MALLOC_CAP_8BIT);
-  if (s_btuReserve) {
-    logShipf("[HEAP] BTU reserve rearmed max8=%u", (unsigned)btLargest8());
+  for (uint32_t i = 0; i < sizeof(kBtuReserveSizes) / sizeof(kBtuReserveSizes[0]);
+       i++) {
+    const uint32_t sz = kBtuReserveSizes[i];
+    if (largest < sz + kBtuReserveWifiGap) continue;
+    s_btuReserve = heap_caps_malloc(sz, MALLOC_CAP_8BIT);
+    if (s_btuReserve) {
+      s_btuReserveSz = sz;
+      logShipf("[HEAP] BTU reserve held sz=%u max8=%u", (unsigned)sz,
+               (unsigned)btLargest8());
+      return true;
+    }
   }
+  return false;
 }
 
 void BleTracker::serviceBtuReserve() {
@@ -97,15 +100,16 @@ void BleTracker::serviceBtuReserve() {
     btuReserveDrop("btu_fail");
     return;
   }
-  // 首持（仅一次）：STA 连上或开机 30s 后才 force hold；
-  // 之前 WiFi.begin 已安全返回，堆最坏也就是稳态碎片，与 2318 持平
-  if (!s_btuResArmed || s_btuResEverHeld || s_btuReserve) return;
+  // hold 窗口重试（非一次性）：首持条件满足后每 5s 试一次自适应 hold。
+  // drop（inquiry 前腾块/btu_fail）后靠这里抓回来，不再依赖 ≥12288 才 rearm
+  // ——1656 实测 dda0 稳态永远到不了 12288，reserve 一次 drop 就永久消失。
+  if (!s_btuResArmed || s_btuReserve) return;
   const bool staUp = WiFi.status() == WL_CONNECTED;
   if (!staUp && millis() < 30000UL) return;
   const uint32_t now = millis();
   if (now < s_btuResNextTryMs) return;
-  s_btuResNextTryMs = now + 5000UL;  // malloc 失败（碎片期）每 5s 重试
-  btuReserveTryHoldForce();
+  s_btuResNextTryMs = now + 5000UL;
+  btuReserveTryHoldAdaptive();
 }
 
 // ===== Inquiry 同步 BT 气囊（不降低 inquiry 频率）=====
@@ -139,9 +143,11 @@ static void btAirTryHold() {
   // 1913：drop 后门槛过低会立刻 re-hold，BTU 只剩 4084。
   // 2206 实测：largest≥8000 就收 4608 会把最大块切到 4084（4608+4112>8000），
   // inquiry 前永远 thin，BTU 4112 必挂。
-  // 安全门槛：收 4608 须 largest≥10000（留出 BTU 4112 + WiFi 2308 + 余量）；
-  // 收 8192 仍 ≥12288。仅 inquiry 空闲时调用；启动前一律 drop。
-  if (largest < 10000) return;
+  // 20261001 dda0：门槛 10000 太高（稳态 maxblk 7156，气囊 drop 后永远抓不回，
+  // inquiry 前无块可腾 → btufail 40/10min）。修正为：
+  //   收 4608 须 largest ≥ 6916（4608+2308：切完还剩 WiFi 的位置；
+  //   inquiry 前 drop 时相邻空闲合并回 ≥4608 > BTU 4112）
+  //   收 8192 仍 ≥12288。仅 inquiry 空闲时调用；启动前一律 drop。
   if (largest >= 12288) {
     s_btAir = malloc(kBtAirSize);
     if (s_btAir) {
@@ -149,6 +155,7 @@ static void btAirTryHold() {
       return;
     }
   }
+  if (largest < 4608 + kBtuReserveWifiGap) return;
   s_btAir = malloc(kBtAirSizeMin);
   if (s_btAir) {
     logShipf("[HEAP] BT air held min max8=%u", (unsigned)btLargest8());
@@ -461,8 +468,9 @@ void BleTracker::onInquiryDone() {
   }
   // 本轮 inquiry 结束后立刻尝试收回 BT 气囊（不降频，只为下一轮准备连续块）
   btAirTryHold();
-  // BTU 应急堆：仅 largest8≥12288 才 rearm，稳态碎片期禁止，避免再打碎 4112
-  btuReserveTryRearm();
+  // BTU 应急堆：inquiry 结束是最佳回收时机（刚 drop 过、碎片窗口最宽），
+  // 自适应尺寸直接试抓；service 侧还有 5s 兜底重试
+  if (s_btuResArmed && !s_btuReserve) btuReserveTryHoldAdaptive();
   if (discRunning_ && !millisReached(millis(), discEndMs_ + 1) && !inquiryPaused_) {
     ensureBtuHeapForInquiry();
     inquiryBusy_ = true;
