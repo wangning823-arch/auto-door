@@ -1823,10 +1823,8 @@ void loop() {
     const uint32_t maxblkNow =
         heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
     const bool heapThin = maxblkNow < 4600;
-    // NFC probe/hwInit 期间也当 quiet：禁止 log/status/poll 与 nfc.probe 并发碰堆
     const bool btQuiet =
-        gBtStackInited &&
-        (btBusy || gBt.btQuietForHttp() || heapThin || httpNfcBusy());
+        gBtStackInited && (btBusy || gBt.btQuietForHttp() || heapThin);
     // 堆从 thin 恢复：立刻 poke log_ship，避免弱网下 30s 周期一直错过空窗
     static bool wasHeapThin = false;
     if (heapThin) {

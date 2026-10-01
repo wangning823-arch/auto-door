@@ -59,19 +59,7 @@ static std::atomic<bool> s_radioBusy{false};
 static std::atomic<bool> s_webBusy{false};   // 本地网页响应中
 static std::atomic<bool> s_paused{false};    // OTA 排空期：拒新提交
 static std::atomic<bool> s_workerBusy{false};  // worker 正在处理一个 job
-static std::atomic<bool> s_nfcBusy{false};    // NFC probe/hwInit：禁出向 HTTP
 static HttpBtBusyFn s_btBusy = nullptr;
-
-void httpSetNfcBusy(bool busy) { s_nfcBusy.store(busy); }
-bool httpNfcBusy() { return s_nfcBusy.load(); }
-
-// ===== worker 静态 IO 缓冲（仅单工作任务使用）=====
-// 1388 rst=4 指纹 http.io：碎片堆上 String req/raw 的 reserve/+= 可能库内 abort。
-// 与 log_ship 同款：头/响应走静态块，body 单独 write，失败直接 return。
-#define HTTP_HDR_CAP 320
-#define HTTP_RAW_CAP 2048
-static char s_reqHdr[HTTP_HDR_CAP];
-static char s_rawBuf[HTTP_RAW_CAP];
 
 // ===== DNS 互斥（见 http_client.h 注释）=====
 // 两个任务并发调 hostByName 会把框架的事件位握手踩烂且无法自愈，
@@ -115,99 +103,58 @@ static int httpExchange(const HttpJob& j, String* respOut) {
   if (!client.connect(addr, j.port, (int32_t)j.timeoutMs)) return -1;
   crashSnapMark("http.io");
 
-  // 静态头缓冲 + body 分段 write：避免碎片堆上 String 拼接 abort
-  int n;
+  String req;
+  req.reserve(160 + j.body.length());
   if (j.isPost) {
-    n = snprintf(s_reqHdr, sizeof(s_reqHdr),
-                 "POST %s HTTP/1.1\r\nHost: %s\r\n"
-                 "User-Agent: garage-esp32\r\n"
-                 "Content-Type: text/plain\r\n"
-                 "Content-Length: %u\r\n"
-                 "Connection: close\r\n\r\n",
-                 j.path.c_str(), j.host.c_str(),
-                 (unsigned)j.body.length());
+    req += "POST ";
+    req += j.path;
+    req += " HTTP/1.1\r\nHost: ";
+    req += j.host;
+    req += "\r\nUser-Agent: garage-esp32\r\n";
+    req += "Content-Type: text/plain\r\nContent-Length: ";
+    req += String((unsigned)j.body.length());
+    req += "\r\nConnection: close\r\n\r\n";
+    req += j.body;
   } else {
-    n = snprintf(s_reqHdr, sizeof(s_reqHdr),
-                 "GET %s HTTP/1.1\r\nHost: %s\r\n"
-                 "User-Agent: garage-esp32\r\n"
-                 "Accept: application/json\r\n"
-                 "Connection: close\r\n\r\n",
-                 j.path.c_str(), j.host.c_str());
+    req += "GET ";
+    req += j.path;
+    req += " HTTP/1.1\r\nHost: ";
+    req += j.host;
+    req += "\r\nUser-Agent: garage-esp32\r\nAccept: application/json\r\n";
+    req += "Connection: close\r\n\r\n";
   }
-  if (n <= 0 || n >= (int)sizeof(s_reqHdr)) {
+  if (client.print(req) != (int)req.length()) {
     client.stop();
     return -2;
-  }
-  if (client.print(s_reqHdr) != n) {
-    client.stop();
-    return -2;
-  }
-  if (j.isPost && j.body.length() > 0) {
-    const char* bp = j.body.c_str();
-    size_t blen = j.body.length();
-    size_t off = 0;
-    while (off < blen) {
-      size_t chunk = blen - off;
-      if (chunk > 256) chunk = 256;
-      size_t w = client.write((const uint8_t*)(bp + off), chunk);
-      if (w == 0) {
-        client.stop();
-        return -2;
-      }
-      off += w;
-    }
   }
 
   uint32_t start = millis();
-  size_t rawN = 0;
+  String raw;
+  raw.reserve(512);
   while (client.connected() || client.available()) {
     if (millis() - start > j.timeoutMs) {
       client.stop();
       return -3;
     }
-    while (client.available() && rawN + 1 < sizeof(s_rawBuf)) {
-      int c = client.read();
-      if (c < 0) break;
-      s_rawBuf[rawN++] = (char)c;
-    }
-    s_rawBuf[rawN] = 0;
-    if (rawN >= 4 && strstr(s_rawBuf, "\r\n\r\n") && !client.connected()) break;
+    while (client.available()) raw += (char)client.read();
+    if (raw.indexOf("\r\n\r\n") >= 0 && !client.connected()) break;
     vTaskDelay(pdMS_TO_TICKS(1));
-    if (rawN >= sizeof(s_rawBuf) - 1) break;
+    if (raw.length() > 8192) break;
   }
   uint32_t tail = millis();
-  while (client.available() && rawN + 1 < sizeof(s_rawBuf) &&
-         millis() - tail < 500) {
-    int c = client.read();
-    if (c < 0) break;
-    s_rawBuf[rawN++] = (char)c;
+  while (client.available() && millis() - tail < 500) {
+    raw += (char)client.read();
   }
-  s_rawBuf[rawN] = 0;
   client.stop();
 
-  char* hdrEnd = strstr(s_rawBuf, "\r\n\r\n");
-  if (!hdrEnd) return -4;
-  size_t bodyOff = (size_t)(hdrEnd - s_rawBuf) + 4;
-  if (respOut) {
-    // 响应体仍拷一次 String（消费方 API）；失败则空串，不 abort
-    respOut->remove(0);
-    if (rawN > bodyOff) {
-      respOut->concat(s_rawBuf + bodyOff, rawN - bodyOff);
-    }
-  }
-  // 状态行: HTTP/1.1 200 OK
-  int sp1 = -1, sp2 = -1;
-  for (size_t i = 0; i < bodyOff && i < 32; i++) {
-    if (s_rawBuf[i] == ' ') {
-      if (sp1 < 0) sp1 = (int)i;
-      else {
-        sp2 = (int)i;
-        break;
-      }
-    }
-  }
-  if (sp1 < 0 || sp2 < 0 || sp2 <= sp1 + 1) return -5;
-  return atoi(s_rawBuf + sp1 + 1);
+  int hdrEnd = raw.indexOf("\r\n\r\n");
+  if (hdrEnd < 0) return -4;
+  String head = raw.substring(0, hdrEnd);
+  if (respOut) *respOut = raw.substring(hdrEnd + 4);
+  int sp1 = head.indexOf(' ');
+  int sp2 = head.indexOf(' ', sp1 + 1);
+  if (sp1 < 0 || sp2 < 0) return -5;
+  return head.substring(sp1 + 1, sp2).toInt();
 }
 
 // 单次任务完成：代次一致才交付结果（被看门狗判死的旧任务直接丢弃）
@@ -241,26 +188,15 @@ static void httpWorker(void*) {
       continue;
     }
 
-    // NFC probe/hwInit 期间禁止出向：避免 nfc.probe + http.io 同时碰碎片堆
-    if (s_nfcBusy.load()) {
-      httpFinishJob(j, -13, String());
-      continue;
-    }
-
     // Inquiry 优先：只在空窗发送；短等后仍 btBusy → 放弃本单（-13），
     // 不推迟 inquiry，也不把放弃算进 netfail（否则会误触发 force STA reconnect）
     s_radioBusy.store(true);
     uint32_t t0 = millis();
-    while (s_webBusy.load() || (s_btBusy && s_btBusy()) || s_nfcBusy.load()) {
+    while (s_webBusy.load() || (s_btBusy && s_btBusy())) {
       if (millis() - t0 > HTTP_BT_GAP_WAIT_MS) break;
       vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (s_btBusy && s_btBusy()) {
-      httpFinishJob(j, -13, String());
-      s_radioBusy.store(false);
-      continue;
-    }
-    if (s_nfcBusy.load()) {
       httpFinishJob(j, -13, String());
       s_radioBusy.store(false);
       continue;
@@ -299,8 +235,6 @@ static bool submit(int owner, bool isPost, const String& host, uint16_t port,
                    uint32_t timeoutMs) {
   if (!s_jobs || owner < 0 || owner >= HTTP_OWNER_COUNT) return false;
   if (s_paused.load()) return false;  // OTA 排空期拒新单
-  // NFC probe/hwInit：拒新单，避免与 nfc.probe 并发碰碎片堆
-  if (s_nfcBusy.load()) return false;
   // Inquiry/BLE 占用时不入队：只在 inquiry 空窗发 HTTP，避免挤掉 BTU 4112 连续块
   if (s_btBusy && s_btBusy()) return false;
   if (s_ownerBusy[owner].load()) return false;  // 该 owner 已有在飞请求

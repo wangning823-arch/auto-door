@@ -2,7 +2,6 @@
 #include "config.h"
 #include "log_ship.h"
 #include "crash_snap.h"
-#include "http_client.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <Adafruit_PN532.h>
@@ -571,16 +570,9 @@ bool NfcReader::recoverBusAndResync() {
   return true;
 }
 
-// NFC probe/hwInit 全程关出向 HTTP：panic 指纹 nfc.probe+ls.flush+http.io
-struct HttpNfcGate {
-  HttpNfcGate() { httpSetNfcBusy(true); }
-  ~HttpNfcGate() { httpSetNfcBusy(false); }
-};
-
 // 与下午能出 0x32010607 的路径一致：完整 PN532 命令，不做裸 0x24 探测
 bool NfcReader::hwInit() {
   if (sda_ < 0) return false;
-  HttpNfcGate nfcHttpGate;
   Serial.printf("[NFC] hwInit t=%ums\n", (unsigned)millis());
   crashSnapMark("nfc.hwinit");
 
