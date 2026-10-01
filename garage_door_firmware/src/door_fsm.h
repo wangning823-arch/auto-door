@@ -1,6 +1,6 @@
 #pragma once
 #include <Arduino.h>
-#include "ble_tracker.h"
+#include "classic_tracker.h"
 #include "config.h"
 
 enum class DoorState : uint8_t { UNKNOWN = 0, CLOSED, OPEN };
@@ -21,7 +21,7 @@ class DoorFsm {
   using RfEmitFn = bool (*)(bool open);
 
   void begin();
-  void loop(BleTracker& bt);
+  void loop(ClassicTracker& bt);
 
   DoorState doorState() const { return doorState_; }
   OpenSource openSource() const { return openSource_; }

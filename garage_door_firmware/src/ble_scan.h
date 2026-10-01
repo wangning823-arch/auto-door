@@ -11,7 +11,7 @@ struct BleAdvHit {
 };
 
 // BLE 只服务：配对 IRK 跟踪 RSSI（名称/MAC 特征通道已移除）
-// 车机经典蓝牙走 BleTracker，不经本类
+// 车机经典蓝牙走 ClassicTracker，不经本类
 class BleScanTool {
  public:
   void runScan(uint32_t durationMs = 10000);

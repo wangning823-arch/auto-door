@@ -1,4 +1,4 @@
-#include "ble_tracker.h"
+#include "classic_tracker.h"
 #include "config.h"
 #include "http_client.h"
 #include "log_ship.h"
@@ -8,7 +8,6 @@
 #include <esp_bt_main.h>
 #include <esp_gap_bt_api.h>
 #include <esp_heap_caps.h>
-#include <WiFi.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error "Classic Bluetooth not enabled"
@@ -23,13 +22,13 @@ static const uint32_t INQUIRY_STUCK_MS = 8000;
 static const uint32_t POST_INQUIRY_QUIET_MS = 800;
 
 static BluetoothSerial SerialBT;
-static BleTracker* gTracker = nullptr;
+static ClassicTracker* gTracker = nullptr;
 static bool gBtReady = false;
 
-volatile uint32_t BleTracker::s_inqCount = 0;
-volatile uint32_t BleTracker::s_thinCount = 0;
-volatile uint32_t BleTracker::s_btuFailCount = 0;
-volatile bool BleTracker::s_btuResGiveReq = false;
+volatile uint32_t ClassicTracker::s_inqCount = 0;
+volatile uint32_t ClassicTracker::s_thinCount = 0;
+volatile uint32_t ClassicTracker::s_btuFailCount = 0;
+volatile bool ClassicTracker::s_btuResGiveReq = false;
 
 static uint32_t btLargest8() {
   return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -54,7 +53,7 @@ static uint32_t s_btuReserveSz = 0;
 static bool s_btuResArmed = false;
 static uint32_t s_btuResNextTryMs = 0;
 
-void BleTracker::noteAllocFail(size_t size, const char* task) {
+void ClassicTracker::noteAllocFail(size_t size, const char* task) {
   // 钩子内：只计数+置位，严禁分配/printf/free
   // BTU inquiry 要 4112；任务名含 BTU 也算
   if (size == 4112 || (task && (strstr(task, "BTU") || strstr(task, "btu")))) {
@@ -63,7 +62,7 @@ void BleTracker::noteAllocFail(size_t size, const char* task) {
   }
 }
 
-bool BleTracker::btuReserveHeld() { return s_btuReserve != nullptr; }
+bool ClassicTracker::btuReserveHeld() { return s_btuReserve != nullptr; }
 
 static void btuReserveDrop(const char* why) {
   if (!s_btuReserve) return;
@@ -94,7 +93,7 @@ static bool btuReserveTryHoldAdaptive() {
   return false;
 }
 
-void BleTracker::serviceBtuReserve() {
+void ClassicTracker::serviceBtuReserve(bool staUp) {
   if (s_btuResGiveReq) {
     s_btuResGiveReq = false;
     btuReserveDrop("btu_fail");
@@ -103,8 +102,9 @@ void BleTracker::serviceBtuReserve() {
   // hold 窗口重试（非一次性）：首持条件满足后每 5s 试一次自适应 hold。
   // drop（inquiry 前腾块/btu_fail）后靠这里抓回来，不再依赖 ≥12288 才 rearm
   // ——1656 实测 dda0 稳态永远到不了 12288，reserve 一次 drop 就永久消失。
+  // staUp 由 main 传入（本模块不依赖 WiFi：STA 已连 或 开机 30s 后才 hold，
+  // 保证 WiFi.begin 已安全返回；无 WiFi 的部署 30s 后照常 hold）。
   if (!s_btuResArmed || s_btuReserve) return;
-  const bool staUp = WiFi.status() == WL_CONNECTED;
   if (!staUp && millis() < 30000UL) return;
   const uint32_t now = millis();
   if (now < s_btuResNextTryMs) return;
@@ -187,15 +187,15 @@ static void ensureBtuHeapForInquiry() {
     }
   }
   if (l < 4112) {
-    BleTracker::noteThin();
+    ClassicTracker::noteThin();
     // 精确统计：thin 次数 + 当前 BTU 累计失败 + 总 fail，不依赖 HEAPFAIL 抽样
     logShipf("[HEAP] BT thin before inq max8=%u thin=%u btufail=%u",
-             (unsigned)l, (unsigned)BleTracker::thinCount(),
-             (unsigned)BleTracker::btuFailCount());
+             (unsigned)l, (unsigned)ClassicTracker::thinCount(),
+             (unsigned)ClassicTracker::btuFailCount());
   }
 }
 
-bool BleTracker::btQuietForHttp() const {
+bool ClassicTracker::btQuietForHttp() const {
   if (inquiryBusy_ || discRunning_) return true;
   return postQuietUntilMs_ != 0 && millisBefore(millis(), postQuietUntilMs_);
 }
@@ -306,7 +306,7 @@ static void gapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* para
   }
 }
 
-bool BleTracker::begin(const char* macStr) {
+bool ClassicTracker::begin(const char* macStr) {
   gTracker = this;
   targetMac_ = String(macStr);
   targetMac_.toUpperCase();
@@ -338,12 +338,12 @@ bool BleTracker::begin(const char* macStr) {
   return true;
 }
 
-void BleTracker::setInquiryPaused(bool paused) {
+void ClassicTracker::setInquiryPaused(bool paused) {
   inquiryPaused_ = paused;
   if (paused) cancelActiveInquiry();
 }
 
-void BleTracker::setInquirySlow(bool slow) {
+void ClassicTracker::setInquirySlow(bool slow) {
   inquirySlow_ = slow;
   if (slow) {
     // 让出射频给 SoftAP，但仍保留跟踪
@@ -352,7 +352,7 @@ void BleTracker::setInquirySlow(bool slow) {
   }
 }
 
-void BleTracker::cancelActiveInquiry() {
+void ClassicTracker::cancelActiveInquiry() {
   if (!gBtReady) return;
   if (inquiryBusy_ && !discRunning_) {
     esp_bt_gap_cancel_discovery();
@@ -361,13 +361,13 @@ void BleTracker::cancelActiveInquiry() {
   }
 }
 
-int BleTracker::lastRssi() const {
+int ClassicTracker::lastRssi() const {
   // 旧值会误导网页/状态：太久没扫到就当作丢失
   if (lastSeenMs_ != 0 && (millis() - lastSeenMs_) > 20000) return -127;
   return lastRssi_;
 }
 
-void BleTracker::startDiscovery(uint32_t durationMs) {
+void ClassicTracker::startDiscovery(uint32_t durationMs) {
   if (!gBtReady) {
     Serial.println("[BT] startDiscovery: BT not ready");
     return;
@@ -396,11 +396,11 @@ void BleTracker::startDiscovery(uint32_t durationMs) {
   }
 }
 
-bool BleTracker::discoveryRunning() const {
+bool ClassicTracker::discoveryRunning() const {
   return discRunning_ && !millisReached(millis(), discEndMs_ + 1);
 }
 
-void BleTracker::onClassicDevice(const String& mac, int rssi, const String& name) {
+void ClassicTracker::onClassicDevice(const String& mac, int rssi, const String& name) {
   String m = mac;
   m.toUpperCase();
   Serial.printf("[BT] FOUND %s rssi=%d name=%s\n", m.c_str(), rssi,
@@ -433,7 +433,7 @@ void BleTracker::onClassicDevice(const String& mac, int rssi, const String& name
   }
 }
 
-void BleTracker::onDeviceName(const String& mac, const String& name) {
+void ClassicTracker::onDeviceName(const String& mac, const String& name) {
   String m = mac;
   m.toUpperCase();
   for (auto& it : discList_) {
@@ -449,7 +449,7 @@ void BleTracker::onDeviceName(const String& mac, const String& name) {
   }
 }
 
-void BleTracker::onInquiryDone() {
+void ClassicTracker::onInquiryDone() {
   inquiryBusy_ = false;
   inquiryStartMs_ = 0;
   postQuietUntilMs_ = millis() + POST_INQUIRY_QUIET_MS;
@@ -479,27 +479,27 @@ void BleTracker::onInquiryDone() {
   }
 }
 
-std::vector<BleDeviceItem> BleTracker::discoveryResults() const { return discList_; }
+std::vector<ClassicDeviceItem> ClassicTracker::discoveryResults() const { return discList_; }
 
-void BleTracker::pushSample(bool visible, int rssi) {
+void ClassicTracker::pushSample(bool visible, int rssi) {
   hist_[histHead_] = visible ? (int8_t)constrain(rssi, -127, 0) : (int8_t)-127;
   histHead_ = (histHead_ + 1) % WIN;
   if (histCount_ < WIN) histCount_++;
 }
 
-void BleTracker::recordTs(int16_t rssi) {
+void ClassicTracker::recordTs(int16_t rssi) {
   tsMs_[tsHead_] = millis();
   tsRssi_[tsHead_] = rssi;
   tsHead_ = (uint16_t)((tsHead_ + 1) % TS_N);
   if (tsCount_ < TS_N) tsCount_++;
 }
 
-void BleTracker::clearTs() {
+void ClassicTracker::clearTs() {
   tsHead_ = 0;
   tsCount_ = 0;
 }
 
-int BleTracker::tsExport(uint32_t* tSec, int16_t* rssi, int maxN) const {
+int ClassicTracker::tsExport(uint32_t* tSec, int16_t* rssi, int maxN) const {
   if (!tSec || !rssi || maxN <= 0 || tsCount_ == 0) return 0;
   int n = tsCount_;
   if (n > maxN) n = maxN;
@@ -514,7 +514,7 @@ int BleTracker::tsExport(uint32_t* tSec, int16_t* rssi, int maxN) const {
   return n;
 }
 
-void BleTracker::computeSlope() {
+void ClassicTracker::computeSlope() {
   if (histCount_ < 3) {
     slope_ = 0;
     return;
@@ -544,7 +544,7 @@ void BleTracker::computeSlope() {
   slope_ = (n * sumXY - sumX * sumY) / denom;
 }
 
-void BleTracker::classifyTrend(bool visible, int rssi) {
+void ClassicTracker::classifyTrend(bool visible, int rssi) {
   uint32_t now = millis();
   if (visible) {
     if (!wasVisible_ && (lastSeenMs_ == 0 || (now - lastSeenMs_) > T_SILENT_GAP_MS)) {
@@ -581,7 +581,7 @@ void BleTracker::classifyTrend(bool visible, int rssi) {
   }
 }
 
-void BleTracker::updateZone() {
+void ClassicTracker::updateZone() {
   bool clearOk = silentSinceMs_ != 0 && (millis() - silentSinceMs_) >= T_CLEAR_MS;
   if (zone_ == CarZone::TRANSIT) {
     if (clearOk && trend_ == SignalTrend::GRADUAL_OUT) zone_ = CarZone::OUT;
@@ -605,7 +605,7 @@ void BleTracker::updateZone() {
   }
 }
 
-void BleTracker::loop() {
+void ClassicTracker::loop() {
   const uint32_t now = millis();
 
   if (discRunning_ && millisReached(now, discEndMs_ + 1)) {
@@ -638,7 +638,7 @@ void BleTracker::loop() {
     // Inquiry 优先：4s 节奏（约 2.5s 占用 + 1.5s 空窗给 HTTP），不被 HTTP 推迟。
     // HTTP 在空窗发送，发不完就放弃。
     ensureBtuHeapForInquiry();
-    BleTracker::noteInquiryStart();
+    ClassicTracker::noteInquiryStart();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
     uint32_t gap = inquirySlow_ ? 15000 : 4000;
@@ -656,13 +656,13 @@ void BleTracker::loop() {
   }
 }
 
-bool BleTracker::seenRecently(uint32_t withinMs) const {
+bool ClassicTracker::seenRecently(uint32_t withinMs) const {
   return lastSeenMs_ != 0 && (millis() - lastSeenMs_) <= withinMs;
 }
 
-void BleTracker::markLeftForCloseEval() {}
+void ClassicTracker::markLeftForCloseEval() {}
 
-String BleTracker::debugLine() const {
+String ClassicTracker::debugLine() const {
   char buf[180];
   snprintf(buf, sizeof(buf),
            "rssi=%d raw=%d slope=%.2f trend=%d zone=%d seen=%lu auto=%d slow=%d",

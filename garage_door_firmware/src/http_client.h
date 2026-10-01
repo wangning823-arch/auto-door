@@ -4,7 +4,7 @@
 // 异步 HTTP：请求丢给独立任务执行，loop 只负责提交/收结果，永不同步阻塞。
 // 射频仲裁：
 //  - HTTP 任务发送前等蓝牙空隙（btBusy 回调），发送期间标记占用；
-//  - BleTracker 见占用则推迟下一轮 inquiry（已在跑的不打断）。
+//  - ClassicTracker 见占用则推迟下一轮 inquiry（已在跑的不打断）。
 
 enum HttpOwner {
   HTTP_OWNER_POLL = 0,

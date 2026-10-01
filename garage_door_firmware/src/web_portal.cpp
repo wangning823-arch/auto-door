@@ -440,9 +440,9 @@ void WebPortal::setupRoutes() {
       server.send(200, "application/json", "{\"n\":0,\"t\":[],\"r\":[]}");
       return;
     }
-    static uint32_t tBuf[BleTracker::TS_N];
-    static int16_t rBuf[BleTracker::TS_N];
-    int n = gPortal->bt_->tsExport(tBuf, rBuf, BleTracker::TS_N);
+    static uint32_t tBuf[ClassicTracker::TS_N];
+    static int16_t rBuf[ClassicTracker::TS_N];
+    int n = gPortal->bt_->tsExport(tBuf, rBuf, ClassicTracker::TS_N);
     String j;
     j.reserve((size_t)n * 10 + 80);
     j += "{\"n\":";
@@ -917,7 +917,7 @@ void WebPortal::setupRoutes() {
   });
 }
 
-void WebPortal::begin(ConfigStore* store, BleTracker* bt, DoorFsm* door,
+void WebPortal::begin(ConfigStore* store, ClassicTracker* bt, DoorFsm* door,
                       BleScanTool* ble, NfcReader* nfc, bool enableAp) {
   gPortal = this;
   store_ = store;

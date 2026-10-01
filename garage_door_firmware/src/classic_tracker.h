@@ -19,7 +19,7 @@ enum class CarZone : uint8_t {
   TRANSIT,
 };
 
-struct BleDeviceItem {
+struct ClassicDeviceItem {
   String mac;
   int rssi;
   String name;
@@ -27,7 +27,7 @@ struct BleDeviceItem {
 
 // 经典蓝牙搜索 + 目标车机 RSSI 跟踪
 // 手机「可被搜索」/车机蓝牙 用经典 BT Inquiry，不是 BLE 广播
-class BleTracker {
+class ClassicTracker {
  public:
   bool begin(const char* macStr);
   void loop();
@@ -59,9 +59,10 @@ class BleTracker {
   static void noteAllocFail(size_t size, const char* task);
   static void noteThin() { s_thinCount++; }
   static void noteInquiryStart() { s_inqCount++; }
-  // BTU 专用应急堆：begin 时持有；largest8<4112 或 BTU 失败时释放；≥12288 才收回
+  // BTU 专用应急堆：armed 后自适应尺寸 hold；largest8<4112 或 BTU 失败时释放
   static bool btuReserveHeld();
-  static void serviceBtuReserve();
+  // staUp: STA 是否已连（由 main 传入，本模块不依赖 WiFi）
+  static void serviceBtuReserve(bool staUp);
   // 超过 20s 未再扫到 → 返回 -127，避免网页显示卡住的旧 RSSI
   int lastRssi() const;
   int lastRssiRaw() const { return lastRssi_; }
@@ -74,7 +75,7 @@ class BleTracker {
 
   void startDiscovery(uint32_t durationMs = 10000);
   bool discoveryRunning() const;
-  std::vector<BleDeviceItem> discoveryResults() const;
+  std::vector<ClassicDeviceItem> discoveryResults() const;
 
   // GAP 回调喂入
   void onClassicDevice(const String& mac, int rssi, const String& name);
@@ -121,7 +122,7 @@ class BleTracker {
 
   volatile bool discRunning_ = false;
   uint32_t discEndMs_ = 0;
-  std::vector<BleDeviceItem> discList_;
+  std::vector<ClassicDeviceItem> discList_;
 
   // 周期性 inquiry 用于跟踪目标
   uint32_t nextInquiryMs_ = 0;

@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <DNSServer.h>
-#include "ble_tracker.h"
+#include "classic_tracker.h"
 #include "door_fsm.h"
 #include "config_store.h"
 #include "ble_scan.h"
@@ -15,7 +15,7 @@ struct PageW;
 // SoftAP + 手机网页：设置车机蓝牙 MAC / BLE 特征 / 查看状态 / 手动开关
 class WebPortal {
  public:
-  void begin(ConfigStore* store, BleTracker* bt, DoorFsm* door, BleScanTool* ble,
+  void begin(ConfigStore* store, ClassicTracker* bt, DoorFsm* door, BleScanTool* ble,
              NfcReader* nfc, bool enableAp = true);
   void loop();
   String apSsid() const { return apSsid_; }
@@ -69,7 +69,7 @@ class WebPortal {
   void webResumeBt();
 
   ConfigStore* store_ = nullptr;
-  BleTracker* bt_ = nullptr;
+  ClassicTracker* bt_ = nullptr;
   DoorFsm* door_ = nullptr;
   BleScanTool* ble_ = nullptr;
   NfcReader* nfc_ = nullptr;

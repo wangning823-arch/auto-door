@@ -181,7 +181,7 @@ void DoorFsm::requestManualClose(OpenSource src) {
            (unsigned)MANUAL_CLOSE_SUPPRESS_MS);
 }
 
-void DoorFsm::loop(BleTracker& bt) {
+void DoorFsm::loop(ClassicTracker& bt) {
   // TRIG = 米家插座路径
   static bool lastTrig = true;
   bool trig = digitalRead(PIN_TRIG_IN);

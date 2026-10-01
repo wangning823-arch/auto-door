@@ -7,7 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "config.h"
-#include "ble_tracker.h"
+#include "classic_tracker.h"
 #include "door_fsm.h"
 #include "config_store.h"
 #include "web_portal.h"
@@ -28,7 +28,7 @@
 // SoftAP 网页配置车机 MAC + F0/F1a/F2a/F3
 // 手机连热点 GarageDoor-xxxx / 12345678 → 浏览器打开 192.168.4.1
 
-static BleTracker gBt;
+static ClassicTracker gBt;
 static DoorFsm gDoor;
 static ConfigStore gCfg;
 static WebPortal gWeb;
@@ -781,7 +781,7 @@ static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
       const char* nm = pcTaskGetName(h);
       if (nm) tnm = nm;
     }
-    BleTracker::noteAllocFail(size, tnm);
+    ClassicTracker::noteAllocFail(size, tnm);
   }
   // 气囊容量以内的失败 → 请 loop 归还共用气囊。
   // 旧阈值 4096 盖不住 BTU inquiry 的 4112B（dda0 max8=4084 实锤），
@@ -847,15 +847,15 @@ static void serviceHeapDiag() {
   // 精确 BTU 失败日志：计数变化就打，不依赖 HEAPFAIL 抽样
   {
     static uint32_t lastBtu = 0;
-    uint32_t btu = BleTracker::btuFailCount();
+    uint32_t btu = ClassicTracker::btuFailCount();
     if (btu != lastBtu) {
       lastBtu = btu;
       multi_heap_info_t i8bit;
       heap_caps_get_info(&i8bit, MALLOC_CAP_8BIT);
       logShipf("[BTUFAIL] n=%u big8=%u thin=%u inq=%u fail=%u",
                (unsigned)btu, (unsigned)i8bit.largest_free_block,
-               (unsigned)BleTracker::thinCount(),
-               (unsigned)BleTracker::inqCount(), (unsigned)gHeapFailN);
+               (unsigned)ClassicTracker::thinCount(),
+               (unsigned)ClassicTracker::inqCount(), (unsigned)gHeapFailN);
     }
   }
   // 共用气囊：钩子已置位 → 这里归还给堆（WiFi 下一帧 2308B / BTU 4112B 就能成）
@@ -864,7 +864,7 @@ static void serviceHeapDiag() {
     remoteOtaReserveGive();
   }
   // BTU 专用应急堆：BTU 分配失败钩子置位 → 这里 free（钩子内严禁碰堆）
-  BleTracker::serviceBtuReserve();
+  ClassicTracker::serviceBtuReserve(gWeb.staConnected());
   // 每 10s 分池水位：哪个 caps 口径在「饿」
   static uint32_t lastPool = 0;
   if (now - lastPool >= 10000) {
@@ -899,9 +899,9 @@ static void serviceHeapDiag() {
                (unsigned)iIn.largest_free_block, (unsigned)gHeapFailN);
       // 精确 BTU/thin 统计：与 HEAPFAIL 抽样无关，status 同步上报
       logShipf("[BTSTAT] inq=%u thin=%u btufail=%u fail=%u maxblk=%u",
-               (unsigned)BleTracker::inqCount(),
-               (unsigned)BleTracker::thinCount(),
-               (unsigned)BleTracker::btuFailCount(), (unsigned)gHeapFailN,
+               (unsigned)ClassicTracker::inqCount(),
+               (unsigned)ClassicTracker::thinCount(),
+               (unsigned)ClassicTracker::btuFailCount(), (unsigned)gHeapFailN,
                (unsigned)i8.largest_free_block);
     }
   }
@@ -1884,9 +1884,9 @@ void loop() {
       sb.carRssi = gBt.lastRssi();
       sb.trend = (int)gBt.trend();
       sb.heapFailN = gHeapFailN;
-      sb.btuFailN = BleTracker::btuFailCount();
-      sb.thinN = BleTracker::thinCount();
-      sb.inqN = BleTracker::inqCount();
+      sb.btuFailN = ClassicTracker::btuFailCount();
+      sb.thinN = ClassicTracker::thinCount();
+      sb.inqN = ClassicTracker::inqCount();
 #ifdef DEVICE_ROLE
       sb.role = DEVICE_ROLE;
 #endif
