@@ -57,7 +57,8 @@ class NfcReader {
   void maybeRecover();
   bool recoverBusAndResync();
   bool probePresent();
-  bool detectIrqWired();
+  bool detectIrqWired(const char* phase = "boot");
+  void attachIrqIsr();
   bool lockBus(uint32_t timeoutMs = 1000);
   void unlockBus();
   // 纯 GPIO 总线清洁：推挽 9-clock×N + STOP，不走 Wire、不等 ACK（<2ms，无超时风险）

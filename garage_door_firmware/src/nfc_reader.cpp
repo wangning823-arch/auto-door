@@ -756,6 +756,20 @@ bool NfcReader::hwInit() {
   lastSlowAckMs_ = 0;
   lastPollSlow_ = false;
   logShipf("[NFC] PN532 ready 0x%08X", ver);
+  // IRQ 补探：开机首探在 SAMConfig 之前跑，未初始化的芯片会把 IRQ 按低 →
+  // 误判未接线（20261002 实测：线通、init 后 2.58V，首探仍 0）。此刻芯片
+  // 已配置、IRQ 已空闲为高，重探一次把事件驱动补上。
+  if (!irqWired_ && irq_ >= 0) {
+    if (detectIrqWired("post-init")) {
+      irqWired_ = true;
+      attachIrqIsr();
+      logShipf("[NFC] IRQ post-init detected → 事件驱动 GPIO%d", irq_);
+      Serial.printf("[NFC] IRQ post-init detected GPIO%d → 事件驱动\n", irq_);
+    } else {
+      // 重探仍失败：真没接线，或模块 IRQ 不是空闲高电平——a/b/c 已上云可分析
+      Serial.printf("[NFC] IRQ post-init still not wired GPIO%d\n", irq_);
+    }
+  }
   return true;
 }
 
@@ -779,20 +793,14 @@ bool NfcReader::begin(int sda, int scl, int irqPin) {
 
   if (!busMux_) busMux_ = xSemaphoreCreateMutex();
   if (!cardQ_) cardQ_ = xQueueCreate(4, 32);  // uid 最长 28+1
-  irqWired_ = detectIrqWired();
+  irqWired_ = detectIrqWired("boot");
   if (irqWired_ && irq_ >= 0) {
-    pinMode(irq_, INPUT);  // 模块侧上拉；FALLING=有事件
-    attachInterrupt(digitalPinToInterrupt(irq_), []() {
-      // 仅唤醒任务；I2C 在任务里做
-      if (s_nfcSelf && s_nfcSelf->task_) {
-        BaseType_t hp = pdFALSE;
-        vTaskNotifyGiveFromISR(s_nfcSelf->task_, &hp);
-        if (hp == pdTRUE) portYIELD_FROM_ISR();
-      }
-    }, FALLING);
+    attachIrqIsr();
     Serial.printf("[NFC] IRQ detected GPIO%d → 事件驱动\n", irq_);
   } else {
-    Serial.printf("[NFC] IRQ GPIO%d not wired → FreeRTOS 任务轮询\n",
+    // 开机探不到多半是「探早了」（PN532 未初始化把 IRQ 按低），hwInit 成功后会
+    // phase=post-init 重探——这里只打串口别下结论，等重探结果上云
+    Serial.printf("[NFC] IRQ GPIO%d not wired at boot → init 后重探\n",
                   irq_ >= 0 ? irq_ : -1);
   }
 
@@ -809,8 +817,15 @@ bool NfcReader::begin(int sda, int scl, int irqPin) {
 
 // 探测 IRQ 是否外接：模块 IRQ 空闲为高（板上拉）。
 // 未接线时内部下拉应读到 LOW；被外部拉高则读到 HIGH。
-bool NfcReader::detectIrqWired() {
-  if (irq_ < 0 || irq_ > 39) return false;
+// 20261002 弱网/强网实测教训：开机首探跑在 PN532 初始化之前，未配置的芯片
+// 把 IRQ 按在低电平 → 即使线焊对了（万用表通断 ✅、init 后实测 2.58V ❗）
+// 也被误判「未接线」且锁死。所以：a/b/c 三次原始电平必须上云（远程可判是
+// 「没线」还是「探早了」），且 hwInit 成功后要用 phase=post-init 重探补救。
+bool NfcReader::detectIrqWired(const char* phase) {
+  if (irq_ < 0 || irq_ > 39) {
+    logShipf("[NFC] IRQ detect(%s): pin=%d invalid", phase, irq_);
+    return false;
+  }
   pinMode(irq_, INPUT_PULLDOWN);
   delayMicroseconds(30);
   int a = digitalRead(irq_);
@@ -821,7 +836,24 @@ bool NfcReader::detectIrqWired() {
   delayMicroseconds(30);
   int c = digitalRead(irq_);
   pinMode(irq_, INPUT_PULLDOWN);
-  return (a == HIGH && b == HIGH && c == HIGH);
+  bool wired = (a == HIGH && b == HIGH && c == HIGH);
+  logShipf("[NFC] IRQ detect(%s) a=%d b=%d c=%d → %d", phase, a, b, c,
+           wired ? 1 : 0);
+  return wired;
+}
+
+// 探测通过后挂 FALLING 中断唤醒读卡任务。可重复调用（attachInterrupt 幂等覆盖）。
+void NfcReader::attachIrqIsr() {
+  if (irq_ < 0 || irq_ > 39) return;
+  pinMode(irq_, INPUT);  // 模块侧上拉；FALLING=有事件
+  attachInterrupt(digitalPinToInterrupt(irq_), []() {
+    // 仅唤醒任务；I2C 在任务里做
+    if (s_nfcSelf && s_nfcSelf->task_) {
+      BaseType_t hp = pdFALSE;
+      vTaskNotifyGiveFromISR(s_nfcSelf->task_, &hp);
+      if (hp == pdTRUE) portYIELD_FROM_ISR();
+    }
+  }, FALLING);
 }
 
 bool NfcReader::lockBus(uint32_t timeoutMs) {
