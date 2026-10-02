@@ -242,9 +242,12 @@ static void btAirDropForInquiry() {
 
 // 方向A：inquiry 前尽量腾出 ≥4112 连续块给 BTU
 // OTA 气囊只要占着就先归还；BT air drop；
-// 仍 <4112 时释放 BTU 专用应急块（与 OTA 气囊分离，避免一次给完就没）；
-// free 后仍薄则 noteThin，但不推迟 inquiry。
-static void ensureBtuHeapForInquiry() {
+// 仍 <4112 时释放 BTU 专用应急块（与 OTA 气囊分离，避免一次给完就没）。
+// 腾完仍薄 → 返回 false 推迟起炮（20261002 1249 实测：ACTIVE 期硬起炮
+// → 回调 BTU 4112 连挂 5 次/40s）；连续薄 3 次后照常起（赌碎片合并，
+// 防晨窗 P=8s 漏检——IDLE 锚定每拍重试，3 拍上限 ~24s）。
+static bool ensureBtuHeapForInquiry() {
+  static uint8_t s_thinStreak = 0;
   if (remoteOtaReserveHeld()) {
     remoteOtaReserveGive();
   }
@@ -262,7 +265,16 @@ static void ensureBtuHeapForInquiry() {
     logShipf("[HEAP] BT thin before inq max8=%u thin=%u btufail=%u",
              (unsigned)l, (unsigned)ClassicTracker::thinCount(),
              (unsigned)ClassicTracker::btuFailCount());
+    if (s_thinStreak < 3) {
+      s_thinStreak++;
+      return false;  // 推迟本轮起炮，给 WiFi/HTTP 释放窗口
+    }
+    // 连薄 3 次：照起（再不起就是系统性漏检了）
+    s_thinStreak = 0;
+    return true;
   }
+  s_thinStreak = 0;
+  return true;
 }
 
 bool ClassicTracker::btQuietForHttp() const {
@@ -640,7 +652,12 @@ void ClassicTracker::onInquiryDone() {
       return;
     }
     // 立即续扫：busy 不落地（postQuiet 已挡住 HTTP 从微缝挤入）
-    ensureBtuHeapForInquiry();
+    if (!ensureBtuHeapForInquiry()) {
+      // 薄（<4112）：推迟续扫 2s 给 WiFi/HTTP 释放窗口——硬起炮会让回调
+      // 的 BTU 4112 必挂。burstDone_ 已计数，进度不丢。
+      nextInquiryMs_ = millis() + 2000;
+      return;
+    }
     inquiryBusy_ = true;
     inquiryStartMs_ = millis();
     nextInquiryMs_ = millis() + ACTIVE_GAP_FALLBACK_MS;  // 回调丢失兜底
@@ -901,7 +918,11 @@ void ClassicTracker::loop(bool staUp) {
     // Inquiry 优先，不被 HTTP 推迟；HTTP 只在纪元空窗/整窗发送。
     // 节奏：IDLE = start+8s 探针（空窗给 HTTP）；
     //       ACTIVE = 正常由 done 续扫/整窗接管，这里只是首发起点+回调丢失兜底。
-    ensureBtuHeapForInquiry();
+    if (!ensureBtuHeapForInquiry()) {
+      // 薄（<4112 连腾两次仍不够）：2s 后重试本轮——硬起炮回调必挂
+      nextInquiryMs_ = now + 2000;
+      return;
+    }
     ClassicTracker::noteInquiryStart();
     inquiryBusy_ = true;
     inquiryStartMs_ = now;
