@@ -106,11 +106,8 @@ void statusReportNow() {
 }
 
 void statusReportService(bool btBusy, bool wifiOk) {
-  // 方向A：inquiry 中或刚结束保护窗 → 不发 status 大包
-  if (btBusy) {
-    return;
-  }
-
+  // 先收结果、后过 busy 门（20261002，与 logShip 同步）：结果不能被 btBusy
+  // 挡住，否则 s_inFlight 悬挂 → owner 永久卡死不再提交。忙时只收不发。
   if (s_inFlight) {
     int code = 0;
     if (!httpTryResult(HTTP_OWNER_STATUS, &code, nullptr)) return;
@@ -121,6 +118,11 @@ void statusReportService(bool btBusy, bool wifiOk) {
     } else {
       s_nextMs = millis() + 30000UL;
     }
+    return;
+  }
+
+  // 方向A：inquiry 中或刚结束保护窗 → 不发 status 大包
+  if (btBusy) {
     return;
   }
 

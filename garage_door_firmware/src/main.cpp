@@ -1849,8 +1849,13 @@ void loop() {
         heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT) +
         ClassicTracker::pinnedHeapBytes();
     const bool heapThin = maxblkNow < 4600;
+    // 20261002 整窗豁免 heapThin：整窗开在 5 连发 inquiry 的堆谷底（气囊
+    // re-hold 失败、pinned=0 时 maxblkNow 恒 <4600），用堆薄卡整窗 = 把排水
+    // 设计废掉 → 1388 实锤：ACTIVE 命中后 12 分钟零上报而 poll 正常
+    //（remoteCmd 不吃 btBusy）。窗内发送失败由 log/status 的 failStreak 退避兜底。
+    const bool thinBlock = heapThin && !gBt.inHttpWindow();
     const bool btQuiet =
-        gBtStackInited && (btBusy || gBt.btQuietForHttp() || heapThin);
+        gBtStackInited && (btBusy || gBt.btQuietForHttp() || thinBlock);
     // 堆从 thin 恢复：立刻 poke log_ship，避免弱网下 30s 周期一直错过空窗
     static bool wasHeapThin = false;
     if (heapThin) {

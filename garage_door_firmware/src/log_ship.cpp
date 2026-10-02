@@ -513,13 +513,9 @@ void logShipFlushNow() {
 }
 
 void logShipService(bool btBusy, bool wifiOk) {
-  // 方向A：inquiry 中或刚结束保护窗 → 不发日志大包，堆留给 BTU
-  if (btBusy) {
-    s_why = 12;
-    return;
-  }
-
-  // 收结果：成功=快照已发走（ring 提交时已摘掉）；失败=塞回队头重试
+  // 先收结果、后过 busy 门（20261002）：结果若被 btBusy 挡在门外，s_inFlight
+  // 永久悬挂 → owner 卡死不再提交 → 静默且无法自愈（1388 升级后 12min 零上报
+  // 的合谋因素）。忙时只收不发，收完仍走下面的 btBusy 门。
   if (s_inFlight) {
     s_why = 1;
     int code = 0;
@@ -542,6 +538,12 @@ void logShipService(bool btBusy, bool wifiOk) {
       s_nextMs = millis() + logShipFailBackoff(s_failStreak);
     }
     s_snap = "";
+    return;
+  }
+
+  // 方向A：inquiry 中或刚结束保护窗 → 不发日志大包，堆留给 BTU
+  if (btBusy) {
+    s_why = 12;
     return;
   }
 

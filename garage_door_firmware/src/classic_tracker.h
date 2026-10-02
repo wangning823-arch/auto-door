@@ -43,6 +43,8 @@ class ClassicTracker {
   // 信号窗由开门事件锚定，不依赖探针相位
   void setDoorOpen(bool open);
   bool epochActive() const { return epochActive_; }
+  // ACTIVE 的 HTTP 整窗内（main 用它豁免 heapThin，见 btQuiet 计算处）
+  bool inHttpWindow() const;
   // 是否已真正 init（网页扫描前判断，避免未起栈就 Inquiry）
   bool ready() const { return ready_; }
 
@@ -116,7 +118,7 @@ class ClassicTracker {
   void enterActiveEpoch(const char* why);
   void exitActiveEpoch(const char* why);
   void openHttpWindow();
-  bool inHttpWindow() const;  // 实现在 .cpp（millisBefore 在 config.h）
+  // 实现在 .cpp（millisBefore 在 config.h）
 
   String targetMac_;
   bool targetSet_ = false;
