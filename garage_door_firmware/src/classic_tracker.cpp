@@ -44,6 +44,15 @@ static const uint32_t PRE_PROBE_QUIET_MS = 800;
 // 到点后等在飞 HTTP 收尾的上限；弱网等不到就超时照常起（不比旧行为差）
 static const uint32_t DRAIN_MAX_MS = 1200;
 
+// ===== door toggle 抖动防护（20261002 五连刷实测）=====
+// 快速 re-enter 窗口：door_closed 退出后在此窗口内再次开门 = 同一开关抖动流
+// （NFC 连刷）。保留 burst 进度与纪元起点——否则每次 toggle 重启 5 发 burst，
+// HTTP 排水窗（唯一发货窗口）永远开不了 → btQuiet 恒真断流（实测 32s+）。
+static const uint32_t REENTER_KEEP_MS = 10000;
+// 排水窗饿死兜底：ACTIVE 且距上次开窗、距纪元起点都超过此值仍未开窗 → 强制
+// 开窗。正常一轮 burst 5×2.56s≈13s 就开窗，16s 还没开 = burst 被 toggle 打断。
+static const uint32_t ACTIVE_WINDOW_FLOOR_MS = 16000;
+
 static BluetoothSerial SerialBT;
 static ClassicTracker* gTracker = nullptr;
 static bool gBtReady = false;
@@ -537,27 +546,40 @@ void ClassicTracker::enterActiveEpoch(const char* why) {
   // 初值用经典纪元口径（>8s 探针最坏见面间隔）；首次 burst 扫到会立即纠正
   epochSawSignal_ =
       lastSeenMs_ != 0 && (millis() - lastSeenMs_) < CLASSIC_SEEN_GAP_MS;
-  epochStartMs_ = millis();
-  burstDone_ = 0;
-  windowUntilMs_ = 0;
+  // 快速 re-enter（door toggle 抖动 <REENTER_KEEP_MS）：保留纪元起点与 burst
+  // 进度。否则连刷时每次开门沿都重启 5 发 burst → HTTP 排水窗永不打开 →
+  // btQuiet 恒真 → 日志断流 32s+（20261002 五连刷实锤）。进度不丢只是提前
+  // 插一个排水窗，窗满 loop 自然续下一轮 burst，扫描目标不受影响。
+  const bool quickReenter =
+      lastExitMs_ != 0 && (millis() - lastExitMs_) < REENTER_KEEP_MS;
+  if (!quickReenter) {
+    epochStartMs_ = millis();
+    burstDone_ = 0;
+    windowUntilMs_ = 0;
+  }
   epochWhy_ = why;
-  nextInquiryMs_ = millis();  // 立即起 burst 第一发
+  // 窗内 re-enter 不打断排水窗（nextInquiryMs_ 已锚在窗满后）
+  if (!inHttpWindow()) nextInquiryMs_ = millis();  // 立即起 burst 第一发
 }
 
 void ClassicTracker::exitActiveEpoch(const char* why) {
   if (!epochActive_) return;
   epochActive_ = false;
   epochSawSignal_ = false;
-  burstDone_ = 0;
-  windowUntilMs_ = 0;
+  lastExitMs_ = millis();  // 快速 re-enter 判定锚
+  // burst 进度/windowUntil 保留：快速关-开抖动时进度是排水窗的唯一指望；
+  // 隔了 REENTER_KEEP_MS 的下次开门走 quickReenter=false 分支自然重置。
   epochWhy_ = why;
   // 正在 inquiry 时不抢锚点：done 后按 IDLE 节奏走（最多提前一拍，无害）
   if (!inquiryBusy_) nextInquiryMs_ = millis() + PROBE_PERIOD_MS;
 }
 
-void ClassicTracker::openHttpWindow() {
+void ClassicTracker::openHttpWindow(bool floor) {
   burstDone_ = 0;
-  windowUntilMs_ = millis() + HTTP_WINDOW_MS;
+  // floor=兜底开窗：此刻可能还有上一发 inquiry 在飞（2.56s + 回调延迟），
+  // 窗内它占着 btQuiet；窗延长 3s 保证真正可发货的时间
+  windowUntilMs_ = millis() + HTTP_WINDOW_MS + (floor ? 3000UL : 0UL);
+  lastWindowMs_ = millis();
   postQuietUntilMs_ = 0;                   // 整窗放行 HTTP（清掉续扫残留 quiet）
   nextInquiryMs_ = windowUntilMs_ + 200;    // 窗满由 loop 起下一轮 burst
 }
@@ -601,6 +623,9 @@ void ClassicTracker::onInquiryDone() {
     return;  // IDLE：不续扫，loop 按 start+PROBE_PERIOD 锚定下一发
   }
   if (inquirySlow_) return;  // SoftAP 有客户端：让出射频，维持慢速节奏
+  // 窗是排水口：窗内完成的在飞 inquiry 不续扫——兜底开窗时可能还有上一发
+  // 在飞，若在这里续扫会把刚开的窗立刻打掉（窗永不成立 → 断流照旧）
+  if (inHttpWindow()) return;
   burstDone_++;
   if (burstDone_ < BURST_N) {
     if (httpClientBusy()) {
@@ -796,13 +821,23 @@ void ClassicTracker::loop(bool staUp) {
   // ===== 纪元转换日志（统一在 loop 上下文上送，回调里不碰 logShip）=====
   if (epochActive_ != epochLoggedActive_) {
     epochLoggedActive_ = epochActive_;
-    // 防挤（20261002）：ACTIVE 期生产>发货，环 FIFO 会把刚写的关键行挤掉
-    //（两轮测试的 EPOCH ACTIVE 行都因此丢失）。清环→推本行→poke，
-    // 让它在第一个开放窗口第一个出网；丢的只是即将被挤掉的旧积压。
-    logShipClearRing();
-    logShipf("[BT] EPOCH %s why=%s", epochActive_ ? "ACTIVE" : "IDLE",
-             epochWhy_);
+    // 关键环直送（20261002）：旧实现"清环→推本行"是双刃剑——ACTIVE 行在环里
+    // 等发货窗时，下一次 IDLE 打点的 clearRing 会把它连同 [NFC] card 行一起
+    // 清掉（五连刷实测全丢）。改独立关键环后行行必达，无需清环让路。
+    logShipCriticalf("[BT] EPOCH %s why=%s", epochActive_ ? "ACTIVE" : "IDLE",
+                     epochWhy_);
     logShipPoke();
+  }
+
+  // ===== 排水窗饿死兜底（20261002）=====
+  // ACTIVE 期 burst 被 door toggle 反复打断时 HTTP 整窗（唯一发货窗口）可能
+  // 开不出来 → btQuiet 恒真 → 日志/心跳断流（五连刷实测 32s）。距上次开窗、
+  // 距纪元起点都超 16s 仍未开窗 → 强制开窗排水；窗内 onInquiryDone 不续扫，
+  // 保住这个窗。正常一轮 burst ≈13s 就开窗，本兜底很少触发。
+  if (epochActive_ && !inHttpWindow() &&
+      (now - lastWindowMs_) > ACTIVE_WINDOW_FLOOR_MS &&
+      (now - epochStartMs_) > ACTIVE_WINDOW_FLOOR_MS) {
+    openHttpWindow(true);
   }
 
   // ===== 纪元退出三条件 =====

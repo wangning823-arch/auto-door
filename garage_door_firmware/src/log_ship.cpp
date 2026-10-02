@@ -29,6 +29,12 @@
 #ifndef LOG_SHIP_RING_BYTES
 #define LOG_SHIP_RING_BYTES 2560
 #endif
+// 关键事件行独立环：EPOCH/NFC 卡/MANUAL/AUTO/RF TX。与主环物理隔离——
+// 主环被积压挤爆、或将来任何清环动作都碰不到它；发货每拍先抽它。
+// 5 连刷一条开关链 ≈300B（card+MANUAL+RF TX+EPOCH），1536B 保住最近 5 链。
+#ifndef LOG_SHIP_CRIT_BYTES
+#define LOG_SHIP_CRIT_BYTES 1536
+#endif
 // 单次快照上限（分片上传）：碎片堆里 8BIT max8 实测可低至 ~2.4KB，整环 2560B
 // 拷进 String 会 OOM → body 变空 → 发出空 POST → 服务端静默丢弃而环已摘走
 // → 内容永久丢失且每轮重复（20260927 dda0：20 次200 空包 0 落盘的死循环）。
@@ -101,10 +107,15 @@ static volatile uint32_t s_attempt = 0;  // 尝试次数（>0 说明确实走到
 // 软复位/看门狗复位后内容保留，掉电清零。
 // 不能用 RTC_DATA_ATTR——那是已初始化段，启动会从 flash 重新装载=清零。
 // 掉电后该段是随机值，靠 magic + 长度双重校验，不合法就当空环优雅降级。
-#define LOG_SHIP_RTC_MAGIC 0x4C534850u  // "LSHP"
+// magic 历史：0x4C534850("LSHP") = 单环布局（无 s_critLen）；20261002 加关键环
+// 后 RTC 内存布局变了——旧布局字节不能按新布局解读，bump magic 整体作废。
+#define LOG_SHIP_RTC_MAGIC 0x4C534851u  // "LSHQ"
 
 static RTC_NOINIT_ATTR char s_ring[LOG_SHIP_RING_BYTES];
 static RTC_NOINIT_ATTR size_t s_len;  // 有效字节，紧凑存放
+// 关键环（发货顺序：本环 → 主环）：与主环分离，主环挤旧/清环都伤不到它
+static RTC_NOINIT_ATTR char s_crit[LOG_SHIP_CRIT_BYTES];
+static RTC_NOINIT_ATTR size_t s_critLen;
 static RTC_NOINIT_ATTR uint32_t s_rtcMagic;
 static uint32_t s_nextMs = 0;
 static int s_failStreak = 0;
@@ -132,9 +143,10 @@ static char s_hdrBuf[LOG_SHIP_HDR_CAP];
 static char s_rawBuf[LOG_SHIP_RAW_CAP];
 static char s_bodyBuf[LOG_SHIP_RING_BYTES];  // 环头拷贝；service 回填也用它
 
-// RTC 段合法性：magic 对且长度在界内（掉电后两者都是垃圾）
+// RTC 段合法性：magic 对且两环长度都在界内（掉电后两者都是垃圾）
 static bool rtcRingOk() {
-  return s_rtcMagic == LOG_SHIP_RTC_MAGIC && s_len < LOG_SHIP_RING_BYTES;
+  return s_rtcMagic == LOG_SHIP_RTC_MAGIC && s_len < LOG_SHIP_RING_BYTES &&
+         s_critLen < LOG_SHIP_CRIT_BYTES;
 }
 static void rtcRingArm() { s_rtcMagic = LOG_SHIP_RTC_MAGIC; }
 
@@ -153,9 +165,61 @@ void logShipDiag(uint8_t* why, uint32_t* largest8, uint32_t* cap,
   if (attempt) *attempt = s_attempt;
   if (pend) {
     ringLock();
-    *pend = (uint32_t)s_len;
+    *pend = (uint32_t)(s_len + s_critLen);
     ringUnlock();
   }
+}
+
+// ===== 关键环（发货顺序在主环之前；满则挤自己最旧，主环不受影响）=====
+static void critPush(const char* s, size_t n) {
+  if (n == 0) return;
+  if (!rtcRingOk()) {
+    s_len = 0;
+    s_critLen = 0;
+    rtcRingArm();
+  }
+  if (n >= LOG_SHIP_CRIT_BYTES) {
+    s += (n - LOG_SHIP_CRIT_BYTES) + 1;
+    n = LOG_SHIP_CRIT_BYTES - 1;
+  }
+  if (s_critLen + n >= LOG_SHIP_CRIT_BYTES) {
+    size_t drop = s_critLen + n - (LOG_SHIP_CRIT_BYTES - 1);
+    if (drop >= s_critLen) {
+      s_critLen = 0;
+    } else {
+      memmove(s_crit, s_crit + drop, s_critLen - drop);
+      s_critLen -= drop;
+    }
+  }
+  memcpy(s_crit + s_critLen, s, n);
+  s_critLen += n;
+}
+
+// 发送失败把快照塞回关键环队头（下拍最先重发）
+static void critPrepend(const char* s, size_t n) {
+  if (n == 0) return;
+  if (!rtcRingOk()) {
+    s_len = 0;
+    s_critLen = 0;
+    rtcRingArm();
+  }
+  if (n >= LOG_SHIP_CRIT_BYTES) {
+    s += (n - (LOG_SHIP_CRIT_BYTES - 1));
+    n = LOG_SHIP_CRIT_BYTES - 1;
+    s_critLen = 0;
+  }
+  if (s_critLen + n >= LOG_SHIP_CRIT_BYTES) {
+    size_t drop = s_critLen + n - (LOG_SHIP_CRIT_BYTES - 1);
+    if (drop >= s_critLen) {
+      s_critLen = 0;
+    } else {
+      memmove(s_crit, s_crit + drop, s_critLen - drop);
+      s_critLen -= drop;
+    }
+  }
+  memmove(s_crit + n, s_crit, s_critLen);
+  memcpy(s_crit, s, n);
+  s_critLen += n;
 }
 
 static void ringPush(const char* s, size_t n) {
@@ -182,49 +246,27 @@ static void ringPush(const char* s, size_t n) {
   s_len += n;
 }
 
-// 发送失败把快照塞回队头（新日志已在后面）
-static void ringPrepend(const char* s, size_t n) {
-  if (n == 0) return;
-  if (!rtcRingOk()) {
-    s_len = 0;
-    rtcRingArm();
-  }
-  if (n >= LOG_SHIP_RING_BYTES) {
-    s += (n - (LOG_SHIP_RING_BYTES - 1));
-    n = LOG_SHIP_RING_BYTES - 1;
-    s_len = 0;
-  }
-  if (s_len + n >= LOG_SHIP_RING_BYTES) {
-    size_t drop = s_len + n - (LOG_SHIP_RING_BYTES - 1);
-    if (drop >= s_len) {
-      s_len = 0;
-    } else {
-      memmove(s_ring, s_ring + drop, s_len - drop);
-      s_len -= drop;
-    }
-  }
-  memmove(s_ring + n, s_ring, s_len);
-  memcpy(s_ring, s, n);
-  s_len += n;
-}
-
 void logShipBegin() {
   if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
   ringLock();
   // 上一轮日志跨复位留在 RTC 里：panic/看门狗复位后重启，这里把它续传出去。
   // 掉电后 RTC 是随机值 → rtcRingOk() 不过 → 清空当新环；长度越界同样清。
-  size_t prevLen = rtcRingOk() ? s_len : 0;
-  if (!prevLen) s_len = 0;
+  size_t prevLen = rtcRingOk() ? (s_len + s_critLen) : 0;
+  if (!prevLen) {
+    s_len = 0;
+    s_critLen = 0;
+  }
   rtcRingArm();
   // 在旧日志前插一条分隔标记：VPS 时间戳是上报时刻，不分段会把
-  // "崩溃前的日志"误读成"开机后的日志"
+  // "崩溃前的日志"误读成"开机后的日志"。标记进关键环队头——关键环先发货，
+  // 标记必先于两环遗留内容出网。
   if (prevLen > 0) {
     char mark[96];
     int m = snprintf(mark, sizeof(mark),
                      "[LOGSHIP] ==== 以下 %u 字节为上一轮(rst=%d)遗留 ====\n",
                      (unsigned)prevLen, (int)esp_reset_reason());
     // snprintf 截断时返回的是"所需长度"而非实写长度，超界会把 mark 外的内存读出去
-    if (m > 0 && m < (int)sizeof(mark)) ringPrepend(mark, (size_t)m);
+    if (m > 0 && m < (int)sizeof(mark)) critPrepend(mark, (size_t)m);
     Serial.printf("[LOGSHIP] resume %u bytes from prev run (rst=%d)\n",
                   (unsigned)prevLen, (int)esp_reset_reason());
   }
@@ -260,6 +302,42 @@ void logShipPrintln(const String& line) {
   if (Serial.availableForWrite() > 96) Serial.println(line);
 }
 
+// 行装配（logShipf / logShipCriticalf 共用尾段）：时间戳前缀 + 换行 + 入环 + 串口
+static void shipEnqueue(char* buf, size_t cap, size_t len, bool critical) {
+  // 事件时间戳前缀：这行日志是「什么时候发生的」，不是「什么时候传上来的」。
+  // 离线 200s 后补传的积压，用接收时间会整体错位 200s。
+  char ts[24];
+  int tn = eventTsPrefix(ts, sizeof(ts));
+  if (tn > 0) {
+    if (len + (size_t)tn > cap - 2) len = cap - 2 - tn;  // 留 \n+NUL
+    memmove(buf + tn, buf, len);
+    memcpy(buf, ts, tn);
+    len += (size_t)tn;
+  }
+  if (len + 1 >= cap) {
+    // 截断后连 '\n' 都放不下：压掉最后一个字符也要保证环里是完整一行
+    buf[cap - 2] = '\n';
+    buf[cap - 1] = '\0';
+    len = cap - 2;
+  } else {
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+  }
+  ringLock();
+  if (critical) {
+    critPush(buf, len + 1);
+  } else {
+    ringPush(buf, len + 1);
+  }
+  ringUnlock();
+  // 心跳/诊断必须恒发 VPS：串口只在 TX FIFO 有余量时打，阻塞风险由门控承担，
+  // 环推送不受影响（1388 无串口主机，旧写法把整个 logShipf 门控掉了）。
+  if (Serial.availableForWrite() > 96) {
+    buf[len] = '\0';  // println 自带换行，别打两个空行
+    Serial.println(buf);
+  }
+}
+
 void logShipf(const char* fmt, ...) {
   // 256 而非 192：心跳行实测 188~190B，rssi/seen/open_ts 位数一涨就 ≥191。
   // 旧实现 192B 缓冲 + "截断就不进环"会把整条丢掉——1388 升级后 8s 一条的心跳
@@ -273,49 +351,26 @@ void logShipf(const char* fmt, ...) {
   if (n < 0) return;
   size_t len = (size_t)n;
   if (len >= sizeof(buf)) len = sizeof(buf) - 1;  // 超长：拿截断结果，也好过不发
+  shipEnqueue(buf, sizeof(buf), len, false);
+}
 
-  // 事件时间戳前缀：这行日志是「什么时候发生的」，不是「什么时候传上来的」。
-  // 离线 200s 后补传的积压，用接收时间会整体错位 200s。
-  char ts[24];
-  int tn = eventTsPrefix(ts, sizeof(ts));
-  if (tn > 0) {
-    if (len + (size_t)tn > sizeof(buf) - 2) len = sizeof(buf) - 2 - tn;  // 留 \n+NUL
-    memmove(buf + tn, buf, len);
-    memcpy(buf, ts, tn);
-    len += (size_t)tn;
-  }
-
-  if (len + 1 >= sizeof(buf)) {
-    // 截断后连 '\n' 都放不下：压掉最后一个字符也要保证环里是完整一行
-    buf[sizeof(buf) - 2] = '\n';
-    buf[sizeof(buf) - 1] = '\0';
-    len = sizeof(buf) - 2;
-  } else {
-    buf[len] = '\n';
-    buf[len + 1] = '\0';
-  }
-  ringLock();
-  ringPush(buf, len + 1);
-  ringUnlock();
-  // 心跳/诊断必须恒发 VPS：串口只在 TX FIFO 有余量时打，阻塞风险由门控承担，
-  // 环推送不受影响（1388 无串口主机，旧写法把整个 logShipf 门控掉了）。
-  if (Serial.availableForWrite() > 96) {
-    buf[len] = '\0';  // println 自带换行，别打两个空行
-    Serial.println(buf);
-  }
+void logShipCriticalf(const char* fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  size_t len = (size_t)n;
+  if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+  shipEnqueue(buf, sizeof(buf), len, true);
 }
 
 size_t logShipPending() {
   ringLock();
-  size_t n = s_len;
+  size_t n = s_len + s_critLen;
   ringUnlock();
   return n;
-}
-
-void logShipClearRing() {
-  ringLock();
-  s_len = 0;
-  ringUnlock();
 }
 
 // 解析 LOG_SHIP_URL → host/port/path（纯 char，不碰堆）
@@ -442,8 +497,20 @@ void logShipFlushNow() {
 
   ringLock();
   const size_t fmax = safeChunk();
-  size_t fchunk = s_len > fmax ? fmax : s_len;
-  if (fchunk > 0) memcpy(s_bodyBuf, s_ring, fchunk);
+  size_t want = s_len + s_critLen;
+  size_t fchunk = want > fmax ? fmax : want;
+  size_t ftakeC = 0;
+  if (fchunk > 0) {
+    // 先拷关键环后拷主环（发货顺序 = 拷贝顺序 = 200 后的摘除顺序）
+    ftakeC = s_critLen < fchunk ? s_critLen : fchunk;
+    if (ftakeC > 0) memcpy(s_bodyBuf, s_crit, ftakeC);
+    size_t fm = fchunk - ftakeC;
+    if (fm > s_len) {
+      fm = s_len;
+      fchunk = ftakeC + fm;
+    }
+    if (fm > 0) memcpy(s_bodyBuf + ftakeC, s_ring, fm);
+  }
   ringUnlock();
   if (fchunk == 0 || WiFi.status() != WL_CONNECTED) {
     Serial.printf("[FLUSH] early skip dt=%u\n", (unsigned)(millis() - t0));
@@ -511,10 +578,15 @@ void logShipFlushNow() {
   Serial.printf("[FLUSH] done code=%d dt=%u\n", code, (unsigned)(millis() - t0));
   if (code == 200) {
     ringLock();
-    // 只摘已发出的环头一片；新日志在环尾不受影响
-    if (fchunk <= s_len) {
-      memmove(s_ring, s_ring + fchunk, s_len - fchunk);
-      s_len -= fchunk;
+    // 只摘已发出的一片（与拷贝同序：先关键环后主环）；新日志在尾部不受影响
+    if (ftakeC > 0 && ftakeC <= s_critLen) {
+      memmove(s_crit, s_crit + ftakeC, s_critLen - ftakeC);
+      s_critLen -= ftakeC;
+    }
+    size_t fm = fchunk - ftakeC;
+    if (fm > 0 && fm <= s_len) {
+      memmove(s_ring, s_ring + fm, s_len - fm);
+      s_len -= fm;
     }
     ringUnlock();
     s_failStreak = 0;
@@ -538,7 +610,7 @@ void logShipService(bool btBusy, bool wifiOk) {
       // 溢出保护：积压过半（ACTIVE 高产期生产>发货会把环挤爆、FIFO 丢心跳）
       // → 加速到 2s 续发；正常积压仍是 8s 一拍
       ringLock();
-      size_t pend = s_len;
+      size_t pend = s_len + s_critLen;
       ringUnlock();
       s_nextMs = millis() +
                  (pend > LOG_SHIP_RING_BYTES / 2 ? 2000UL : LOG_SHIP_INTERVAL_MS);
@@ -546,7 +618,7 @@ void logShipService(bool btBusy, bool wifiOk) {
       s_failStreak++;
       s_why = 10;  // 收到非200（网络失败/服务端拒）
       ringLock();
-      ringPrepend(s_snap.c_str(), s_snap.length());
+      critPrepend(s_snap.c_str(), s_snap.length());
       ringUnlock();
       s_nextMs = millis() + logShipFailBackoff(s_failStreak);
     }
@@ -588,13 +660,28 @@ void logShipService(bool btBusy, bool wifiOk) {
     return;
   }
   ringLock();
-  if (s_len > 0) {
+  if (s_critLen > 0 || s_len > 0) {
     s_attempt++;
-    chunk = s_len > s_chunkMax ? s_chunkMax : s_len;
+    // 摘取顺序 = 发货顺序：先关键环后主环，关键行每拍最先出网
+    size_t want = s_len + s_critLen;
+    chunk = want > s_chunkMax ? s_chunkMax : want;
     if (chunk > sizeof(s_bodyBuf)) chunk = sizeof(s_bodyBuf);
-    memcpy(s_bodyBuf, s_ring, chunk);
-    memmove(s_ring, s_ring + chunk, s_len - chunk);
-    s_len -= chunk;
+    size_t takeC = s_critLen < chunk ? s_critLen : chunk;
+    if (takeC > 0) {
+      memcpy(s_bodyBuf, s_crit, takeC);
+      memmove(s_crit, s_crit + takeC, s_critLen - takeC);
+      s_critLen -= takeC;
+    }
+    size_t takeM = chunk - takeC;
+    if (takeM > s_len) {
+      takeM = s_len;
+      chunk = takeC + takeM;
+    }
+    if (takeM > 0) {
+      memcpy(s_bodyBuf + takeC, s_ring, takeM);
+      memmove(s_ring, s_ring + takeM, s_len - takeM);
+      s_len -= takeM;
+    }
   }
   ringUnlock();
 
@@ -614,7 +701,7 @@ void logShipService(bool btBusy, bool wifiOk) {
     s_why = 6;  // body String 构造不完整 → 不认摘环，回填静态块
     body = "";
     ringLock();
-    ringPrepend(s_bodyBuf, chunk);
+    critPrepend(s_bodyBuf, chunk);
     ringUnlock();
     s_nextMs = now + 3000;
     return;
@@ -626,7 +713,7 @@ void logShipService(bool btBusy, bool wifiOk) {
     s_why = 7;
     s_snap = "";
     ringLock();
-    ringPrepend(s_bodyBuf, chunk);
+    critPrepend(s_bodyBuf, chunk);
     ringUnlock();
     s_nextMs = now + 3000;
     return;
@@ -640,7 +727,7 @@ void logShipService(bool btBusy, bool wifiOk) {
     s_why = 11;
     s_snap = "";
     ringLock();
-    ringPrepend(s_bodyBuf, chunk);
+    critPrepend(s_bodyBuf, chunk);
     ringUnlock();
     s_nextMs = now + 3000;
   }

@@ -119,7 +119,7 @@ class ClassicTracker {
   // 纪元调度（实现见 .cpp 常量区）
   void enterActiveEpoch(const char* why);
   void exitActiveEpoch(const char* why);
-  void openHttpWindow();
+  void openHttpWindow(bool floor = false);  // floor=饿死兜底开窗（延长窗长）
   // 实现在 .cpp（millisBefore 在 config.h）
 
   String targetMac_;
@@ -171,6 +171,10 @@ class ClassicTracker {
   uint8_t burstDone_ = 0;         // 本 burst 已完成次数（0..BURST_N-1 续扫）
   uint32_t epochStartMs_ = 0;
   uint32_t windowUntilMs_ = 0;    // ACTIVE 的 HTTP 整窗截止；0=不在窗内
+  // 最近一次 exit 时刻：快速 re-enter 判定锚（door toggle 抖动保留进度）
+  uint32_t lastExitMs_ = 0;
+  // 最近一次开窗时刻：排水窗饿死兜底锚（ACTIVE 期太久没窗 → 强制开窗）
+  uint32_t lastWindowMs_ = 0;
   const char* epochWhy_ = "boot"; // 最近一次纪元切换原因（loop 统一打日志）
   bool epochLoggedActive_ = false; // loop 侧：epochWhy_ 是否已上送
   // Round-3 排水：到点先等在飞 HTTP 收尾再起探针；期间 draining_ 封新单

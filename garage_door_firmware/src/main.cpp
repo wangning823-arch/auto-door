@@ -1677,11 +1677,12 @@ void setup() {
     const bool auth = gNfc.isAuthorized(uid);
     if (auth) {
       gDoor.requestManualToggle(OpenSource::NFC);
-      logShipf("[NFC] card: %s authorized → RF", uid.c_str());
+      // 刷卡行进关键环：紧跟开门沿的 EPOCH ACTIVE 打点不能把它挤掉
+      logShipCriticalf("[NFC] card: %s authorized → RF", uid.c_str());
     } else if (gNfc.authUid().length() == 0) {
-      logShipf("[NFC] card: %s unregistered", uid.c_str());
+      logShipCriticalf("[NFC] card: %s unregistered", uid.c_str());
     } else {
-      logShipf("[NFC] card: %s unauthorized", uid.c_str());
+      logShipCriticalf("[NFC] card: %s unauthorized", uid.c_str());
     }
     Serial.printf("[NFC] card cb uid=%s auth=%d\n", uid.c_str(), (int)auth);
   });
