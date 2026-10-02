@@ -84,9 +84,14 @@ static bool airLogDue() {
 // 应急块与 OTA 气囊分离：只在 largest8<4112（或 BTU 失败）时释放。
 // 20261001 实测：固定 8192 在 dda0 稳态（maxblk 2292~7156）永远抓不到
 // → 自适应降级：8192 失败试 6144，再失败试 4608（仍 ≥ BTU 的 4112）。
-// 每档都要求 largest ≥ sz+2308（给 WiFi 2308 留位置），抓到哪档算哪档。
+// 每档都要求 largest ≥ sz+2×2308（给 WiFi 留双块），抓到哪档算哪档。
 static const uint32_t kBtuReserveSizes[] = {8192, 6144, 4608};
-static const uint32_t kBtuReserveWifiGap = 2308;
+// pin 后必须给 WiFi 留 2 块 esf（2×2308=4616）：esf 池正常水位是 2~3 块，
+// 只留 1 块（旧值 2308）时第 2 块必败 → 2308 连锁重试风暴（20261002 1231 实测
+// 85/min，连带 tiT/lwIP 1512、httpWorker 528、BTU 4112 全部失败）。
+// 代价：drop 后 largest≈8180 < 4608+4616=9224 → 平时不 pin——1117 实测
+// pinned=0 状态 btufail=0（ensureBtuHeap+排水已护住 BTU），pin 反而两头输。
+static const uint32_t kBtuReserveWifiGap = 4616;
 static void* s_btuReserve = nullptr;
 static uint32_t s_btuReserveSz = 0;
 // 首持推迟：begin() 只置 armed，真正 force hold 在 serviceBtuReserve（loop 阶段，
@@ -120,8 +125,8 @@ static void btuReserveDrop(const char* why) {
   }
 }
 
-// 自适应尺寸 hold：从大到小试，每档要求 largest ≥ sz+2308（给 WiFi 2308 留位），
-// 抓到哪档算哪档。drop 后 4608 空间即可盖住 BTU 4112。
+// 自适应尺寸 hold：从大到小试，每档要求 largest ≥ sz+kBtuReserveWifiGap
+//（给 WiFi 留 2 块 esf 双块余量），抓到哪档算哪档。drop 后 4608 空间即可盖住 BTU 4112。
 static bool btuReserveTryHoldAdaptive() {
   if (s_btuReserve) return true;
   const uint32_t largest = btLargest8();
@@ -198,12 +203,12 @@ static void btAirTryHold() {
   // 1913：drop 后门槛过低会立刻 re-hold，BTU 只剩 4084。
   // 2206 实测：largest≥8000 就收 4608 会把最大块切到 4084（4608+4112>8000），
   // inquiry 前永远 thin，BTU 4112 必挂。
-  // 20261001 dda0：门槛 10000 太高（稳态 maxblk 7156，气囊 drop 后永远抓不回，
-  // inquiry 前无块可腾 → btufail 40/10min）。修正为：
-  //   收 4608 须 largest ≥ 6916（4608+2308：切完还剩 WiFi 的位置；
-  //   inquiry 前 drop 时相邻空闲合并回 ≥4608 > BTU 4112）
-  //   收 8192 仍 ≥12288。仅 inquiry 空闲时调用；启动前一律 drop。
-  if (largest >= 12288) {
+  // 20261002 1231 实测：旧门槛 6916（只留 1 块 WiFi 2308）在 drop 后 8180 上
+  // 必然 pin 成功 → raw largest 压到 ~3444 → WiFi 第 2 块 esf 必败 → 85/min
+  // 风暴 + BTU 4112 也挂（#464）。改为留 2 块（4616）：平时不 pin，
+  // WiFi 健康时 raw largest 充足，BTU 由 ensureBtuHeapForInquiry 兜底。
+  //   收 4608 须 largest ≥ 4608+4616=9224；收 8192 须 ≥ 8192+4616=12808。
+  if (largest >= 8192 + kBtuReserveWifiGap) {
     s_btAir = malloc(kBtAirSize);
     if (s_btAir) {
       s_btAirSz = kBtAirSize;
