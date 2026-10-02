@@ -204,9 +204,11 @@
 // 强弱语义与「库内安装」相反：
 //   车在门外/门口 = 强；车入库 = 弱/丢失；开走离开门口 = 强后丢失
 // 开：真无→有（远离侧回场）或门口「持续」强；库内弱漏扫/单点强不许开
-// 关：门口强后信号丢失满此时长 → 自动关（开走/出库）
+// 关：门口强信号「逐渐减弱后」丢失满此时长 → 自动关（开走/出库）。
+// 20261002 用户实测：30s 太长（开车走根本看不到关门）→ 10s；
+// 且「贴脸强帧直接消失」（关机特征，见 RSSI_SUDDEN_CLOSE）不触发关门。
 #ifndef OUT_CLOSE_SILENT_MS
-#define OUT_CLOSE_SILENT_MS   30000UL
+#define OUT_CLOSE_SILENT_MS   10000UL
 #endif
 // 强信号后弱/丢满此时长 → 判定车在库内，禁止弱路径自动开
 #ifndef OUT_IN_GARAGE_SILENT_MS
@@ -242,6 +244,10 @@
 #define RSSI_STRONG           -80     // 门口强信号阈值（门外安装）
 #define RSSI_SUDDEN_STRONG    -80     // 单点强不算开门，须 OPEN_STRONG_STREAK
 #define RSSI_FAR_CLOSE        -90     // 离场旁路：≤此约走出（连续 N 次）
+// 丢失前最后帧 ≥ 此值 = 贴脸强信号「直接消失」→ 设备关机特征，不触发关门。
+// 实测分界：开车/走路离开最后一帧 -79（衰减后丢失→该关）；
+// 设备关机前一帧 -55（强帧断崖消失→不关）。取两者中点偏紧的 -70。
+#define RSSI_SUDDEN_CLOSE     -70
 // 单次 ≤-90 只是多径凹点，须连续 N 次 far 才算离场
 #ifndef RSSI_FAR_MIN_STREAK
 #define RSSI_FAR_MIN_STREAK 2

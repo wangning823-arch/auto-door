@@ -318,6 +318,8 @@ static bool gInGarage = true;
 static bool gHadDoorStrong = false;       // 曾在门口见过强信号
 static uint32_t gLastStrongMs = 0;        // 最近一次 ≥RSSI_STRONG
 static uint32_t gLostSinceStrongMs = 0;   // 强后信号丢失起始（0=当前未丢/从未强）
+static int gLastSigRssiValid = -127;      // 最近一次「有信号」帧的 rssi（关机判据用）
+static bool gLostFromSudden = false;      // 本次丢失=贴脸强帧断崖消失（关机特征→不关）
 static uint8_t gStrongStreak = 0;         // 滑动窗口内强样本计数
 static uint32_t gStrongStreakSince = 0;   // 本窗口起始
 static uint32_t gFirstStrongInWinMs = 0;  // 窗口内首次强（校验 HOLD）
@@ -478,10 +480,11 @@ static void observeSignal(bool hasSignal, int rssi) {
   if (hasSignal) {
     gNoSigSince = 0;
     gEverHadSignal = true;
+    gLastSigRssiValid = rssi;  // 关机/离开判据：丢失前最后一帧的实际强度
+    gLostSinceStrongMs = 0;    // 有信号（含弱帧/漏扫后恢复）= 未丢失，重置计时
     if (rssi >= RSSI_STRONG) {
       // 门口强：滑动窗口累计（多径 强/弱 交替不得清零）
       gLastStrongMs = now;
-      gLostSinceStrongMs = 0;
       gStrongAfterOpen = true;
       clearLeaveQual("回到强信号");
       gRssiTrend.clear();
@@ -540,7 +543,11 @@ static void observeSignal(bool hasSignal, int rssi) {
     if (gNoSigSince == 0) gNoSigSince = now;
     if (gLastStrongMs != 0 && gLostSinceStrongMs == 0) {
       gLostSinceStrongMs = now;
-      Serial.printf("[FSM] 门口强后信号丢失 t=%u\n", (unsigned)now);
+      // 关机 vs 离开：丢失前最后帧仍贴脸强（≥RSSI_SUDDEN_CLOSE）= 设备断电
+      // 特征（人可能还在原地）→ 不触发关门；衰减后丢失（车开走）→ 照常计时
+      gLostFromSudden = (gLastSigRssiValid >= RSSI_SUDDEN_CLOSE);
+      Serial.printf("[FSM] 门口强后信号丢失 t=%u last=%d sudden=%d\n",
+                    (unsigned)now, gLastSigRssiValid, gLostFromSudden ? 1 : 0);
     }
     if (millisReached(now, gNoSigSince + RSSI_TRUE_SILENT_MS) && !gTrueNo) {
       gTrueNo = true;
@@ -564,14 +571,15 @@ static void observeSignal(bool hasSignal, int rssi) {
 }
 
 // 门外安装关门：
-//  1) 主路径：门口强信号后丢失满 OUT_CLOSE_SILENT_MS（开走/出库、入库）
+//  1) 主路径：门口强信号「逐渐减弱后」丢失满 OUT_CLOSE_SILENT_MS（开走/出库）
+//     ——丢失前贴脸强帧断崖消失（RSSI_SUDDEN_CLOSE，关机特征）不触发
 //  2) 旁路：渐离趋势 + 开门后见过强 + 连续偏远
 static bool shouldCloseBySignal(bool hasSignal, bool isFar) {
   if (!gCloseArmed) return false;
   const uint32_t now = millis();
-  // 开走关门：强→丢失满时长（车离开门口 RF 区，或入库后人离开车库）
+  // 开走关门：强→衰减→丢失满时长（车离开门口 RF 区，或入库后人离开车库）
   if (gHadDoorStrong && gLostSinceStrongMs != 0 && !hasSignal) {
-    if (millisReached(now, gLostSinceStrongMs + OUT_CLOSE_SILENT_MS)) {
+    if (!gLostFromSudden && millisReached(now, gLostSinceStrongMs + OUT_CLOSE_SILENT_MS)) {
       return true;
     }
   }
