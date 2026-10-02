@@ -318,8 +318,9 @@ static bool gInGarage = true;
 static bool gHadDoorStrong = false;       // 曾在门口见过强信号
 static uint32_t gLastStrongMs = 0;        // 最近一次 ≥RSSI_STRONG
 static uint32_t gLostSinceStrongMs = 0;   // 强后信号丢失起始（0=当前未丢/从未强）
-static int gLastSigRssiValid = -127;      // 最近一次「有信号」帧的 rssi（关机判据用）
-static bool gLostFromSudden = false;      // 本次丢失=贴脸强帧断崖消失（关机特征→不关）
+static int gLastSigRssiValid = -127;      // 最近一次「有信号」帧的 rssi
+static uint32_t gLastSigTimeValid = 0;    // 最近一次「有信号」帧的时刻
+static bool gLostFromSudden = false;      // 本次丢失=贴脸消失/断电骤降（关机特征→不关）
 static uint8_t gStrongStreak = 0;         // 滑动窗口内强样本计数
 static uint32_t gStrongStreakSince = 0;   // 本窗口起始
 static uint32_t gFirstStrongInWinMs = 0;  // 窗口内首次强（校验 HOLD）
@@ -480,8 +481,18 @@ static void observeSignal(bool hasSignal, int rssi) {
   if (hasSignal) {
     gNoSigSince = 0;
     gEverHadSignal = true;
-    gLastSigRssiValid = rssi;  // 关机/离开判据：丢失前最后一帧的实际强度
-    gLostSinceStrongMs = 0;    // 有信号（含弱帧/漏扫后恢复）= 未丢失，重置计时
+    gLostSinceStrongMs = 0;  // 有信号（含弱帧/漏扫后恢复）= 未丢失，重置计时
+    // 关机 vs 离开候选（每帧覆盖，丢失时以最后帧定格的值为准）：
+    //  A 贴脸帧直接消失：最后帧 ≥ RSSI_SUDDEN_CLOSE（1301 实测 -55）
+    //  B 断电尾帧骤降：与前帧 ≤4s 内掉 ≥25dBm（1324 实测 -58→-90 2s 掉 32，
+    //    关机瞬间发射弱化的尾帧会把「最后一帧判据」带偏 → 必须看相邻帧斜率）
+    // 离开是缓降（1320 实测 -64→-87 用 18s；1242 -60→-79 用 4s 掉 19<25）
+    gLostFromSudden =
+        (rssi >= RSSI_SUDDEN_CLOSE) ||
+        (gLastSigTimeValid != 0 && (now - gLastSigTimeValid) <= 4000UL &&
+         (gLastSigRssiValid - rssi) >= 25);
+    gLastSigRssiValid = rssi;
+    gLastSigTimeValid = now;
     if (rssi >= RSSI_STRONG) {
       // 门口强：滑动窗口累计（多径 强/弱 交替不得清零）
       gLastStrongMs = now;
@@ -543,9 +554,7 @@ static void observeSignal(bool hasSignal, int rssi) {
     if (gNoSigSince == 0) gNoSigSince = now;
     if (gLastStrongMs != 0 && gLostSinceStrongMs == 0) {
       gLostSinceStrongMs = now;
-      // 关机 vs 离开：丢失前最后帧仍贴脸强（≥RSSI_SUDDEN_CLOSE）= 设备断电
-      // 特征（人可能还在原地）→ 不触发关门；衰减后丢失（车开走）→ 照常计时
-      gLostFromSudden = (gLastSigRssiValid >= RSSI_SUDDEN_CLOSE);
+      // gLostFromSudden 已在最后帧时按「贴脸消失/断电骤降」定格（见 hasSignal 分支）
       Serial.printf("[FSM] 门口强后信号丢失 t=%u last=%d sudden=%d\n",
                     (unsigned)now, gLastSigRssiValid, gLostFromSudden ? 1 : 0);
     }
