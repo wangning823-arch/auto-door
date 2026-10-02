@@ -1,4 +1,4 @@
 #pragma once
 // 由 tools/bump_version.py 在编译前生成，勿手改
-#define FW_VERSION "0.2.202610021245"
-#define FW_BUILD_TS 202610021245
+#define FW_VERSION "0.2.202610021249"
+#define FW_BUILD_TS 202610021249

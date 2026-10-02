@@ -405,6 +405,9 @@ static bool tryCloseIfOpen(const char* why) {
   sigLogShip(ok ? "autoClose" : "closeSkip", gLastSigRssi);
   if (ok) {
     gLastAutoCloseMs = now;
+    // 解除关门武装：不清的话离场条件（有→强→丢失满时长）持续成立，
+    // 每个限频窗口放行就重发一次关码——1243 实测信号消失后 4 分钟重发 13+ 次
+    gCloseArmed = false;
     clearLeaveQual("已发关码");
     gStrongAfterOpen = false;
     // 关完门：车多半在库内或已走远，禁止库内漏扫弱路径再顶开
