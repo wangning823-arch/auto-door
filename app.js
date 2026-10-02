@@ -3,7 +3,8 @@
   var $ = function (id) { return document.getElementById(id); };
   var currentId = null;
   var pollTimer = null;
-  var busyCmd = false;
+  // 在途指令按设备记账（devId -> cmd）：一台在等结果时不能锁住另一台的按钮
+  var busyCmds = {};
 
   function token() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
 
@@ -49,6 +50,27 @@
     $("listView").classList.toggle("hidden", view !== "list");
     $("detailView").classList.toggle("hidden", view !== "detail");
     $("logoutBtn").classList.toggle("hidden", view === "login");
+  }
+
+  // 按钮可用性只看「当前这台设备」有没有在途指令，而不是全局一把锁
+  function syncCmdButtons() {
+    var wip = currentId ? busyCmds[currentId] : null;
+    var open = $("openBtn");
+    var close = $("closeBtn");
+    var upd = $("updateBtn");
+    if (open) open.disabled = !!wip;
+    if (close) close.disabled = !!wip;
+    if (upd) upd.disabled = !!wip;
+  }
+
+  // 等待结果期间用户可能已切到另一台设备：提示别写到别人的页面上
+  function tipFor(id, text, cls) {
+    if (currentId === id) setTip($("ctrlTip"), text, cls);
+  }
+
+  // 后台设备的结果通知要带上 id，避免和当前查看的设备混淆
+  function devSuffix(id) {
+    return currentId === id ? "" : " · " + id;
   }
 
   function api(path, opts) {
@@ -312,10 +334,12 @@
         "服务器固件 " + o.version + (d.fw && d.fw !== o.version ? " · 设备可升级" : " · 已是最新");
     }
     loadLogs();
+    syncCmdButtons();
   }
 
   function openDetail(id) {
     currentId = id;
+    syncCmdButtons();
     show("detail");
     $("logBox").textContent = "加载中…";
     refreshDetail();
@@ -645,16 +669,17 @@
       notifyErr("未选择设备");
       return Promise.resolve();
     }
-    if (busyCmd) {
-      notifyWarn("有指令正在处理，请稍候");
+    var id = currentId;
+    if (busyCmds[id]) {
+      var wip = cmdLabel(busyCmds[id]);
+      notifyWarn("该设备的「" + wip + "」结果确认中，请稍候再试");
+      tipFor(id, wip + "结果确认中，完成前不能再次下发", "warn");
       return Promise.resolve();
     }
-    var id = currentId;
     var label = cmdLabel(cmd);
-    var btn = cmd === "open" ? $("openBtn") : (cmd === "close" ? $("closeBtn") : $("updateBtn"));
 
-    busyCmd = true;
-    if (btn) btn.disabled = true;
+    busyCmds[id] = cmd;
+    syncCmdButtons();
 
     if (cmd === "open" || cmd === "close") {
       setTip($("ctrlTip"), "已排队，等待设备认领并发射频…（不算成功）", "ok");
@@ -680,11 +705,11 @@
         if ((e.message || "").indexOf("not claimed") >= 0) return;
         if ((e.message || "").indexOf("RF fail") >= 0) return;
         if ((e.message || "").indexOf("claimed but no rf") >= 0) return;
-        setTip($("ctrlTip"), e.message || (label + "失败"), "err");
-        notifyErr(label + "失败：" + (e.message || "未知错误"));
+        tipFor(id, e.message || (label + "失败"), "err");
+        notifyErr(label + "失败：" + (e.message || "未知错误") + devSuffix(id));
       }).finally(function () {
-        busyCmd = false;
-        if (btn) btn.disabled = false;
+        delete busyCmds[id];
+        syncCmdButtons();
       });
     }
 
@@ -713,20 +738,20 @@
         .catch(function (e) {
           if ((e.message || "").indexOf("unconfirmed") >= 0) return;
           if ((e.message || "").indexOf("update") >= 0 && /失败|离线/.test(e.message || "")) {
-            notifyErr(e.message);
+            notifyErr(e.message + devSuffix(id));
             return;
           }
-          setTip($("ctrlTip"), e.message || "更新失败", "err");
-          notifyErr("更新失败：" + (e.message || "未知错误"));
+          tipFor(id, e.message || "更新失败", "err");
+          notifyErr("更新失败：" + (e.message || "未知错误") + devSuffix(id));
         })
         .finally(function () {
-          busyCmd = false;
-          if (btn) btn.disabled = false;
+          delete busyCmds[id];
+          syncCmdButtons();
         });
     }
 
-    busyCmd = false;
-    if (btn) btn.disabled = false;
+    delete busyCmds[id];
+    syncCmdButtons();
     return Promise.resolve();
   }
 
