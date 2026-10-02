@@ -339,13 +339,19 @@ static void gapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* para
       } else {
         // 没带名称：先登记，再异步读远程名称
         gTracker->onClassicDevice(mac, rssi, "");
-        uint8_t bda[6];
-        for (int i = 0; i < 6; i++) {
-          unsigned v = 0;
-          sscanf(mac.c_str() + i * 3, "%02x", &v);
-          bda[i] = (uint8_t)v;
+        // Round-4：仅手动扫描时取远端名（名字只服务扫描 UI，跟踪判 MAC 足够）。
+        // 自动路径每台无名邻居都 read_remote_name = 对邻居发起 ACL 寻呼，
+        // 每次持缓冲 5~10s；8s 探针 × N 台邻居 = 持续占用+切洞——
+        // 4084 孤儿结构的持续供给源之一。
+        if (gTracker->discoveryRunning()) {
+          uint8_t bda[6];
+          for (int i = 0; i < 6; i++) {
+            unsigned v = 0;
+            sscanf(mac.c_str() + i * 3, "%02x", &v);
+            bda[i] = (uint8_t)v;
+          }
+          esp_bt_gap_read_remote_name(bda);
         }
-        esp_bt_gap_read_remote_name(bda);
       }
       break;
     }
@@ -767,7 +773,7 @@ void ClassicTracker::updateZone() {
   }
 }
 
-void ClassicTracker::loop() {
+void ClassicTracker::loop(bool staUp) {
   const uint32_t now = millis();
 
   if (discRunning_ && millisReached(now, discEndMs_ + 1)) {
@@ -809,6 +815,17 @@ void ClassicTracker::loop() {
     }
   }
 
+  // ===== Round-4：首探针等 STA 稳定（或开机 30s 兜底）=====
+  // 气囊在 begin() 里 force-hold；若首探针在 WiFi bringup 的分配风暴里 drop，
+  // 腾出的 8192 会被 WiFi 当场吃掉 → re-hold 永久失败 → 4084 孤儿结构
+  // （0835 实锤：probe#3 起 thin≈inq 96%，7 分钟不自愈，排水也救不了）
+  if (!firstProbeReady_) {
+    if (staUp || millis() >= 30000UL) {
+      firstProbeReady_ = true;
+      nextInquiryMs_ = millis() + 1000;  // STA 起来后再稳 1s 开首炮
+    }
+  }
+
   // 显式暂停时才停后台跟踪；SoftAP 慢速模式仍要扫（否则手机连热点时车走了永远不关）
   if (!autoTrack_ || inquiryPaused_ || !gBtReady || !targetSet_ || discRunning_ ||
       inquiryBusy_) {
@@ -820,7 +837,7 @@ void ClassicTracker::loop() {
     }
     return;
   }
-  if (millisReached(now, nextInquiryMs_)) {
+  if (firstProbeReady_ && millisReached(now, nextInquiryMs_)) {
     // ===== Round-3 排水：起探针前等在飞 HTTP 收尾 =====
     // 预静默（due 前 800ms，见 btQuietForHttp）已封新单；这里等最后 1~2 个
     // 在飞请求收尾，让 lwIP/HTTP 瞬时缓冲 free+合并，再 drop 气囊起 inquiry。

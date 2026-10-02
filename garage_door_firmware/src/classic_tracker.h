@@ -38,7 +38,9 @@ struct ClassicDeviceItem {
 class ClassicTracker {
  public:
   bool begin(const char* macStr);
-  void loop();
+  // staUp: STA 是否已连（main 传入）——首探针等 STA 稳定后再开火，
+  // 避免 WiFi bringup 中途吃掉刚 drop 的气囊块（0835 thin 陷阱根因）
+  void loop(bool staUp);
   // 门状态喂入（main 每轮调用）：开门沿进入 ACTIVE 纪元——晨间出库的
   // 信号窗由开门事件锚定，不依赖探针相位
   void setDoorOpen(bool open);
@@ -174,6 +176,9 @@ class ClassicTracker {
   // Round-3 排水：到点先等在飞 HTTP 收尾再起探针；期间 draining_ 封新单
   bool draining_ = false;
   uint32_t drainStartMs_ = 0;
+  // Round-4：首探针等 STA 连上（或开机 30s 兜底）——防开机竞态把气囊
+  // force-hold 变成永久孤儿（drop 的瞬间被 WiFi bringup 吃掉 → 96% thin）
+  bool firstProbeReady_ = false;
 
   // 精确统计（静态，钩子/loop 共用；volatile 防优化）
   static volatile uint32_t s_inqCount;

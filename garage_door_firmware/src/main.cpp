@@ -1804,7 +1804,7 @@ void loop() {
     if (gWeb.trackMode() == TRACK_MODE_CLASSIC) {
       // 门态喂入：开门沿 → ACTIVE 纪元（晨间出库的信号窗由事件锚定）
       gBt.setDoorOpen(gDoor.doorState() == DoorState::OPEN);
-      gBt.loop();
+      gBt.loop(gWeb.staConnected());
     }
     gBleBond.service();  // 内部 begun_ 门闩：经典模式直接 return
   }
