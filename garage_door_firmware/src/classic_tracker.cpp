@@ -796,8 +796,13 @@ void ClassicTracker::loop(bool staUp) {
   // ===== 纪元转换日志（统一在 loop 上下文上送，回调里不碰 logShip）=====
   if (epochActive_ != epochLoggedActive_) {
     epochLoggedActive_ = epochActive_;
+    // 防挤（20261002）：ACTIVE 期生产>发货，环 FIFO 会把刚写的关键行挤掉
+    //（两轮测试的 EPOCH ACTIVE 行都因此丢失）。清环→推本行→poke，
+    // 让它在第一个开放窗口第一个出网；丢的只是即将被挤掉的旧积压。
+    logShipClearRing();
     logShipf("[BT] EPOCH %s why=%s", epochActive_ ? "ACTIVE" : "IDLE",
              epochWhy_);
+    logShipPoke();
   }
 
   // ===== 纪元退出三条件 =====

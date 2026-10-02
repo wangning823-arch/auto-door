@@ -804,7 +804,10 @@ static void onAllocFailed(size_t size, uint32_t caps, const char* fn) {
   // 导致 BTU 失败根本不触发归还；现改为 OTA_RESERVE_SIZE(4352)。
   // 故意不做「largest 不够就跳过 inquiry」——那会推迟自动开门。
   if (size <= OTA_RESERVE_SIZE) gResGiveReq = true;
-  if (n <= 16 || (n & 255) == 0) {
+  // 风暴加密抽样（20261002）：fail 风暴实测 30s +431、单会话 7200+，
+  // 旧抽样（前16条+每256条）把风暴成分完全藏住。前 64 条 + 每 16 条：
+  // 64/min 风暴也只多打 ~4 条/分钟，环可承受（覆盖旧的16/255口径）。
+  if (n <= 64 || (n & 15) == 0) {
     gFailEvt.size = (uint32_t)size;
     gFailEvt.caps = (uint32_t)caps;
     gFailEvt.ra0 = __builtin_return_address(0);

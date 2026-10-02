@@ -14,6 +14,9 @@ void logShipPrintln(const String& line);
 void logShipService(bool btBusy, bool wifiOk);
 // 堆从 thin 恢复后立刻尝试补发（s_nextMs=0）
 void logShipPoke();
+// 清空积压环：关键事件（纪元切换）防挤用——ACTIVE 期生产>发货，环 FIFO
+// 会把刚写入的关键行挤掉；先清再推+poke，保证该行第一个出网
+void logShipClearRing();
 // 同步 flush：立刻 HTTP POST（OTA 重启前 / 串口 logs flush）
 void logShipFlushNow();
 // 预解析日志服务器 IP 并缓存（OTA 开始时网络正常时调用）：

@@ -76,8 +76,10 @@ static size_t safeChunk() {
   if (largest <= floor_need) return 0;  // 连最小片的余量都保不住，下轮再试
   size_t cap = (largest - floor_need) / 4;
   if (cap > LOG_SHIP_CHUNK) cap = LOG_SHIP_CHUNK;
-  // 弱网 inquiry 空窗只有 ~1.5s：堆不宽裕时用小片，避免 POST 撞窗被放弃
-  if (largest < 8000 && cap > 256) cap = 256;
+  // 20261002 放宽 256→512：旧限是为 1.5s 老空窗写的；现在窗 2.4s+排水+允许
+  // 跨窗，ACTIVE 期发货速率必须追上生产（~4KB/min），否则 2560B 环被 FIFO
+  // 挤爆、心跳/纪元行整段丢失（11:07 实锤 137s 无心跳）。堆真紧时公式自然缩。
+  if (largest < 8000 && cap > 512) cap = 512;
   if (cap < LOG_SHIP_CHUNK_MIN) cap = LOG_SHIP_CHUNK_MIN;
   return cap;
 }
@@ -310,6 +312,12 @@ size_t logShipPending() {
   return n;
 }
 
+void logShipClearRing() {
+  ringLock();
+  s_len = 0;
+  ringUnlock();
+}
+
 // 解析 LOG_SHIP_URL → host/port/path（纯 char，不碰堆）
 static void parseLogUrlBuf(char* host, size_t hostCap, uint16_t* port,
                            char* path, size_t pathCap) {
@@ -526,8 +534,14 @@ void logShipService(bool btBusy, bool wifiOk) {
     if (code == 200) {
       s_failStreak = 0;
       s_why = 9;
-      // 环里还有积压 → 下一拍（8s）接着发下一片；不搞 1s 连发（见 INTERVAL 注释）
-      s_nextMs = millis() + LOG_SHIP_INTERVAL_MS;
+      // 环里还有积压 → 下一拍（8s）接着发下一片；不搞 1s 连发（见 INTERVAL 注释）。
+      // 溢出保护：积压过半（ACTIVE 高产期生产>发货会把环挤爆、FIFO 丢心跳）
+      // → 加速到 2s 续发；正常积压仍是 8s 一拍
+      ringLock();
+      size_t pend = s_len;
+      ringUnlock();
+      s_nextMs = millis() +
+                 (pend > LOG_SHIP_RING_BYTES / 2 ? 2000UL : LOG_SHIP_INTERVAL_MS);
     } else {
       s_failStreak++;
       s_why = 10;  // 收到非200（网络失败/服务端拒）
