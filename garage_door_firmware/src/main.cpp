@@ -1853,7 +1853,14 @@ void loop() {
     // re-hold 失败、pinned=0 时 maxblkNow 恒 <4600），用堆薄卡整窗 = 把排水
     // 设计废掉 → 1388 实锤：ACTIVE 命中后 12 分钟零上报而 poll 正常
     //（remoteCmd 不吃 btBusy）。窗内发送失败由 log/status 的 failStreak 退避兜底。
-    const bool thinBlock = heapThin && !gBt.inHttpWindow();
+    //
+    // Round-2：门控下限改 2600 —— 4600 只在「气囊死锁态」（pinned=0 且
+    // raw 恒 4084 <6916 抓不回）起作用，而它恰恰把死锁锁死：1388 实测
+    // IDLE 下 21 分钟零上报，OTA 拆栈瞬间才开门 flush。log_ship 有
+    // safeChunk 自适应降块，2600（WiFi 2308+余量）以下才真禁发；
+    // heapThin(4600) 保留给 poke/诊断口径不变。
+    const bool heapCrit = maxblkNow < 2600;
+    const bool thinBlock = heapCrit && !gBt.inHttpWindow();
     const bool btQuiet =
         gBtStackInited && (btBusy || gBt.btQuietForHttp() || thinBlock);
     // 堆从 thin 恢复：立刻 poke log_ship，避免弱网下 30s 周期一直错过空窗

@@ -822,6 +822,11 @@ void ClassicTracker::loop() {
       inquiryStartMs_ = 0;
       btAirTryHold();
     }
+  } else {
+    // 气囊死锁自愈（Round-2）：re-hold 原来只在 done 那一下试，失败就永久
+    // 放弃 → pinned=0 且 raw<6916 再也抓不回 → thinBlock 死锁（1388 实测
+    // 21 分钟零上报）。空闲空窗每轮补试；抓不上是 no-op（函数首行判空）。
+    btAirTryHold();
   }
 }
 
