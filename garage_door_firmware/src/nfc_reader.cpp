@@ -28,7 +28,8 @@ static void forceIdlePullups(int sda, int scl) {
     gpio_set_pull_mode((gpio_num_t)scl, GPIO_PULLUP_ONLY);
 }
 
-#define NFC_COOLDOWN_MS 800   // 同一张卡防连读；太短会把一次贴卡读成开+关两次 toggle
+// 同一张卡的在场去重：时间冷却挡不住 poll gap（持卡会被反复读），
+// 真正的语义是「移开再靠近才再次响应」——见 readPassiveTarget 的 cardPresent_
 #define NFC_POLL_MIN_MS 350
 #define NFC_RECOVER_GAP_MS 15000
 #define NFC_INIT_DELAY_MS 8000
@@ -1215,6 +1216,8 @@ bool NfcReader::poll(String& uid) {
     }
     // 正常无卡：不要例行 drain（会刷 Error 263 并可能打乱总线）
     lastPollSlow_ = false;
+    // 场内无卡 = 上张卡已移开：清在场标记，之后重新靠近才会再次触发
+    cardPresent_ = false;
     // 不可在此清 slowAckStreak_：慢/快交替会每次清零 → resync 永不触发。
     // 仅超过 15s 无慢 ACK 才视为恢复。
     if (slowAckStreak_ && lastSlowAckMs_ && (now - lastSlowAckMs_) > 15000UL) {
@@ -1245,11 +1248,16 @@ bool NfcReader::poll(String& uid) {
   }
   uid.toUpperCase();
 
-  if (uid == lastUid_ && (now - lastReadMs_) < NFC_COOLDOWN_MS) {
+  // 持卡只响应一次（20261002）：旧的时间冷却 800ms 挡不住 poll gap 1.4s——
+  // 一次贴卡被读成 3 次 toggle（实测开-关-开连跳）。改为在场判定：同 uid
+  // 且上张卡还没从射频场移走（无卡帧未见）→ 抑制；移开后 1216 段清标记，
+  // 重新靠近才会再次触发。I2C 错误路径不清标记（毛刺不造成重复触发）。
+  if (uid == lastUid_ && cardPresent_) {
     return false;
   }
   lastUid_ = uid;
   lastReadMs_ = now;
+  cardPresent_ = true;
   return true;
 }
 

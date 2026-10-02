@@ -49,8 +49,9 @@ static bool slotOk(const CrashSlot* s) {
 
 void crashSnapBegin() {
   // 不清槽位：内容由 magic 自校验，等 crashSnapReport 读一次即可。
-  // 走 logShipf 而非 Serial，好在 VPS 上确认新固件真的带了这个功能。
-  logShipf("[CRASH] snap ready (rtc noinit, %u bytes)", (unsigned)sizeof(s_slot));
+  // 走关键环：boot 早期主环拥挤/截断时这行也必须到 VPS（确认新固件带此功能）
+  logShipCriticalf("[CRASH] snap ready (rtc noinit, %u bytes)",
+                   (unsigned)sizeof(s_slot));
 }
 
 static CrashSlot* pickSlot(const char* name) {
@@ -129,10 +130,12 @@ void crashSnapReport(int rst) {
     CrashSlot* s = &s_slot[i];
     if (!slotOk(s)) continue;
     shown++;
-    logShipf("[CRASH] task=%s phase=%s up=%ums rst=%d", s->task,
-             s->phase[0] ? s->phase : "-", (unsigned)s->uptimeMs, rst);
+    // 关键环：崩溃现场行开机早期必达——12:14 panic 后 task=/pc= 行没到 VPS，
+    // 归因断线索（无 USB 只能靠这些行）
+    logShipCriticalf("[CRASH] task=%s phase=%s up=%ums rst=%d", s->task,
+                     s->phase[0] ? s->phase : "-", (unsigned)s->uptimeMs, rst);
     if (s->pcN == 0) {
-      logShipf("[CRASH] %s (no pc, mark only)", s->task);
+      logShipCriticalf("[CRASH] %s (no pc, mark only)", s->task);
       continue;
     }
     // 8 个 PC 约 90 字节，logShipf 缓冲 192，一行放得下
@@ -142,7 +145,9 @@ void crashSnapReport(int rst) {
       off += snprintf(line + off, sizeof(line) - (size_t)off, " %08x",
                       (unsigned)s->pc[k]);
     }
-    logShipf("%s", line);
+    logShipCriticalf("%s", line);
   }
-  if (!shown) logShipf("[CRASH] rst=%d but no valid snapshot", rst);
+  if (!shown) {
+    logShipCriticalf("[CRASH] rst=%d but no valid snapshot", rst);
+  }
 }

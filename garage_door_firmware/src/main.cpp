@@ -857,10 +857,19 @@ static void serviceHeapDiag() {
       heap_caps_get_info(&i8bit, MALLOC_CAP_8BIT);
       // logShipf = 串口 + VPS 双通道：侦查数据不插 USB 也能从设备日志看
       // 格式: free/big 成对（8BIT 大小 vs 失败 caps 口径大小）
-      logShipf("[HEAPFAIL] #%u sz=%u t=%s big8=%u ra4=%p ra5=%p",
-               (unsigned)seq, (unsigned)gFailEvt.size, gFailEvt.task,
-               (unsigned)i8bit.largest_free_block, gFailEvt.ra4,
-               gFailEvt.ra5);
+      // 开机 90s 内走关键环：OTA boot 病态（12:03 开机 3s 败 28 次）的成分
+      // #1-28 被开机日志挤出主环没到 VPS，归因断线——开机期必须必达
+      if (millis() < 90000UL) {
+        logShipCriticalf("[HEAPFAIL] #%u sz=%u t=%s big8=%u ra4=%p ra5=%p",
+                         (unsigned)seq, (unsigned)gFailEvt.size, gFailEvt.task,
+                         (unsigned)i8bit.largest_free_block, gFailEvt.ra4,
+                         gFailEvt.ra5);
+      } else {
+        logShipf("[HEAPFAIL] #%u sz=%u t=%s big8=%u ra4=%p ra5=%p",
+                 (unsigned)seq, (unsigned)gFailEvt.size, gFailEvt.task,
+                 (unsigned)i8bit.largest_free_block, gFailEvt.ra4,
+                 gFailEvt.ra5);
+      }
     }
   }
   // 精确 BTU 失败日志：计数变化就打，不依赖 HEAPFAIL 抽样

@@ -81,6 +81,9 @@ class NfcReader {
   String authUid_;
   String lastUid_;
   uint32_t lastReadMs_ = 0;
+  // 在场标记：持卡期间 poll 会反复读到同一张卡——同 uid 且仍在场 → 只响应
+  // 一次；poll 到无卡帧（卡移开）才清，重新靠近才再次触发（20261002 用户实测）
+  bool cardPresent_ = false;
   uint16_t failStreak_ = 0;
   uint32_t lastOkMs_ = 0;
   uint32_t lastRecoverMs_ = 0;
