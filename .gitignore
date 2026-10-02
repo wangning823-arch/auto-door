@@ -69,3 +69,6 @@ diag_*.html
 # 本次 dda0 日志断流诊断的临时产物（诊断完成后可删）
 .tmp_diag/
 peek_boot.py
+
+# Playwright local run artifacts (page snapshots/console logs)
+.playwright-cli/
