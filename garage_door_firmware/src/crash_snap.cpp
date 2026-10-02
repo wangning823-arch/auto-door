@@ -118,6 +118,11 @@ void crashSnapMark(const char* phase) {
     strlcpy(s->task, name, CRASH_TASK_NAME);
   }
   s->magic = CRASH_SNAP_MAGIC;
+  // mark 即采样：mark 点都在函数内（ls.flush/nfc.probe/http.io...），此时栈是
+  // 深的。周期采样（哪怕 250ms）总落在任务空闲骨架上——1341/1824 两次崩溃的
+  // PC 全是同组骨架地址就是证据。嵌进来后每个阶段点留一份函数级深栈，
+  // 崩溃时最新一份 mark 快照 = "最后在干哪一步"的完整调用链。
+  crashSnapCapture();
 }
 
 void crashSnapReport(int rst) {
