@@ -1915,11 +1915,12 @@ void loop() {
     serviceHeapDiag();
     // 崩溃快照：每 1s 抓一次当前任务调用栈到 RTC noinit 段。
     // panic 时无法执行用户代码（panic_abort 结尾就是 break），拿不到崩溃瞬间
-    // 的栈；只能靠周期采样，1s 粒度足以定位"卡在哪个函数"。
+    // 的栈；只能靠周期采样。250ms 粒度（20261002 提频：1s 版四次崩溃都只
+    // 抓到任务骨架 1 帧——恰好采在空闲点；250ms 更大概率撞上干活中的深栈）
     {
       static uint32_t lastSnap = 0;
       uint32_t nowSnap = millis();
-      if ((int32_t)(nowSnap - lastSnap) >= 1000) {
+      if ((int32_t)(nowSnap - lastSnap) >= 250) {
         lastSnap = nowSnap;
         crashSnapCapture();
       }

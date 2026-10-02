@@ -488,6 +488,9 @@ static bool shipSendAll(int sfd, const char* data, size_t total, uint32_t budget
 void logShipFlushNow() {
   uint32_t t0 = millis();
   crashSnapMark("ls.flush");
+  // 进 flush 就留栈：flush 中途 socket 阻塞时 loop 周期采样跑不动，
+  // 没有这几份快照就只有 phase 没有栈（1341 崩溃复盘缺口）
+  crashSnapCapture();
   Serial.printf("[FLUSH] enter t=%u\n", (unsigned)t0);
   s_nextMs = 0;
   uint16_t port = 80;
@@ -529,6 +532,7 @@ void logShipFlushNow() {
   WiFiClient client;
   bool conn = client.connect(s_shipIp, port, LOG_SHIP_TIMEOUT_MS);
   Serial.printf("[FLUSH] conn=%d dt=%u\n", (int)conn, (unsigned)(millis() - t0));
+  crashSnapCapture();  // connect 阻塞后：若崩在连接期，这份栈是最后现场
   if (!conn) return;
   esp_task_wdt_reset();
 
@@ -552,6 +556,7 @@ void logShipFlushNow() {
                 shipSendAll(sfd, s_bodyBuf, fchunk, 3000);
   Serial.printf("[FLUSH] sent hdr=%d body=%u ok=%d dt=%u\n", hdrLen,
                 (unsigned)fchunk, (int)sentOk, (unsigned)(millis() - t0));
+  crashSnapCapture();  // send 阻塞后：send 是 1s select×10 轮的高危阻塞段
   if (!sentOk) {
     client.stop();
     return;
@@ -576,6 +581,7 @@ void logShipFlushNow() {
   client.stop();
   int code = rawN > 0 ? parseHttpStatusBuf(s_rawBuf) : -1;
   Serial.printf("[FLUSH] done code=%d dt=%u\n", code, (unsigned)(millis() - t0));
+  crashSnapCapture();  // 读响应阻塞后：recv 轮询段的最后现场
   if (code == 200) {
     ringLock();
     // 只摘已发出的一片（与拷贝同序：先关键环后主环）；新日志在尾部不受影响
