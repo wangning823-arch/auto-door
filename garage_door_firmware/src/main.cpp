@@ -1849,20 +1849,24 @@ void loop() {
         heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT) +
         ClassicTracker::pinnedHeapBytes();
     const bool heapThin = maxblkNow < 4600;
-    // 20261002 整窗豁免 heapThin：整窗开在 5 连发 inquiry 的堆谷底（气囊
-    // re-hold 失败、pinned=0 时 maxblkNow 恒 <4600），用堆薄卡整窗 = 把排水
-    // 设计废掉 → 1388 实锤：ACTIVE 命中后 12 分钟零上报而 poll 正常
-    //（remoteCmd 不吃 btBusy）。窗内发送失败由 log/status 的 failStreak 退避兜底。
-    //
-    // Round-2：门控下限改 2600 —— 4600 只在「气囊死锁态」（pinned=0 且
-    // raw 恒 4084 <6916 抓不回）起作用，而它恰恰把死锁锁死：1388 实测
-    // IDLE 下 21 分钟零上报，OTA 拆栈瞬间才开门 flush。log_ship 有
-    // safeChunk 自适应降块，2600（WiFi 2308+余量）以下才真禁发；
-    // heapThin(4600) 保留给 poke/诊断口径不变。
-    const bool heapCrit = maxblkNow < 2600;
-    const bool thinBlock = heapCrit && !gBt.inHttpWindow();
-    const bool btQuiet =
+    // ===== Round-3 门控（20261002 A/B 实锤后的定稿）=====
+    // 0800(门4600): 91 探针 0 挂但日志闷 11 分钟 —— 4600 是"降级时闭嘴
+    // 让堆自愈"的保护；0809(门2600): 日志通但 76% 挂 —— 2600 会让 HTTP 在
+    // 4084 残堆上持续咀嚼，永远合并不回去。所以门限回 4600，另配：
+    // ① 卡死破除器：门连续关满 60s 强制放行一轮（观测最坏断 60s，不是21min）
+    // ② ACTIVE 整窗豁免（窗就是排水口）
+    // ③ 探针前排水（预静默+等在飞，见 classic_tracker）从源头减少咀嚼
+    const bool thinBlock = heapThin && !gBt.inHttpWindow();
+    bool btQuiet =
         gBtStackInited && (btBusy || gBt.btQuietForHttp() || thinBlock);
+    static uint32_t quietSinceMs = 0;
+    const uint32_t qNow = millis();
+    if (btQuiet) {
+      if (quietSinceMs == 0) quietSinceMs = qNow;
+      if ((qNow - quietSinceMs) >= 60000UL) btQuiet = false;  // 卡死破除
+    } else {
+      quietSinceMs = 0;
+    }
     // 堆从 thin 恢复：立刻 poke log_ship，避免弱网下 30s 周期一直错过空窗
     static bool wasHeapThin = false;
     if (heapThin) {

@@ -18,7 +18,9 @@
 #define LOG_SHIP_URL "http://door.wzx.homes/dev/logs"
 #endif
 #ifndef LOG_SHIP_INTERVAL_MS
-#define LOG_SHIP_INTERVAL_MS 30000UL
+// 发送节奏：每 8s 一拍（20261002 用户定的：跟随探针节奏，不搞积压1s连发——
+// 高频连发在 4084 残堆上反复咀嚼是 btufail 元凶之一；环里有货就一拍发一片）
+#define LOG_SHIP_INTERVAL_MS 8000UL
 #endif
 #ifndef LOG_SHIP_TIMEOUT_MS
 #define LOG_SHIP_TIMEOUT_MS 4000
@@ -524,11 +526,8 @@ void logShipService(bool btBusy, bool wifiOk) {
     if (code == 200) {
       s_failStreak = 0;
       s_why = 9;
-      // 环里还有积压 → 1s 后接着发下一片；发干净才回 30s 周期
-      ringLock();
-      size_t left = s_len;
-      ringUnlock();
-      s_nextMs = millis() + (left > 0 ? 1000UL : LOG_SHIP_INTERVAL_MS);
+      // 环里还有积压 → 下一拍（8s）接着发下一片；不搞 1s 连发（见 INTERVAL 注释）
+      s_nextMs = millis() + LOG_SHIP_INTERVAL_MS;
     } else {
       s_failStreak++;
       s_why = 10;  // 收到非200（网络失败/服务端拒）

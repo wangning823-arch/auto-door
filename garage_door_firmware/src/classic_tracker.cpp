@@ -38,6 +38,12 @@ static const uint32_t ACTIVE_NO_SIGNAL_TIMEOUT_MS = 120000;
 // 本纪元见过信号后，连续 N 次探不到 → 判定信号消失，退 IDLE
 static const uint8_t EPOCH_EXIT_MISS = 3;
 
+// ===== Round-3 探针排水（20261002）=====
+// due 前这么多毫秒起封新单，给在飞请求留收尾时间
+static const uint32_t PRE_PROBE_QUIET_MS = 800;
+// 到点后等在飞 HTTP 收尾的上限；弱网等不到就超时照常起（不比旧行为差）
+static const uint32_t DRAIN_MAX_MS = 1200;
+
 static BluetoothSerial SerialBT;
 static ClassicTracker* gTracker = nullptr;
 static bool gBtReady = false;
@@ -246,8 +252,14 @@ static void ensureBtuHeapForInquiry() {
 }
 
 bool ClassicTracker::btQuietForHttp() const {
-  if (inquiryBusy_ || discRunning_) return true;
-  // ACTIVE 整窗：放行 HTTP（即便窗开启瞬间有残留 quiet）
+  if (inquiryBusy_ || discRunning_ || draining_) return true;
+  // Round-3 预静默：距下次探针 ≤800ms 起封新单（覆盖 IDLE 空窗尾段与
+  // ACTIVE 整窗尾段），配合 loop 的排水等待——due 前不再起任何 HTTP
+  if (millisBefore(millis(), nextInquiryMs_) &&
+      (nextInquiryMs_ - millis()) <= PRE_PROBE_QUIET_MS) {
+    return true;
+  }
+  // ACTIVE 整窗：放行 HTTP（窗尾已被上面的预静默盖住）
   if (inHttpWindow()) return false;
   return postQuietUntilMs_ != 0 && millisBefore(millis(), postQuietUntilMs_);
 }
@@ -585,6 +597,12 @@ void ClassicTracker::onInquiryDone() {
   if (inquirySlow_) return;  // SoftAP 有客户端：让出射频，维持慢速节奏
   burstDone_++;
   if (burstDone_ < BURST_N) {
+    if (httpClientBusy()) {
+      // Round-3 排水：窗尾 straddle 的请求还在飞 → 交回 loop 等它收尾再续
+      //（postQuiet 已在函数顶部设好，新提交仍被封着；burstDone_ 已计数）
+      nextInquiryMs_ = millis() + 200;
+      return;
+    }
     // 立即续扫：busy 不落地（postQuiet 已挡住 HTTP 从微缝挤入）
     ensureBtuHeapForInquiry();
     inquiryBusy_ = true;
@@ -794,6 +812,8 @@ void ClassicTracker::loop() {
   // 显式暂停时才停后台跟踪；SoftAP 慢速模式仍要扫（否则手机连热点时车走了永远不关）
   if (!autoTrack_ || inquiryPaused_ || !gBtReady || !targetSet_ || discRunning_ ||
       inquiryBusy_) {
+    draining_ = false;  // 排水中被暂停/扫描抢占 → 复位，防 draining_ 永久封门
+    drainStartMs_ = 0;
     // 跟踪空闲时尽量把 BT 气囊占住，供下一轮 inquiry 归还
     if (autoTrack_ && gBtReady && targetSet_ && !inquiryBusy_ && !discRunning_) {
       btAirTryHold();
@@ -801,8 +821,23 @@ void ClassicTracker::loop() {
     return;
   }
   if (millisReached(now, nextInquiryMs_)) {
+    // ===== Round-3 排水：起探针前等在飞 HTTP 收尾 =====
+    // 预静默（due 前 800ms，见 btQuietForHttp）已封新单；这里等最后 1~2 个
+    // 在飞请求收尾，让 lwIP/HTTP 瞬时缓冲 free+合并，再 drop 气囊起 inquiry。
+    // "清空堆"清的是我们自己的工作；WiFi/lwIP 常驻块动不了，只能不去搅它。
+    // 弱网等不到 → 超时照常起（不比旧行为差）。
+    if (httpClientBusy()) {
+      if (drainStartMs_ == 0) drainStartMs_ = now;
+      if ((now - drainStartMs_) < DRAIN_MAX_MS) {
+        draining_ = true;  // 预静默过期后继续封新单，直到排水结束
+        return;
+      }
+      // 超时：照常起
+    }
+    draining_ = false;
+    drainStartMs_ = 0;
     // Inquiry 优先，不被 HTTP 推迟；HTTP 只在纪元空窗/整窗发送。
-    // 节奏：IDLE = start+8s 探针（空窗 ~4.6s 给 HTTP）；
+    // 节奏：IDLE = start+8s 探针（空窗给 HTTP）；
     //       ACTIVE = 正常由 done 续扫/整窗接管，这里只是首发起点+回调丢失兜底。
     ensureBtuHeapForInquiry();
     ClassicTracker::noteInquiryStart();
@@ -823,6 +858,8 @@ void ClassicTracker::loop() {
       btAirTryHold();
     }
   } else {
+    draining_ = false;
+    drainStartMs_ = 0;
     // 气囊死锁自愈（Round-2）：re-hold 原来只在 done 那一下试，失败就永久
     // 放弃 → pinned=0 且 raw<6916 再也抓不回 → thinBlock 死锁（1388 实测
     // 21 分钟零上报）。空闲空窗每轮补试；抓不上是 no-op（函数首行判空）。

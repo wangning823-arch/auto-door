@@ -171,6 +171,9 @@ class ClassicTracker {
   uint32_t windowUntilMs_ = 0;    // ACTIVE 的 HTTP 整窗截止；0=不在窗内
   const char* epochWhy_ = "boot"; // 最近一次纪元切换原因（loop 统一打日志）
   bool epochLoggedActive_ = false; // loop 侧：epochWhy_ 是否已上送
+  // Round-3 排水：到点先等在飞 HTTP 收尾再起探针；期间 draining_ 封新单
+  bool draining_ = false;
+  uint32_t drainStartMs_ = 0;
 
   // 精确统计（静态，钩子/loop 共用；volatile 防优化）
   static volatile uint32_t s_inqCount;
